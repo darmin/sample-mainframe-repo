@@ -1,0 +1,658 @@
+!
+!  MEDBILL -- Medical Bill Processing Server
+!  Workers' Compensation Medical Bill Repricing and Payment
+!
+!  This server processes medical bills for workers' compensation claims,
+!  performing duplicate detection, fee schedule repricing, modifier
+!  adjustments, and payment recommendation generation.
+!
+!  Process: MEDBILL
+!  Pathway Server Class: MEDBILL-SC
+!  Primary File: MEDBILF (bill records)
+!  Fee Schedule: FEESCHF (jurisdiction fee schedules)
+!
+!  Copyright (c) TPA Systems Inc. All rights reserved.
+!
+
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?LIST
+
+LITERAL MAX^LINES       = 50;
+LITERAL MAX^MODS        = 4;
+LITERAL FEE^SCHED^SIZE  = 8000;
+LITERAL DUP^WINDOW^DAYS = 30;
+LITERAL ANES^TIME^UNIT  = 15;   ! 15-minute anesthesia units
+LITERAL MAX^PROC^REDUCE = 5;    ! Max procedures for multiple proc reduction
+
+! Modifier codes
+LITERAL MOD^PROFESSIONAL = "26";  ! Professional component only
+LITERAL MOD^TECHNICAL    = "TC";  ! Technical component only
+LITERAL MOD^BILATERAL    = "50";  ! Bilateral procedure
+LITERAL MOD^DISTINCT     = "59";  ! Distinct procedural service
+LITERAL MOD^ASST^SURG   = "80";  ! Assistant surgeon
+LITERAL MOD^ANES^PHYS   = "AA";  ! Anesthesia by physician
+
+! Multiple procedure reduction percentages (FIXED)
+FIXED  MULTI^PROC^PCT(0:4) := [100F, 50F, 50F, 50F, 50F];
+
+! Assistant surgeon reduction
+FIXED  ASST^SURG^PCT := 20F;
+
+! Bill status codes
+LITERAL STAT^RECEIVED   = 0;
+LITERAL STAT^DUPLICATE  = 1;
+LITERAL STAT^REPRICED   = 2;
+LITERAL STAT^ADJUSTED   = 3;
+LITERAL STAT^APPROVED   = 4;
+LITERAL STAT^DENIED     = 5;
+LITERAL STAT^PENDED     = 6;
+
+! Fee schedule entry structure
+STRUCT FEE^ENTRY (*);
+  BEGIN
+    STRING CPT^CODE[0:4];
+    STRING STATE^CODE[0:1];
+    INT    EFFECTIVE^DATE[0:2];   ! YYYYMMDD as 3 words
+    FIXED  PROFESSIONAL^FEE;
+    FIXED  TECHNICAL^FEE;
+    FIXED  GLOBAL^FEE;
+    FIXED  ANES^BASE^UNITS;
+    FIXED  ANES^CONV^FACTOR;
+    INT    STATUS;                ! 0=active, 1=deleted
+  END;
+
+! Bill header structure
+STRUCT BILL^HDR (*);
+  BEGIN
+    STRING BILL^ID[0:11];
+    STRING CLAIM^NUM[0:11];
+    STRING PROVIDER^TIN[0:8];
+    STRING PROVIDER^NPI[0:9];
+    INT    SERVICE^FROM[0:2];
+    INT    SERVICE^TO[0:2];
+    INT    RECEIVED^DATE[0:2];
+    STRING STATE^JURISDICTION[0:1];
+    INT    LINE^COUNT;
+    FIXED  TOTAL^BILLED;
+    FIXED  TOTAL^ALLOWED;
+    FIXED  TOTAL^ADJUSTED;
+    FIXED  TOTAL^PAYMENT;
+    INT    BILL^STATUS;
+    STRING NETWORK^ID[0:7];
+    FIXED  NETWORK^DISCOUNT^PCT;
+    FIXED  COB^AMOUNT;
+    STRING DUP^BILL^ID[0:11];
+  END;
+
+! Bill line item structure
+STRUCT BILL^LINE (*);
+  BEGIN
+    INT    LINE^NUM;
+    STRING CPT^CODE[0:4];
+    STRING MODIFIER1[0:1];
+    STRING MODIFIER2[0:1];
+    STRING MODIFIER3[0:1];
+    STRING MODIFIER4[0:1];
+    STRING REV^CODE[0:3];
+    INT    UNITS;
+    INT    ANES^MINUTES;
+    STRING PLACE^OF^SVC[0:1];
+    FIXED  BILLED^AMT;
+    FIXED  FEE^SCHED^AMT;
+    FIXED  MODIFIER^ADJ;
+    FIXED  MULTI^PROC^ADJ;
+    FIXED  ALLOWED^AMT;
+    FIXED  PAYMENT^AMT;
+    INT    LINE^STATUS;          ! 0=payable, 1=denied, 2=duplicate
+    STRING DENY^REASON[0:3];
+    INT    MULTI^PROC^RANK;      ! Rank for multiple procedure reduction
+  END;
+
+! Fee schedule table (loaded at startup)
+STRUCT FEE^TABLE(FEE^SCHED^SIZE);
+INT    FEE^TABLE^COUNT;
+
+! Working storage
+STRUCT W^BILL^HDR (BILL^HDR);
+STRUCT W^BILL^LINES(MAX^LINES) (BILL^LINE);
+STRUCT W^FEE (FEE^ENTRY);
+INT    W^ERR;
+INT    W^LINE^IDX;
+FIXED  W^RUNNING^TOTAL;
+
+! File numbers
+INT    MEDBIL^FNUM;
+INT    FEESCHD^FNUM;
+INT    DUPCHK^FNUM;
+INT    AUDIT^FNUM;
+
+!---------------------------------------------------------------
+! PROC LOAD^FEE^SCHEDULE -- Load fee schedule into memory table
+!---------------------------------------------------------------
+PROC LOAD^FEE^SCHEDULE;
+  BEGIN
+    INT COUNT := 0;
+    INT READ^ERR;
+
+    CALL OPEN(FEESCHD^FNUM, "FEESCHF");
+    IF <> THEN CALL ABEND^PROCESS(1);
+
+    CALL POSITION(FEESCHD^FNUM, 0D);
+    WHILE COUNT < FEE^SCHED^SIZE DO
+      BEGIN
+        CALL READUPDATE(FEESCHD^FNUM, FEE^TABLE(COUNT), $LEN(FEE^ENTRY));
+        IF <> THEN
+          BEGIN
+            READ^ERR := $RDSTATUS;
+            IF READ^ERR = 1 THEN  ! EOF
+              BEGIN
+                FEE^TABLE^COUNT := COUNT;
+                RETURN;
+              END;
+            CALL LOG^ERROR("FEE SCHEDULE READ ERROR", READ^ERR);
+            RETURN;
+          END;
+        COUNT := COUNT + 1;
+      END;
+    FEE^TABLE^COUNT := COUNT;
+  END;
+
+!---------------------------------------------------------------
+! PROC LOOKUP^FEE -- Find fee schedule entry for CPT/State/Date
+!---------------------------------------------------------------
+INT PROC LOOKUP^FEE(CPT^CODE, STATE^CODE, SVC^DATE, FEE^RESULT);
+  STRING .CPT^CODE[0:4];
+  STRING .STATE^CODE[0:1];
+  INT    .SVC^DATE[0:2];
+  STRUCT .FEE^RESULT (FEE^ENTRY);
+  BEGIN
+    INT I;
+    INT BEST^IDX := -1;
+    INT BEST^DATE[0:2] := [0, 0, 0];
+
+    FOR I := 0 TO FEE^TABLE^COUNT - 1 DO
+      BEGIN
+        IF FEE^TABLE(I).CPT^CODE = CPT^CODE FOR 5 AND
+           FEE^TABLE(I).STATE^CODE = STATE^CODE FOR 2 AND
+           FEE^TABLE(I).STATUS = 0 THEN
+          BEGIN
+            ! Check effective date <= service date
+            IF FEE^TABLE(I).EFFECTIVE^DATE[0] < SVC^DATE[0] OR
+               (FEE^TABLE(I).EFFECTIVE^DATE[0] = SVC^DATE[0] AND
+                FEE^TABLE(I).EFFECTIVE^DATE[1] '<=' SVC^DATE[1]) THEN
+              BEGIN
+                ! Use most recent effective date
+                IF FEE^TABLE(I).EFFECTIVE^DATE[0] > BEST^DATE[0] OR
+                   (FEE^TABLE(I).EFFECTIVE^DATE[0] = BEST^DATE[0] AND
+                    FEE^TABLE(I).EFFECTIVE^DATE[1] > BEST^DATE[1]) THEN
+                  BEGIN
+                    BEST^IDX := I;
+                    BEST^DATE ':=' FEE^TABLE(I).EFFECTIVE^DATE FOR 6;
+                  END;
+              END;
+          END;
+      END;
+
+    IF BEST^IDX >= 0 THEN
+      BEGIN
+        FEE^RESULT ':=' FEE^TABLE(BEST^IDX) FOR $LEN(FEE^ENTRY);
+        RETURN 0;
+      END;
+
+    RETURN -1;  ! Not found
+  END;
+
+!---------------------------------------------------------------
+! PROC CHECK^DUPLICATE -- Check for duplicate bill submission
+!---------------------------------------------------------------
+INT PROC CHECK^DUPLICATE(BILL^REC);
+  STRUCT .BILL^REC (BILL^HDR);
+  BEGIN
+    STRING KEY^BUF[0:29];
+    STRUCT DUP^REC (BILL^HDR);
+    INT    READ^ERR;
+    INT    DATE^DIFF;
+
+    ! Build alternate key: Provider TIN + Claim + Service From
+    KEY^BUF ':=' BILL^REC.PROVIDER^TIN FOR 9;
+    KEY^BUF[9] ':=' BILL^REC.CLAIM^NUM FOR 12;
+    KEY^BUF[21] ':=' BILL^REC.SERVICE^FROM FOR 6;
+
+    CALL KEYPOSITION(DUPCHK^FNUM, KEY^BUF, , 0, 2);  ! Approximate
+    WHILE 1 DO
+      BEGIN
+        CALL READ(DUPCHK^FNUM, DUP^REC, $LEN(BILL^HDR));
+        IF <> THEN RETURN 0;  ! No match, not duplicate
+
+        ! Compare provider, claim, and service dates
+        IF DUP^REC.PROVIDER^TIN = BILL^REC.PROVIDER^TIN FOR 9 AND
+           DUP^REC.CLAIM^NUM = BILL^REC.CLAIM^NUM FOR 12 AND
+           DUP^REC.SERVICE^FROM[0] = BILL^REC.SERVICE^FROM[0] AND
+           DUP^REC.SERVICE^FROM[1] = BILL^REC.SERVICE^FROM[1] AND
+           DUP^REC.SERVICE^FROM[2] = BILL^REC.SERVICE^FROM[2] THEN
+          BEGIN
+            ! Check if within duplicate window
+            CALL CALC^DATE^DIFF(DUP^REC.RECEIVED^DATE,
+                                BILL^REC.RECEIVED^DATE, DATE^DIFF);
+            IF DATE^DIFF <= DUP^WINDOW^DAYS THEN
+              BEGIN
+                BILL^REC.DUP^BILL^ID ':=' DUP^REC.BILL^ID FOR 12;
+                RETURN 1;  ! Duplicate found
+              END;
+          END;
+
+        ! Past our key range
+        IF DUP^REC.PROVIDER^TIN > BILL^REC.PROVIDER^TIN FOR 9 THEN
+          RETURN 0;
+      END;
+    RETURN 0;
+  END;
+
+!---------------------------------------------------------------
+! PROC VALIDATE^CPT -- Validate CPT code exists in fee schedule
+!---------------------------------------------------------------
+INT PROC VALIDATE^CPT(CPT^CODE, STATE^CODE, SVC^DATE);
+  STRING .CPT^CODE[0:4];
+  STRING .STATE^CODE[0:1];
+  INT    .SVC^DATE[0:2];
+  BEGIN
+    STRUCT TEMP^FEE (FEE^ENTRY);
+    RETURN LOOKUP^FEE(CPT^CODE, STATE^CODE, SVC^DATE, TEMP^FEE);
+  END;
+
+!---------------------------------------------------------------
+! PROC APPLY^MODIFIERS -- Apply modifier adjustments to a line
+!---------------------------------------------------------------
+PROC APPLY^MODIFIERS(LINE^REC, FEE^REC);
+  STRUCT .LINE^REC (BILL^LINE);
+  STRUCT .FEE^REC  (FEE^ENTRY);
+  BEGIN
+    FIXED  BASE^AMT;
+    STRING MODS(0:3)[0:1];
+
+    MODS(0) ':=' LINE^REC.MODIFIER1 FOR 2;
+    MODS(1) ':=' LINE^REC.MODIFIER2 FOR 2;
+    MODS(2) ':=' LINE^REC.MODIFIER3 FOR 2;
+    MODS(3) ':=' LINE^REC.MODIFIER4 FOR 2;
+
+    BASE^AMT := FEE^REC.GLOBAL^FEE;
+    LINE^REC.MODIFIER^ADJ := 0F;
+
+    INT I;
+    FOR I := 0 TO 3 DO
+      BEGIN
+        IF MODS(I) = MOD^PROFESSIONAL FOR 2 THEN
+          BEGIN
+            ! Professional component only
+            BASE^AMT := FEE^REC.PROFESSIONAL^FEE;
+            LINE^REC.MODIFIER^ADJ := LINE^REC.MODIFIER^ADJ +
+              (FEE^REC.GLOBAL^FEE - FEE^REC.PROFESSIONAL^FEE);
+          END
+        ELSE IF MODS(I) = MOD^TECHNICAL FOR 2 THEN
+          BEGIN
+            ! Technical component only
+            BASE^AMT := FEE^REC.TECHNICAL^FEE;
+            LINE^REC.MODIFIER^ADJ := LINE^REC.MODIFIER^ADJ +
+              (FEE^REC.GLOBAL^FEE - FEE^REC.TECHNICAL^FEE);
+          END
+        ELSE IF MODS(I) = MOD^BILATERAL FOR 2 THEN
+          BEGIN
+            ! Bilateral procedure -- 150% of fee schedule
+            FIXED BILATERAL^AMT := BASE^AMT * 150F / 100F;
+            LINE^REC.MODIFIER^ADJ := LINE^REC.MODIFIER^ADJ -
+              (BILATERAL^AMT - BASE^AMT);
+            BASE^AMT := BILATERAL^AMT;
+          END
+        ELSE IF MODS(I) = MOD^ASST^SURG FOR 2 THEN
+          BEGIN
+            ! Assistant surgeon -- 20% of primary surgeon fee
+            FIXED ASST^AMT := BASE^AMT * ASST^SURG^PCT / 100F;
+            LINE^REC.MODIFIER^ADJ := LINE^REC.MODIFIER^ADJ +
+              (BASE^AMT - ASST^AMT);
+            BASE^AMT := ASST^AMT;
+          END;
+      END;
+
+    LINE^REC.FEE^SCHED^AMT := BASE^AMT;
+  END;
+
+!---------------------------------------------------------------
+! PROC CALC^ANESTHESIA -- Calculate anesthesia allowed amount
+!---------------------------------------------------------------
+PROC CALC^ANESTHESIA(LINE^REC, FEE^REC);
+  STRUCT .LINE^REC (BILL^LINE);
+  STRUCT .FEE^REC  (FEE^ENTRY);
+  BEGIN
+    FIXED BASE^UNITS;
+    FIXED TIME^UNITS;
+    FIXED TOTAL^UNITS;
+    FIXED MODIFYING^UNITS := 0F;
+
+    ! Base units from fee schedule
+    BASE^UNITS := FEE^REC.ANES^BASE^UNITS;
+
+    ! Time units = minutes / 15 (rounded up)
+    TIME^UNITS := $FIXED(LINE^REC.ANES^MINUTES + ANES^TIME^UNIT - 1)
+                  / $FIXED(ANES^TIME^UNIT);
+
+    ! Modifying units for physical status or qualifying circumstances
+    ! P3=+1, P4=+2, P5=+3 (simplified -- full table in production)
+    ! 99100 (anes complicated by emergency) = +5 units
+
+    TOTAL^UNITS := BASE^UNITS + TIME^UNITS + MODIFYING^UNITS;
+
+    LINE^REC.FEE^SCHED^AMT := TOTAL^UNITS * FEE^REC.ANES^CONV^FACTOR;
+    LINE^REC.MODIFIER^ADJ := 0F;
+    LINE^REC.MULTI^PROC^ADJ := 0F;
+  END;
+
+!---------------------------------------------------------------
+! PROC RANK^PROCEDURES -- Sort lines for multiple procedure reduction
+!---------------------------------------------------------------
+PROC RANK^PROCEDURES(LINES, COUNT);
+  STRUCT .LINES(MAX^LINES) (BILL^LINE);
+  INT    COUNT;
+  BEGIN
+    INT    I, J;
+    INT    RANK := 0;
+    FIXED  MAX^AMT;
+    INT    MAX^IDX;
+    INT    RANKED(0:MAX^LINES - 1);
+
+    ! Initialize ranked flags
+    FOR I := 0 TO COUNT - 1 DO RANKED(I) := 0;
+
+    ! Rank by allowed amount descending (highest paid first at 100%)
+    FOR RANK := 0 TO COUNT - 1 DO
+      BEGIN
+        MAX^AMT := -1F;
+        MAX^IDX := -1;
+        FOR I := 0 TO COUNT - 1 DO
+          BEGIN
+            IF RANKED(I) = 0 AND
+               LINES(I).LINE^STATUS = 0 AND
+               LINES(I).FEE^SCHED^AMT > MAX^AMT THEN
+              BEGIN
+                MAX^AMT := LINES(I).FEE^SCHED^AMT;
+                MAX^IDX := I;
+              END;
+          END;
+        IF MAX^IDX >= 0 THEN
+          BEGIN
+            RANKED(MAX^IDX) := 1;
+            LINES(MAX^IDX).MULTI^PROC^RANK := RANK;
+          END;
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC APPLY^MULTI^PROC -- Apply multiple procedure reduction
+!---------------------------------------------------------------
+PROC APPLY^MULTI^PROC(LINES, COUNT);
+  STRUCT .LINES(MAX^LINES) (BILL^LINE);
+  INT    COUNT;
+  BEGIN
+    INT I;
+    INT RANK;
+    FIXED REDUCTION^PCT;
+
+    FOR I := 0 TO COUNT - 1 DO
+      BEGIN
+        IF LINES(I).LINE^STATUS <> 0 THEN
+          BEGIN
+            LINES(I).MULTI^PROC^ADJ := 0F;
+          END
+        ELSE
+          BEGIN
+            RANK := LINES(I).MULTI^PROC^RANK;
+            IF RANK < MAX^PROC^REDUCE THEN
+              REDUCTION^PCT := MULTI^PROC^PCT(RANK)
+            ELSE
+              REDUCTION^PCT := 50F;
+
+            IF REDUCTION^PCT < 100F THEN
+              BEGIN
+                FIXED REDUCED^AMT := LINES(I).FEE^SCHED^AMT *
+                                     REDUCTION^PCT / 100F;
+                LINES(I).MULTI^PROC^ADJ :=
+                  LINES(I).FEE^SCHED^AMT - REDUCED^AMT;
+                LINES(I).ALLOWED^AMT := REDUCED^AMT;
+              END
+            ELSE
+              BEGIN
+                LINES(I).MULTI^PROC^ADJ := 0F;
+                LINES(I).ALLOWED^AMT := LINES(I).FEE^SCHED^AMT;
+              END;
+          END;
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC APPLY^NETWORK^DISCOUNT -- Apply network discount to bill
+!---------------------------------------------------------------
+PROC APPLY^NETWORK^DISCOUNT(HDR, LINES);
+  STRUCT .HDR (BILL^HDR);
+  STRUCT .LINES(MAX^LINES) (BILL^LINE);
+  BEGIN
+    INT I;
+    FIXED DISCOUNT;
+
+    IF HDR.NETWORK^DISCOUNT^PCT <= 0F THEN RETURN;
+
+    FOR I := 0 TO HDR.LINE^COUNT - 1 DO
+      BEGIN
+        IF LINES(I).LINE^STATUS = 0 THEN
+          BEGIN
+            DISCOUNT := LINES(I).ALLOWED^AMT *
+                        HDR.NETWORK^DISCOUNT^PCT / 100F;
+            LINES(I).PAYMENT^AMT := LINES(I).ALLOWED^AMT - DISCOUNT;
+          END;
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC APPLY^COB^ADJUSTMENT -- Coordination of Benefits adjustment
+!---------------------------------------------------------------
+PROC APPLY^COB^ADJUSTMENT(HDR, LINES);
+  STRUCT .HDR  (BILL^HDR);
+  STRUCT .LINES(MAX^LINES) (BILL^LINE);
+  BEGIN
+    INT I;
+    FIXED COB^REMAINING;
+    FIXED LINE^SHARE;
+
+    IF HDR.COB^AMOUNT <= 0F THEN RETURN;
+
+    ! Workers' comp is primary payer -- exclusive remedy doctrine
+    ! COB applies only for non-WC concurrent conditions
+    COB^REMAINING := HDR.COB^AMOUNT;
+
+    FOR I := 0 TO HDR.LINE^COUNT - 1 DO
+      BEGIN
+        IF LINES(I).LINE^STATUS = 0 AND COB^REMAINING > 0F THEN
+          BEGIN
+            ! Proportional COB reduction across payable lines
+            LINE^SHARE := COB^REMAINING;
+            IF LINE^SHARE > LINES(I).PAYMENT^AMT THEN
+              LINE^SHARE := LINES(I).PAYMENT^AMT;
+
+            LINES(I).PAYMENT^AMT := LINES(I).PAYMENT^AMT - LINE^SHARE;
+            COB^REMAINING := COB^REMAINING - LINE^SHARE;
+          END;
+      END;
+
+    HDR.TOTAL^ADJUSTED := HDR.TOTAL^ADJUSTED + HDR.COB^AMOUNT - COB^REMAINING;
+  END;
+
+!---------------------------------------------------------------
+! PROC PROCESS^BILL -- Main bill processing logic
+!---------------------------------------------------------------
+INT PROC PROCESS^BILL(HDR, LINES);
+  STRUCT .HDR (BILL^HDR);
+  STRUCT .LINES(MAX^LINES) (BILL^LINE);
+  BEGIN
+    INT I;
+    INT IS^ANES;
+    INT RESULT;
+
+    ! Step 1: Duplicate check
+    IF CHECK^DUPLICATE(HDR) = 1 THEN
+      BEGIN
+        HDR.BILL^STATUS := STAT^DUPLICATE;
+        CALL WRITE^AUDIT("DUPLICATE DETECTED", HDR.BILL^ID);
+        RETURN STAT^DUPLICATE;
+      END;
+
+    ! Step 2: Reprice each line item
+    FOR I := 0 TO HDR.LINE^COUNT - 1 DO
+      BEGIN
+        ! Validate CPT code
+        RESULT := LOOKUP^FEE(LINES(I).CPT^CODE,
+                             HDR.STATE^JURISDICTION,
+                             HDR.SERVICE^FROM, W^FEE);
+        IF RESULT < 0 THEN
+          BEGIN
+            LINES(I).LINE^STATUS := 1;  ! Denied
+            LINES(I).DENY^REASON ':=' "ICPT";  ! Invalid CPT
+            LINES(I).ALLOWED^AMT := 0F;
+            LINES(I).PAYMENT^AMT := 0F;
+          END
+        ELSE
+          BEGIN
+            ! Check if anesthesia procedure (00100-01999)
+            IS^ANES := 0;
+            IF LINES(I).CPT^CODE[0] = "0" AND
+               (LINES(I).CPT^CODE[1] = "0" OR
+                LINES(I).CPT^CODE[1] = "1") THEN
+              IS^ANES := 1;
+
+            IF IS^ANES = 1 THEN
+              CALL CALC^ANESTHESIA(LINES(I), W^FEE)
+            ELSE
+              BEGIN
+                CALL APPLY^MODIFIERS(LINES(I), W^FEE);
+                ! Multiply by units
+                LINES(I).FEE^SCHED^AMT :=
+                  LINES(I).FEE^SCHED^AMT * $FIXED(LINES(I).UNITS);
+              END;
+
+            LINES(I).LINE^STATUS := 0;
+            LINES(I).ALLOWED^AMT := LINES(I).FEE^SCHED^AMT;
+            LINES(I).PAYMENT^AMT := LINES(I).FEE^SCHED^AMT;
+          END;
+      END;
+
+    ! Step 3: Multiple procedure reduction
+    CALL RANK^PROCEDURES(LINES, HDR.LINE^COUNT);
+    CALL APPLY^MULTI^PROC(LINES, HDR.LINE^COUNT);
+
+    ! Step 4: Network discount
+    CALL APPLY^NETWORK^DISCOUNT(HDR, LINES);
+
+    ! Step 5: COB adjustment
+    CALL APPLY^COB^ADJUSTMENT(HDR, LINES);
+
+    ! Step 6: Accumulate totals
+    HDR.TOTAL^BILLED  := 0F;
+    HDR.TOTAL^ALLOWED := 0F;
+    HDR.TOTAL^PAYMENT := 0F;
+    FOR I := 0 TO HDR.LINE^COUNT - 1 DO
+      BEGIN
+        HDR.TOTAL^BILLED  := HDR.TOTAL^BILLED + LINES(I).BILLED^AMT;
+        HDR.TOTAL^ALLOWED := HDR.TOTAL^ALLOWED + LINES(I).ALLOWED^AMT;
+        HDR.TOTAL^PAYMENT := HDR.TOTAL^PAYMENT + LINES(I).PAYMENT^AMT;
+      END;
+
+    HDR.TOTAL^ADJUSTED := HDR.TOTAL^BILLED - HDR.TOTAL^PAYMENT;
+    HDR.BILL^STATUS := STAT^REPRICED;
+
+    CALL WRITE^AUDIT("BILL REPRICED", HDR.BILL^ID);
+    RETURN STAT^REPRICED;
+  END;
+
+!---------------------------------------------------------------
+! PROC WRITE^AUDIT -- Write audit trail record
+!---------------------------------------------------------------
+PROC WRITE^AUDIT(MSG, BILL^ID);
+  STRING .MSG;
+  STRING .BILL^ID[0:11];
+  BEGIN
+    STRING AUDIT^REC[0:79];
+    INT    TIMESTAMP[0:6];
+
+    CALL TIMESTAMP(TIMESTAMP);
+    AUDIT^REC ':=' BILL^ID FOR 12;
+    AUDIT^REC[12] ':=' " " FOR 1;
+    AUDIT^REC[13] ':=' MSG FOR 40;
+    CALL WRITE(AUDIT^FNUM, AUDIT^REC, 80);
+  END;
+
+!---------------------------------------------------------------
+! PROC SERVER^MAIN -- Pathway server main loop
+!---------------------------------------------------------------
+PROC SERVER^MAIN MAIN;
+  BEGIN
+    INT    MSGCODE;
+    INT    COUNTREAD;
+    INT    REPLY^ERR;
+    STRING REQUEST^BUF[0:4095];
+    STRING REPLY^BUF[0:4095];
+    INT    REPLY^LEN;
+
+    ! Initialize
+    CALL OPEN^FILES;
+    CALL LOAD^FEE^SCHEDULE;
+    CALL WRITE^AUDIT("SERVER STARTED ", "            ");
+
+    ! Open $RECEIVE for Pathway messages
+    INT RECV^FNUM;
+    CALL OPEN(RECV^FNUM, "$RECEIVE", 1);
+    IF <> THEN CALL ABEND^PROCESS(99);
+
+    ! Main server loop
+    WHILE 1 DO
+      BEGIN
+        CALL READ(RECV^FNUM, REQUEST^BUF, 4096);
+        IF < THEN
+          BEGIN
+            ! System message
+            CALL READUPDATE(RECV^FNUM, REQUEST^BUF, 4096);
+          END;
+
+        COUNTREAD := $RDCOUNT;
+        MSGCODE := $MSGCODE;
+
+        IF MSGCODE = -30 THEN   ! OPEN message
+          BEGIN
+            CALL REPLY(, , 0);
+          END
+        ELSE IF MSGCODE = -33 THEN  ! CLOSE message
+          BEGIN
+            CALL REPLY(, , 0);
+          END
+        ELSE IF MSGCODE = 1 THEN    ! PROCESS BILL request
+          BEGIN
+            W^BILL^HDR ':=' REQUEST^BUF FOR $LEN(BILL^HDR);
+            W^BILL^LINES ':=' REQUEST^BUF[$LEN(BILL^HDR)]
+                              FOR W^BILL^HDR.LINE^COUNT * $LEN(BILL^LINE);
+
+            INT STATUS;
+            STATUS := PROCESS^BILL(W^BILL^HDR, W^BILL^LINES);
+
+            ! Build reply
+            REPLY^BUF ':=' W^BILL^HDR FOR $LEN(BILL^HDR);
+            REPLY^BUF[$LEN(BILL^HDR)] ':=' W^BILL^LINES
+              FOR W^BILL^HDR.LINE^COUNT * $LEN(BILL^LINE);
+            REPLY^LEN := $LEN(BILL^HDR) +
+              W^BILL^HDR.LINE^COUNT * $LEN(BILL^LINE);
+
+            CALL REPLY(REPLY^BUF, REPLY^LEN);
+          END
+        ELSE
+          BEGIN
+            ! Unknown message code
+            CALL REPLY(, , 2);  ! Error reply
+          END;
+      END;
+  END;

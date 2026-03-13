@@ -1,0 +1,542 @@
+?page "MEDRSCR - Medical Bill Review Screen"
+?section IDENTIFICATION
+*
+*  SCREEN NAME:   MEDRSCR
+*  DESCRIPTION:   Medical Bill Review and Adjudication Screen
+*  SYSTEM:        Claims Management System (CMS)
+*  PATHWAY:       MEDSRV (Medical Review Server Class)
+*  AUTHOR:        TPA Systems Development
+*  DATE:          2024-08-12
+*  MODIFIED:      2025-02-28 - Added modifier validation, bundling edits
+*
+*  Medical bill review is the highest-volume transaction in WC claims.
+*  This screen presents line-item detail with fee schedule comparison
+*  for adjudication. Supports CMS-1500 and UB-04 bill formats.
+*
+*  Fee schedules are jurisdiction-specific. Most states use a variant
+*  of the Medicare RBRVS fee schedule with a conversion factor.
+*  Some states (e.g., TX, FL) have their own fee schedules.
+*
+*  Modifier handling: -25 (significant E&M), -59 (distinct procedure),
+*  -76 (repeat procedure), -77 (repeat by another physician),
+*  -TC (technical component), -26 (professional component)
+*
+?section DATA
+*
+SCREEN MEDRSCR.
+*
+    01 MED-SCREEN-RECORD.
+*
+*--- Bill Header (Lines 1-3)
+*
+       05 MED-HDR-CLAIM-NBR       PIC X(12)
+           AT 1, 2
+           DISPLAY LENGTH 12
+           PROTECTED
+           VALUE SPACES.
+       05 MED-HDR-CLAIMANT-NAME   PIC X(25)
+           AT 1, 16
+           DISPLAY LENGTH 25
+           PROTECTED
+           VALUE SPACES.
+       05 MED-HDR-BILL-NBR        PIC X(15)
+           AT 1, 44
+           DISPLAY LENGTH 15
+           PROTECTED.
+       05 MED-HDR-BILL-TYPE       PIC X(6)
+           AT 1, 62
+           DISPLAY LENGTH 6
+           PROTECTED.
+       05 MED-HDR-BILL-STATUS     PIC X(8)
+           AT 1, 70
+           DISPLAY LENGTH 8
+           PROTECTED.
+*
+       05 MED-HDR-PROV-NAME       PIC X(30)
+           AT 2, 16
+           DISPLAY LENGTH 30
+           PROTECTED.
+       05 MED-HDR-PROV-NPI        PIC X(10)
+           AT 2, 48
+           DISPLAY LENGTH 10
+           PROTECTED.
+       05 MED-HDR-PROV-TIN        PIC X(11)
+           AT 2, 60
+           DISPLAY LENGTH 11
+           PROTECTED.
+       05 MED-HDR-PROV-NETWORK    PIC X(6)
+           AT 2, 73
+           DISPLAY LENGTH 6
+           PROTECTED.
+*
+       05 MED-HDR-DOS-FROM        PIC X(10)
+           AT 3, 16
+           DISPLAY LENGTH 10
+           PROTECTED.
+       05 MED-HDR-DOS-TO          PIC X(10)
+           AT 3, 29
+           DISPLAY LENGTH 10
+           PROTECTED.
+       05 MED-HDR-TOTAL-BILLED    PIC $ZZ,ZZZ.99
+           AT 3, 42
+           DISPLAY LENGTH 11
+           PROTECTED.
+       05 MED-HDR-TOTAL-ALLOWED   PIC $ZZ,ZZZ.99
+           AT 3, 55
+           DISPLAY LENGTH 11
+           PROTECTED.
+       05 MED-HDR-PRIOR-AUTH      PIC X(12)
+           AT 3, 68
+           DISPLAY LENGTH 12
+           PROTECTED.
+*
+*--- Diagnosis Codes (Line 5)
+*
+       05 MED-DIAG-LABEL          PIC X(4)
+           AT 5, 1
+           DISPLAY LENGTH 4
+           PROTECTED
+           VALUE "Dx: ".
+       05 MED-DIAG-1              PIC X(8)
+           AT 5, 6
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-2              PIC X(8)
+           AT 5, 15
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-3              PIC X(8)
+           AT 5, 24
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-4              PIC X(8)
+           AT 5, 33
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-5              PIC X(8)
+           AT 5, 42
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-6              PIC X(8)
+           AT 5, 51
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-7              PIC X(8)
+           AT 5, 60
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-8              PIC X(8)
+           AT 5, 69
+           DISPLAY LENGTH 8
+           PROTECTED.
+*
+       05 MED-DIAG-9              PIC X(8)
+           AT 6, 6
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-10             PIC X(8)
+           AT 6, 15
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-11             PIC X(8)
+           AT 6, 24
+           DISPLAY LENGTH 8
+           PROTECTED.
+       05 MED-DIAG-12             PIC X(8)
+           AT 6, 33
+           DISPLAY LENGTH 8
+           PROTECTED.
+*
+*--- Line Item Grid Header (Line 8)
+*
+       05 MED-GRID-HEADER         PIC X(78)
+           AT 8, 1
+           DISPLAY LENGTH 78
+           PROTECTED
+           VALUE " Ln CPT    Mod  Description"
+           &     "            Billed   FeeSch   Allowed  Un D".
+*
+*--- Line Items (Lines 9-18, 10 lines)
+*
+       05 MED-LINE OCCURS 10 TIMES.
+          10 MED-LN-SEL           PIC X(1)
+              DISPLAY LENGTH 1
+              UPSHIFT.
+          10 MED-LN-NBR           PIC Z9
+              DISPLAY LENGTH 2
+              PROTECTED.
+          10 MED-LN-CPT           PIC X(5)
+              DISPLAY LENGTH 5
+              PROTECTED.
+          10 MED-LN-MOD           PIC X(4)
+              DISPLAY LENGTH 4
+              PROTECTED.
+          10 MED-LN-DESC          PIC X(20)
+              DISPLAY LENGTH 20
+              PROTECTED.
+          10 MED-LN-BILLED        PIC Z,ZZZ.99
+              DISPLAY LENGTH 8
+              PROTECTED.
+          10 MED-LN-FEESCHED      PIC Z,ZZZ.99
+              DISPLAY LENGTH 8
+              PROTECTED.
+          10 MED-LN-ALLOWED       PIC Z,ZZZ.99
+              DISPLAY LENGTH 8.
+          10 MED-LN-UNITS         PIC Z9
+              DISPLAY LENGTH 2
+              PROTECTED.
+          10 MED-LN-DECISION      PIC X(1)
+              DISPLAY LENGTH 1
+              UPSHIFT.
+*
+*--- Review Decision Area (Lines 19-20)
+*
+       05 MED-DECISION-LABEL      PIC X(20)
+           AT 19, 1
+           DISPLAY LENGTH 20
+           PROTECTED
+           VALUE "Decision: A=Approve ".
+       05 MED-DECISION-HELP       PIC X(50)
+           AT 19, 22
+           DISPLAY LENGTH 50
+           PROTECTED
+           VALUE "R=Reduce D=Deny  (per line or F5 for all lines)".
+*
+       05 MED-DENY-REASON         PIC X(4)
+           AT 20, 18
+           DISPLAY LENGTH 4
+           UPSHIFT.
+       05 MED-DENY-REASON-DESC    PIC X(40)
+           AT 20, 25
+           DISPLAY LENGTH 40
+           PROTECTED.
+       05 MED-DENY-REASON-HELP    PIC X(30)
+           AT 20, 45
+           DISPLAY LENGTH 30
+           PROTECTED
+           VALUE "(NREL DUPE NOAU BNDL EXMX ...)".
+*
+*--- Totals Line (Line 21)
+*
+       05 MED-TOT-LABEL           PIC X(8)
+           AT 21, 1
+           DISPLAY LENGTH 8
+           PROTECTED BRIGHT
+           VALUE "TOTALS: ".
+       05 MED-TOT-LINES           PIC Z9
+           AT 21, 10
+           DISPLAY LENGTH 2
+           PROTECTED.
+       05 MED-TOT-LINES-LBL       PIC X(6)
+           AT 21, 13
+           DISPLAY LENGTH 6
+           PROTECTED
+           VALUE "Lines ".
+       05 MED-TOT-BILLED          PIC $ZZ,ZZZ.99
+           AT 21, 30
+           DISPLAY LENGTH 11
+           PROTECTED BRIGHT.
+       05 MED-TOT-FEESCHED        PIC $ZZ,ZZZ.99
+           AT 21, 42
+           DISPLAY LENGTH 11
+           PROTECTED.
+       05 MED-TOT-ALLOWED         PIC $ZZ,ZZZ.99
+           AT 21, 54
+           DISPLAY LENGTH 11
+           PROTECTED BRIGHT.
+       05 MED-TOT-SAVINGS         PIC $ZZ,ZZZ.99
+           AT 21, 66
+           DISPLAY LENGTH 11
+           PROTECTED.
+*
+*--- Message and Function Key Area (Lines 23-24)
+*
+       05 MED-MESSAGE-AREA        PIC X(78)
+           AT 23, 1
+           DISPLAY LENGTH 78
+           PROTECTED.
+       05 MED-FKEY-LINE           PIC X(78)
+           AT 24, 1
+           DISPLAY LENGTH 78
+           PROTECTED
+           VALUE "F3=Exit  F5=Process  F6=Fee Lkup  "
+           &     "F7=Auth Chk  F8=Next Line".
+*
+*--- Hidden Fields
+*
+       05 MED-USER-ID             PIC X(8)   HIDDEN.
+       05 MED-FUNCTION-CODE       PIC X(2)   HIDDEN.
+       05 MED-CLAIM-KEY           PIC X(12)  HIDDEN.
+       05 MED-BILL-KEY            PIC X(15)  HIDDEN.
+       05 MED-TIMESTAMP           PIC X(26)  HIDDEN.
+       05 MED-CURRENT-LINE-PAGE   PIC 9(2)   HIDDEN.
+       05 MED-TOTAL-LINE-PAGES    PIC 9(2)   HIDDEN.
+       05 MED-FEE-SCHED-CODE      PIC X(4)   HIDDEN.
+       05 MED-JURISDICTION         PIC X(2)   HIDDEN.
+       05 MED-BUNDLE-EDIT-FLAG    PIC X(1)   HIDDEN.
+*
+?section LOGIC
+*
+*================================================================
+*  MAIN PROCESSING LOGIC
+*================================================================
+*
+PROCEDURE MEDRSCR-MAIN.
+*
+    PERFORM MED-INITIALIZE.
+    PERFORM MED-PROCESS UNTIL MED-FUNCTION-CODE = "EX".
+    PERFORM MED-TERMINATE.
+*
+END PROCEDURE.
+*
+*================================================================
+*  INITIALIZE SCREEN
+*================================================================
+*
+PROCEDURE MED-INITIALIZE.
+*
+    DISPLAY BASE MED-SCREEN-RECORD.
+    MOVE SPACES TO MED-MESSAGE-AREA.
+    MOVE 1 TO MED-CURRENT-LINE-PAGE.
+    MOVE "IN" TO MED-FUNCTION-CODE.
+*
+    SEND MED-SCREEN-RECORD TO MEDSRV
+        REPLY LENGTH 4096
+        TIMEOUT 30.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE MED-SCREEN-RECORD FROM MEDSRV
+        DISPLAY OVERLAY MED-SCREEN-RECORD
+*
+*       Check for bundling edits on initial load
+*
+        IF MED-BUNDLE-EDIT-FLAG = "Y"
+            MOVE "NOTE: Bundling edits detected - review allowed amounts"
+                TO MED-MESSAGE-AREA
+            DISPLAY OVERLAY MED-MESSAGE-AREA
+        END-IF
+    ELSE
+        MOVE "ERROR: Medical review server unavailable"
+            TO MED-MESSAGE-AREA
+        DISPLAY OVERLAY MED-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  MAIN PROCESS LOOP
+*================================================================
+*
+PROCEDURE MED-PROCESS.
+*
+    ACCEPT MED-SCREEN-RECORD UNTIL
+        F3-KEY, F5-KEY, F6-KEY, F7-KEY, F8-KEY.
+*
+    EVALUATE TRUE
+        WHEN F3-KEY
+            MOVE "EX" TO MED-FUNCTION-CODE
+*
+        WHEN F5-KEY
+            PERFORM MED-VALIDATE-DECISIONS
+            IF MED-MESSAGE-AREA = SPACES
+                PERFORM MED-PROCESS-BILL
+            END-IF
+*
+        WHEN F6-KEY
+            PERFORM MED-FEE-LOOKUP
+*
+        WHEN F7-KEY
+            PERFORM MED-AUTH-CHECK
+*
+        WHEN F8-KEY
+            PERFORM MED-NEXT-LINE-PAGE
+*
+    END-EVALUATE.
+*
+END PROCEDURE.
+*
+*================================================================
+*  VALIDATE LINE-ITEM DECISIONS
+*================================================================
+*
+PROCEDURE MED-VALIDATE-DECISIONS.
+*
+    MOVE SPACES TO MED-MESSAGE-AREA.
+*
+*   Verify each line has a decision code
+*
+    PERFORM VARYING WS-IDX FROM 1 BY 1
+        UNTIL WS-IDX > 10
+        IF MED-LN-CPT(WS-IDX) NOT = SPACES
+            IF MED-LN-DECISION(WS-IDX) NOT = "A"
+               AND MED-LN-DECISION(WS-IDX) NOT = "R"
+               AND MED-LN-DECISION(WS-IDX) NOT = "D"
+                STRING "Line " WS-IDX
+                    " requires decision (A/R/D)"
+                    DELIMITED SIZE
+                    INTO MED-MESSAGE-AREA
+                DISPLAY OVERLAY MED-MESSAGE-AREA
+            END-IF
+*
+*           Deny reason required for denied lines
+*
+            IF MED-LN-DECISION(WS-IDX) = "D"
+                IF MED-DENY-REASON = SPACES
+                    MOVE "Deny reason code required for denied lines"
+                        TO MED-MESSAGE-AREA
+                    DISPLAY OVERLAY MED-MESSAGE-AREA
+                END-IF
+            END-IF
+*
+*           Allowed amount validation for reduced lines
+*
+            IF MED-LN-DECISION(WS-IDX) = "R"
+                IF MED-LN-ALLOWED(WS-IDX) = ZERO
+                    STRING "Line " WS-IDX
+                        " reduced - enter allowed amount"
+                        DELIMITED SIZE
+                        INTO MED-MESSAGE-AREA
+                    DISPLAY OVERLAY MED-MESSAGE-AREA
+                END-IF
+                IF MED-LN-ALLOWED(WS-IDX) > MED-LN-BILLED(WS-IDX)
+                    STRING "Line " WS-IDX
+                        " allowed cannot exceed billed"
+                        DELIMITED SIZE
+                        INTO MED-MESSAGE-AREA
+                    DISPLAY OVERLAY MED-MESSAGE-AREA
+                END-IF
+            END-IF
+        END-IF
+    END-PERFORM.
+*
+END PROCEDURE.
+*
+*================================================================
+*  PROCESS BILL (SUBMIT DECISIONS)
+*================================================================
+*
+PROCEDURE MED-PROCESS-BILL.
+*
+    MOVE "PR" TO MED-FUNCTION-CODE.
+*
+    SEND MED-SCREEN-RECORD TO MEDSRV
+        REPLY LENGTH 4096
+        TIMEOUT 30.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE MED-SCREEN-RECORD FROM MEDSRV
+        DISPLAY OVERLAY MED-SCREEN-RECORD
+        STRING "Bill processed - Total allowed: "
+               MED-TOT-ALLOWED
+               " Savings: " MED-TOT-SAVINGS
+               DELIMITED SIZE
+               INTO MED-MESSAGE-AREA
+    ELSE
+        MOVE "ERROR: Bill processing failed"
+            TO MED-MESSAGE-AREA
+    END-IF.
+*
+    DISPLAY OVERLAY MED-MESSAGE-AREA.
+*
+END PROCEDURE.
+*
+*================================================================
+*  FEE SCHEDULE LOOKUP
+*================================================================
+*
+PROCEDURE MED-FEE-LOOKUP.
+*
+*   Find selected line for fee lookup
+*
+    MOVE SPACES TO MED-MESSAGE-AREA.
+    MOVE "FL" TO MED-FUNCTION-CODE.
+*
+    PERFORM VARYING WS-IDX FROM 1 BY 1
+        UNTIL WS-IDX > 10
+        IF MED-LN-SEL(WS-IDX) = "X" OR MED-LN-SEL(WS-IDX) = "x"
+            SEND MED-SCREEN-RECORD TO MEDSRV
+                REPLY LENGTH 4096
+                TIMEOUT 15
+            IF TERMINATION-STATUS = 0
+                RECEIVE MED-SCREEN-RECORD FROM MEDSRV
+                DISPLAY OVERLAY MED-SCREEN-RECORD
+                STRING "Fee schedule: " MED-FEE-SCHED-CODE
+                    " applied for " MED-JURISDICTION
+                    DELIMITED SIZE INTO MED-MESSAGE-AREA
+            END-IF
+            MOVE SPACES TO MED-LN-SEL(WS-IDX)
+        END-IF
+    END-PERFORM.
+*
+    IF MED-MESSAGE-AREA = SPACES
+        MOVE "Select a line with 'X' for fee schedule lookup"
+            TO MED-MESSAGE-AREA
+    END-IF.
+*
+    DISPLAY OVERLAY MED-MESSAGE-AREA.
+*
+END PROCEDURE.
+*
+*================================================================
+*  AUTHORIZATION CHECK
+*================================================================
+*
+PROCEDURE MED-AUTH-CHECK.
+*
+    MOVE "AC" TO MED-FUNCTION-CODE.
+*
+    SEND MED-SCREEN-RECORD TO MEDSRV
+        REPLY LENGTH 4096
+        TIMEOUT 15.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE MED-SCREEN-RECORD FROM MEDSRV
+        DISPLAY OVERLAY MED-SCREEN-RECORD
+        IF MED-HDR-PRIOR-AUTH NOT = SPACES
+            MOVE "Authorization verified and applied"
+                TO MED-MESSAGE-AREA
+        ELSE
+            MOVE "No prior authorization on file for this provider/DOS"
+                TO MED-MESSAGE-AREA
+        END-IF
+    ELSE
+        MOVE "ERROR: Authorization check failed"
+            TO MED-MESSAGE-AREA
+    END-IF.
+*
+    DISPLAY OVERLAY MED-MESSAGE-AREA.
+*
+END PROCEDURE.
+*
+*================================================================
+*  NEXT LINE PAGE
+*================================================================
+*
+PROCEDURE MED-NEXT-LINE-PAGE.
+*
+    IF MED-CURRENT-LINE-PAGE < MED-TOTAL-LINE-PAGES
+        ADD 1 TO MED-CURRENT-LINE-PAGE
+        MOVE "NL" TO MED-FUNCTION-CODE
+        SEND MED-SCREEN-RECORD TO MEDSRV
+            REPLY LENGTH 4096
+            TIMEOUT 15
+        IF TERMINATION-STATUS = 0
+            RECEIVE MED-SCREEN-RECORD FROM MEDSRV
+            DISPLAY OVERLAY MED-SCREEN-RECORD
+        END-IF
+    ELSE
+        MOVE "No additional line items" TO MED-MESSAGE-AREA
+        DISPLAY OVERLAY MED-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  TERMINATE SCREEN
+*================================================================
+*
+PROCEDURE MED-TERMINATE.
+*
+    ESCAPE TO CLMMENU.
+*
+END PROCEDURE.

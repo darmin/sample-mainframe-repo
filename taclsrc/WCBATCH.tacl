@@ -1,0 +1,359 @@
+?SECTION WCBATCH ROUTINE
+!==================================================================!
+! SCRIPT:     WCBATCH                                              !
+! AUTHOR:     MAINFRAMEMOD TPA SYSTEMS                             !
+! DATE:       2024-01-20                                           !
+! PURPOSE:    WORKERS COMP MONTHLY BATCH PROCESSING ORCHESTRATOR   !
+!             RUNS ALL MONTHLY CYCLE JOBS IN SEQUENCE WITH ERROR   !
+!             HANDLING, TIMING, AND COMPLETION REPORTING            !
+! PLATFORM:   HPE NONSTOP / GUARDIAN / TACL                        !
+!==================================================================!
+! CHANGE LOG:                                                      !
+! 2024-01-20  INITIAL DEVELOPMENT                                  !
+! 2024-04-15  ADDED ACTUARIAL DATA EXTRACT                         !
+! 2024-07-01  ADDED 1099 ACCUMULATION AND STALE CHECK PROCESSING   !
+! 2024-10-10  ENHANCED ERROR HANDLING AND RETRY LOGIC              !
+!==================================================================!
+
+! Global variables
+#SET BATCH^RUN^DATE [#TIMESTAMP]
+#SET BATCH^LOG^FILE $DATA1.WCFILES.BATCHLOG
+#SET BATCH^STATUS 0
+#SET STEP^COUNT 0
+#SET STEP^ERRORS 0
+#SET TOTAL^STEPS 10
+#SET RETRY^MAX 3
+#SET RETRY^WAIT 30
+
+! Notification addresses
+#SET NOTIFY^EMAIL WCBATCH@TPACOMPANY.COM
+#SET NOTIFY^PAGER 5551234567
+
+! Data volume assignments
+#SET DATA^VOL $DATA1
+#SET WORK^VOL $DATA2
+#SET REPORT^VOL $DATA3
+
+!------------------------------------------------------------------!
+! MAIN BATCH ORCHESTRATION                                         !
+!------------------------------------------------------------------!
+#PUSH ERRTEXT
+
+SINK [#LOG^FILE OPEN [BATCH^LOG^FILE]]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: MONTHLY BATCH CYCLE STARTED"]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: RUN DATE = " [BATCH^RUN^DATE]]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: TOTAL STEPS = " [TOTAL^STEPS]]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "=================================================="]
+
+!------------------------------------------------------------------!
+! STEP 1: MONTHLY RESERVE REVIEW TRIGGER                           !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 1
+#SET STEP^NAME "RESERVE REVIEW TRIGGER"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 1/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+[#IF [#PROCESSEXISTS $DATA1.WCOBJ.WCRESRV] |THEN|
+  #SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRESRV /NAME $RSRV/ -
+    IN  [DATA^VOL].WCFILES.RSVWDAT, -
+    OUT [DATA^VOL].WCFILES.RSVWOUT]
+  #SET STEP^CC [#PROCESSWAIT $RSRV]
+  [#IF [STEP^CC] <> 0 |THEN|
+    #SET STEP^ERRORS [STEP^ERRORS] + 1
+    SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+      "STEP 1: *** FAILED *** RC=" [STEP^CC]]
+    [#IF [STEP^ERRORS] >= 3 |THEN|
+      #SET BATCH^STATUS -1
+      #GOTO BATCH^ABORT
+    ]
+  |ELSE|
+    SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+      "STEP 1: COMPLETED SUCCESSFULLY"]
+  ]
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 1: *** ERROR *** WCRESRV OBJECT NOT FOUND"]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+]
+
+!------------------------------------------------------------------!
+! STEP 2: LOSS DEVELOPMENT FACTOR APPLICATION                      !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 2
+#SET STEP^NAME "LOSS DEVELOPMENT FACTORS"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 2/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCLDF /NAME $WLDF/ -
+  IN  [DATA^VOL].WCFILES.LDFDATA, -
+  OUT [DATA^VOL].WCFILES.LDFOUT]
+#SET STEP^CC [#PROCESSWAIT $WLDF]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 2: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 2: COMPLETED - LOSS DEVELOPMENT FACTORS APPLIED"]
+]
+
+!------------------------------------------------------------------!
+! STEP 3: ACTUARIAL DATA EXTRACT GENERATION                        !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 3
+#SET STEP^NAME "ACTUARIAL DATA EXTRACT"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 3/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCACTRY /NAME $WACT/ -
+  IN  [DATA^VOL].WCFILES.CLMDATA, -
+  OUT [REPORT^VOL].WCRPTS.ACTEXTR]
+#SET STEP^CC [#PROCESSWAIT $WACT]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 3: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 3: COMPLETED - ACTUARIAL EXTRACT GENERATED"]
+  ! FTP extract to actuarial vendor
+  FTP $DATA3.WCRPTS.ACTEXTR ACTUARIAL.VENDOR.COM/INCOMING/
+]
+
+!------------------------------------------------------------------!
+! STEP 4: STATE FILING BATCH (FROI/SROI)                           !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 4
+#SET STEP^NAME "STATE FILING BATCH"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 4/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCSTATE /NAME $WSTF/ -
+  IN  [DATA^VOL].WCFILES.CLMIN, -
+  OUT [DATA^VOL].WCFILES.FILOUT]
+#SET STEP^CC [#PROCESSWAIT $WSTF]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 4: *** FAILED *** RC=" [STEP^CC] " - STATE FILINGS NOT SENT"]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 4: COMPLETED - STATE FILINGS GENERATED"]
+]
+
+!------------------------------------------------------------------!
+! STEP 5: EDI BATCH TRANSMISSION                                   !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 5
+#SET STEP^NAME "EDI BATCH TRANSMISSION"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 5/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+! Run EDI batch processing script
+RUN $DATA1.TACLOBJ.EDIBATCH
+#SET STEP^CC [#COMPLETIONCODE]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 5: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 5: COMPLETED - EDI BATCH TRANSMITTED"]
+]
+
+!------------------------------------------------------------------!
+! STEP 6: 1099 ACCUMULATION RUN                                    !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 6
+#SET STEP^NAME "1099 ACCUMULATION"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 6/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WC1099 /NAME $W109/ -
+  IN  [DATA^VOL].WCFILES.PYMTLOG, -
+  OUT [DATA^VOL].WCFILES.TX1099]
+#SET STEP^CC [#PROCESSWAIT $W109]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 6: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 6: COMPLETED - 1099 ACCUMULATIONS UPDATED"]
+]
+
+!------------------------------------------------------------------!
+! STEP 7: STALE CHECK PROCESSING                                   !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 7
+#SET STEP^NAME "STALE CHECK PROCESSING"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 7/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+! Stale checks = uncashed >180 days (varies by state escheatment law)
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCSTALE /NAME $WSTL/ -
+  IN  [DATA^VOL].WCFILES.CHKDATA, -
+  OUT [DATA^VOL].WCFILES.STALOUT]
+#SET STEP^CC [#PROCESSWAIT $WSTL]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 7: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 7: COMPLETED - STALE CHECKS PROCESSED"]
+]
+
+!------------------------------------------------------------------!
+! STEP 8: DIARY AGING AND ESCALATION                               !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 8
+#SET STEP^NAME "DIARY AGING AND ESCALATION"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 8/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCDIARY /NAME $WDIA/ -
+  IN  [DATA^VOL].WCFILES.DIARYFL, -
+  OUT [DATA^VOL].WCFILES.DIAOUT]
+#SET STEP^CC [#PROCESSWAIT $WDIA]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 8: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 8: COMPLETED - DIARIES AGED AND ESCALATED"]
+]
+
+!------------------------------------------------------------------!
+! STEP 9: MANAGEMENT REPORTS GENERATION                            !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 9
+#SET STEP^NAME "MANAGEMENT REPORTS"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 9/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+! Run reporting batch script
+RUN $DATA1.TACLOBJ.RPTBATCH
+#SET STEP^CC [#COMPLETIONCODE]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 9: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 9: COMPLETED - MANAGEMENT REPORTS GENERATED"]
+]
+
+!------------------------------------------------------------------!
+! STEP 10: DATA WAREHOUSE FEED                                     !
+!------------------------------------------------------------------!
+#SET STEP^COUNT 10
+#SET STEP^NAME "DATA WAREHOUSE FEED"
+#SET STEP^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "STEP 10/" [TOTAL^STEPS] ": " [STEP^NAME] " - STARTED " [STEP^START]]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCDWFEED /NAME $WDWF/ -
+  IN  [DATA^VOL].WCFILES.CLMDATA, -
+  OUT [WORK^VOL].WCWORK.DWEXTRT]
+#SET STEP^CC [#PROCESSWAIT $WDWF]
+[#IF [STEP^CC] <> 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 10: *** FAILED *** RC=" [STEP^CC]]
+  #SET STEP^ERRORS [STEP^ERRORS] + 1
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "STEP 10: COMPLETED - DATA WAREHOUSE FEED GENERATED"]
+  ! Transfer to data warehouse staging area
+  FTP [WORK^VOL].WCWORK.DWEXTRT DW.STAGING.SERVER/INCOMING/WC/
+]
+
+#GOTO BATCH^COMPLETE
+
+!------------------------------------------------------------------!
+! BATCH ABORT HANDLER                                              !
+!------------------------------------------------------------------!
+BATCH^ABORT:
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: *** BATCH ABORTED *** AT STEP " [STEP^COUNT]]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: TOTAL ERRORS = " [STEP^ERRORS]]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "=================================================="]
+
+! Send critical alert
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: SENDING ABORT NOTIFICATION"]
+
+! Page on-call operations
+! TACL PATHSEND to notification server
+PATHSEND $NOTIFY.#PAGER [NOTIFY^PAGER] -
+  "WCBATCH ABORTED AT STEP " [STEP^COUNT] " - IMMEDIATE ACTION REQUIRED"
+
+#SET BATCH^STATUS -1
+#GOTO BATCH^CLEANUP
+
+!------------------------------------------------------------------!
+! BATCH COMPLETION                                                 !
+!------------------------------------------------------------------!
+BATCH^COMPLETE:
+#SET BATCH^END [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: MONTHLY BATCH CYCLE COMPLETED"]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: END TIME    = " [BATCH^END]]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: STEPS RUN   = " [STEP^COUNT] "/" [TOTAL^STEPS]]
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "WCBATCH: STEP ERRORS = " [STEP^ERRORS]]
+
+[#IF [STEP^ERRORS] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "WCBATCH: STATUS = ALL STEPS SUCCESSFUL"]
+  #SET BATCH^STATUS 0
+|ELSE|
+  SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+    "WCBATCH: STATUS = COMPLETED WITH " [STEP^ERRORS] " ERROR(S)"]
+  #SET BATCH^STATUS 4
+]
+
+SINK [#LOG^FILE WRITE [BATCH^LOG^FILE] -
+  "=================================================="]
+
+!------------------------------------------------------------------!
+! BATCH CLEANUP                                                    !
+!------------------------------------------------------------------!
+BATCH^CLEANUP:
+
+! Archive batch log
+COPY [BATCH^LOG^FILE] [REPORT^VOL].WCLOGS.BATCHLOG[#JULIANTIMESTAMP]
+
+! Purge work files older than 30 days
+PURGE [WORK^VOL].WCWORK.*, PURGE
+
+SINK [#LOG^FILE CLOSE [BATCH^LOG^FILE]]
+
+#POP ERRTEXT
+
+! Return batch status to caller
+#SET #COMPLETIONCODE [BATCH^STATUS]

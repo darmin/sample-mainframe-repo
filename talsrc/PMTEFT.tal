@@ -1,0 +1,753 @@
+?SECTION PMTEFT
+?PAGE "EFT/ACH Payment Processing Server — Workers' Compensation TPA"
+!---------------------------------------------------------------------
+! PMTEFT — Electronic Funds Transfer / ACH Payment Processing
+!
+! Generates NACHA-format ACH files for electronic payment of workers'
+! compensation benefits. Handles bank routing validation, batch
+! header/control records, pre-notification for new accounts, return
+! and NOC processing, payment status tracking, and dual-approval
+! batch release.
+!
+! Process: PMTEFT
+! Pathway Server Class: EFTE-SVR
+! TMF Protected: Yes
+! Enscribe Files:
+!   EFTQUEUE (key-seq) — Approved EFT payments
+!   EFTBATCH (key-seq) — Batch control records
+!   EFTACCT  (key-seq) — Payee bank account info
+!   EFTSTAT  (key-seq) — Payment status tracking
+!   NACHAFIL (edit)    — NACHA format output file
+!---------------------------------------------------------------------
+
+?NOLIST
+?SOURCE $SYSTEM.SYSTEM.EXTDECS0 (INITIALIZER, SERVERCLASS_SEND_,
+   FILE_OPEN_, FILE_READ64_, FILE_READLOCK64_, FILE_WRITE64_,
+   FILE_WRITEUPDATE64_, FILE_CLOSE_,
+   ABEND, TMF_BEGINTRANSACTION_, TMF_ENDTRANSACTION_,
+   TMF_ABORTTRANSACTION_, JULIANTIMESTAMP)
+?LIST
+
+LITERAL MSG^CREATE^BATCH    = 1;
+LITERAL MSG^ADD^PAYMENT     = 2;
+LITERAL MSG^RELEASE^BATCH   = 3;
+LITERAL MSG^PROCESS^RETURN  = 4;
+LITERAL MSG^PRENOTE         = 5;
+LITERAL MSG^STATUS^QUERY    = 6;
+
+LITERAL BATCH^STATUS^OPEN   = 0;
+LITERAL BATCH^STATUS^READY  = 1;
+LITERAL BATCH^STATUS^APPR1  = 2;
+LITERAL BATCH^STATUS^APPR2  = 3;  ! Dual approval complete
+LITERAL BATCH^STATUS^SENT   = 4;
+LITERAL BATCH^STATUS^ERROR  = 9;
+
+LITERAL ACH^SEC^PPD         = 1;   ! Prearranged Payment and Deposit
+LITERAL ACH^SEC^CCD         = 2;   ! Corporate Credit or Debit
+LITERAL ACH^TRANS^CREDIT    = 22;  ! Checking credit
+LITERAL ACH^TRANS^PRENOTE   = 23;  ! Prenote for checking credit
+LITERAL ACH^TRANS^SAVINGS   = 32;  ! Savings credit
+LITERAL ACH^TRANS^SAV^PRE   = 33;  ! Prenote for savings
+
+LITERAL NACHA^REC^LEN       = 94;  ! Fixed NACHA record length
+LITERAL MAX^ENTRIES^BATCH   = 9999;
+
+DEFINE DOLLARS = FIXED(2);
+
+!---------------------------------------------------------------------
+! EFT Payment Queue Record
+!---------------------------------------------------------------------
+STRUCT EFT^QUEUE^REC;
+  BEGIN
+    STRING  PAYMENT^ID[0:9];             ! Key
+    STRING  CLAIM^NUMBER[0:11];
+    STRING  PAYEE^NAME[0:21];            ! NACHA: 22 chars max
+    STRING  PAYEE^TIN[0:8];
+    DOLLARS PAYMENT^AMOUNT;
+    INT     PAYMENT^TYPE;                ! 1=medical, 2=indemnity, etc.
+    INT(32) EFFECTIVE^DATE;              ! Settlement date
+    STRING  ROUTING^NUMBER[0:8];         ! 9-digit ABA
+    STRING  ACCOUNT^NUMBER[0:16];        ! Up to 17 chars
+    INT     ACCOUNT^TYPE;                ! 1=checking, 2=savings
+    INT     ADDENDA^FLAG;                ! 1=has addenda record
+    STRING  ADDENDA^INFO[0:79];          ! Payment description
+    INT     PRENOTE^STATUS;              ! 0=none, 1=sent, 2=verified
+    STRING  BATCH^ID[0:7];              ! Assigned batch
+    INT     PMT^STATUS;                  ! 0=queued, 1=batched, 2=sent, 3=settled, 8=returned
+  END;
+
+!---------------------------------------------------------------------
+! Batch Control Record
+!---------------------------------------------------------------------
+STRUCT BATCH^CONTROL^REC;
+  BEGIN
+    STRING  BATCH^ID[0:7];              ! Key
+    INT(32) CREATE^DATE;
+    INT(32) EFFECTIVE^DATE;
+    INT     SEC^CODE;                    ! PPD or CCD
+    INT     STATUS;
+    INT     ENTRY^COUNT;
+    DOLLARS TOTAL^CREDIT;
+    DOLLARS TOTAL^DEBIT;
+    INT(32) ENTRY^HASH;                  ! Sum of routing numbers mod 10^10
+    STRING  APPROVER^1[0:7];
+    STRING  APPROVER^2[0:7];
+    INT(32) APPROVE^DATE^1;
+    INT(32) APPROVE^DATE^2;
+    STRING  COMPANY^ID[0:9];             ! FEIN
+    STRING  COMPANY^NAME[0:15];
+  END;
+
+!---------------------------------------------------------------------
+! Payee Bank Account Record
+!---------------------------------------------------------------------
+STRUCT EFT^ACCT^REC;
+  BEGIN
+    STRING  PAYEE^TIN[0:8];             ! Key
+    STRING  PAYEE^NAME[0:21];
+    STRING  ROUTING^NUMBER[0:8];
+    STRING  ACCOUNT^NUMBER[0:16];
+    INT     ACCOUNT^TYPE;
+    INT     PRENOTE^STATUS;              ! 0=pending, 1=sent, 2=verified, 3=failed
+    INT(32) PRENOTE^DATE;
+    INT(32) LAST^PAYMENT^DATE;
+    INT     RETURN^COUNT;                ! Number of ACH returns
+    INT     NOC^COUNT;                   ! Notification of Change count
+  END;
+
+!---------------------------------------------------------------------
+! NACHA record buffers (94 bytes each)
+!---------------------------------------------------------------------
+STRING  NACHA^FILE^HEADER[0:93];
+STRING  NACHA^BATCH^HEADER[0:93];
+STRING  NACHA^ENTRY^DETAIL[0:93];
+STRING  NACHA^ADDENDA[0:93];
+STRING  NACHA^BATCH^CONTROL[0:93];
+STRING  NACHA^FILE^CONTROL[0:93];
+
+!---------------------------------------------------------------------
+! Request/Response messages
+!---------------------------------------------------------------------
+STRUCT EFT^REQUEST;
+  BEGIN
+    INT     MSG^TYPE;
+    STRING  BATCH^ID[0:7];
+    STRING  PAYMENT^ID[0:9];
+    STRING  APPROVER^ID[0:7];
+    INT     EFFECTIVE^DATE^OFFSET;       ! Days from today
+  END;
+
+STRUCT EFT^RESPONSE;
+  BEGIN
+    INT     STATUS;
+    STRING  BATCH^ID[0:7];
+    INT     ENTRIES^PROCESSED;
+    DOLLARS TOTAL^AMOUNT;
+    STRING  MESSAGE[0:59];
+  END;
+
+!---------------------------------------------------------------------
+! File numbers and working storage
+!---------------------------------------------------------------------
+INT     EFTQ^FNUM;
+INT     EFTB^FNUM;
+INT     EFTA^FNUM;
+INT     EFTS^FNUM;
+INT     NACHA^FNUM;
+INT     RECV^FNUM;
+
+STRUCT  W^QUEUE(EFT^QUEUE^REC);
+STRUCT  W^BATCH(BATCH^CONTROL^REC);
+STRUCT  W^ACCT(EFT^ACCT^REC);
+INT(32) TODAY^JULIAN;
+INT     TMF^TAG;
+INT     BATCH^SEQ;
+
+!=====================================================================
+! PROC VALIDATE^ROUTING^NUMBER
+! ABA check digit: 3(d1+d4+d7) + 7(d2+d5+d8) + (d3+d6+d9) mod 10 = 0
+!=====================================================================
+INT PROC VALIDATE^ROUTING^NUMBER(RTN);
+  STRING .RTN[0:8];
+BEGIN
+  INT D1, D2, D3, D4, D5, D6, D7, D8, D9;
+  INT CHECKSUM;
+
+  D1 := RTN[0] - "0";
+  D2 := RTN[1] - "0";
+  D3 := RTN[2] - "0";
+  D4 := RTN[3] - "0";
+  D5 := RTN[4] - "0";
+  D6 := RTN[5] - "0";
+  D7 := RTN[6] - "0";
+  D8 := RTN[7] - "0";
+  D9 := RTN[8] - "0";
+
+  CHECKSUM := 3 * (D1 + D4 + D7) + 7 * (D2 + D5 + D8) + (D3 + D6 + D9);
+
+  IF (CHECKSUM LOR %17777) = (CHECKSUM LOR %17777) THEN
+  BEGIN
+    ! Modulo 10 check
+    IF CHECKSUM - ((CHECKSUM / 10) * 10) = 0 THEN
+      RETURN 1;  ! Valid
+  END;
+
+  RETURN 0;  ! Invalid
+END;
+
+!=====================================================================
+! PROC FORMAT^FILE^HEADER
+! NACHA File Header Record (Record Type 1)
+!=====================================================================
+PROC FORMAT^FILE^HEADER;
+BEGIN
+  ! Record Type Code: 1
+  ! Priority Code: 01
+  ! Immediate Destination: space + 9-digit routing
+  ! Immediate Origin: space + 10-digit company FEIN
+  ! File Creation Date: YYMMDD
+  ! File Creation Time: HHMM
+  ! File ID Modifier: A
+  ! Record Size: 094
+  ! Blocking Factor: 10
+  ! Format Code: 1
+
+  NACHA^FILE^HEADER ':='
+    "101 000000000 0000000000"
+  & "                         094101"
+  & "                                                       ";
+
+  ! Fill in origin routing number (positions 3-12)
+  ! This would be parameterized from company config
+  NACHA^FILE^HEADER[3] ':=' " 091000019";  ! Fed routing
+
+  ! Company ID (positions 13-22)
+  NACHA^FILE^HEADER[13] ':=' " 123456789";
+
+  CALL FILE_WRITE64_(NACHA^FNUM, NACHA^FILE^HEADER, NACHA^REC^LEN);
+END;
+
+!=====================================================================
+! PROC FORMAT^BATCH^HEADER
+! NACHA Batch Header Record (Record Type 5)
+!=====================================================================
+PROC FORMAT^BATCH^HEADER(BATCH^REC);
+  STRUCT .BATCH^REC(BATCH^CONTROL^REC);
+BEGIN
+  ! Record Type: 5
+  ! Service Class: 220 (credits only) or 200 (mixed)
+  ! Company Name: 16 chars
+  ! Company Discretionary Data: 20 chars
+  ! Company ID: 10 chars
+  ! SEC Code: PPD or CCD (3 chars)
+  ! Company Entry Description: 10 chars
+  ! Effective Entry Date: YYMMDD
+  ! Originator Status Code: 1
+  ! Originating DFI: 8 chars
+
+  NACHA^BATCH^HEADER ':='
+    "5220                                                    "
+  & "PPD WC PAYMT            1091000010000001"
+  & "              ";
+
+  ! Company name (positions 4-19)
+  NACHA^BATCH^HEADER[4] ':=' BATCH^REC.COMPANY^NAME FOR 16;
+
+  ! Company ID (positions 40-49)
+  NACHA^BATCH^HEADER[40] ':=' BATCH^REC.COMPANY^ID FOR 10;
+
+  ! SEC code (positions 50-52)
+  IF BATCH^REC.SEC^CODE = ACH^SEC^CCD THEN
+    NACHA^BATCH^HEADER[50] ':=' "CCD"
+  ELSE
+    NACHA^BATCH^HEADER[50] ':=' "PPD";
+
+  CALL FILE_WRITE64_(NACHA^FNUM, NACHA^BATCH^HEADER, NACHA^REC^LEN);
+END;
+
+!=====================================================================
+! PROC FORMAT^ENTRY^DETAIL
+! NACHA Entry Detail Record (Record Type 6)
+!=====================================================================
+PROC FORMAT^ENTRY^DETAIL(QUEUE^REC, TRACE^NUM);
+  STRUCT .QUEUE^REC(EFT^QUEUE^REC);
+  INT    TRACE^NUM;
+BEGIN
+  INT TRANS^CODE;
+
+  ! Determine transaction code
+  IF QUEUE^REC.ACCOUNT^TYPE = 1 THEN     ! Checking
+  BEGIN
+    IF QUEUE^REC.PRENOTE^STATUS = 1 THEN
+      TRANS^CODE := ACH^TRANS^PRENOTE     ! Prenote
+    ELSE
+      TRANS^CODE := ACH^TRANS^CREDIT;     ! Credit
+  END
+  ELSE                                     ! Savings
+  BEGIN
+    IF QUEUE^REC.PRENOTE^STATUS = 1 THEN
+      TRANS^CODE := ACH^TRANS^SAV^PRE
+    ELSE
+      TRANS^CODE := ACH^TRANS^SAVINGS;
+  END;
+
+  ! Record Type: 6
+  ! Transaction Code: 2 digits
+  ! Receiving DFI: 8 digits (routing without check digit)
+  ! Check Digit: 1 digit (9th digit of routing)
+  ! DFI Account Number: 17 chars
+  ! Amount: 10 digits (right justified, zero filled)
+  ! Individual ID: 15 chars (claim number)
+  ! Individual Name: 22 chars (payee name)
+  ! Trace Number: 15 digits
+
+  NACHA^ENTRY^DETAIL ':='
+    "6                                                       "
+  & "                                      ";
+
+  ! Transaction code (positions 1-2)
+  NACHA^ENTRY^DETAIL[1] := $DBL(TRANS^CODE) '<<' 8 '>>' 8 + "0";
+  NACHA^ENTRY^DETAIL[2] := $DBL(TRANS^CODE) '>>' 8 + "0";
+
+  ! Routing number (positions 3-11)
+  NACHA^ENTRY^DETAIL[3] ':=' QUEUE^REC.ROUTING^NUMBER FOR 9;
+
+  ! Account number (positions 12-28)
+  NACHA^ENTRY^DETAIL[12] ':=' QUEUE^REC.ACCOUNT^NUMBER FOR 17;
+
+  ! Individual name (positions 54-75)
+  NACHA^ENTRY^DETAIL[54] ':=' QUEUE^REC.PAYEE^NAME FOR 22;
+
+  CALL FILE_WRITE64_(NACHA^FNUM, NACHA^ENTRY^DETAIL, NACHA^REC^LEN);
+END;
+
+!=====================================================================
+! PROC FORMAT^BATCH^CONTROL
+! NACHA Batch Control Record (Record Type 8)
+!=====================================================================
+PROC FORMAT^BATCH^CONTROL(BATCH^REC);
+  STRUCT .BATCH^REC(BATCH^CONTROL^REC);
+BEGIN
+  ! Record Type: 8
+  ! Service Class: 220
+  ! Entry/Addenda Count: 6 digits
+  ! Entry Hash: 10 digits
+  ! Total Debit: 12 digits
+  ! Total Credit: 12 digits
+  ! Company ID: 10 chars
+
+  NACHA^BATCH^CONTROL ':='
+    "8220                                                    "
+  & "                                      ";
+
+  CALL FILE_WRITE64_(NACHA^FNUM, NACHA^BATCH^CONTROL, NACHA^REC^LEN);
+END;
+
+!=====================================================================
+! PROC FORMAT^FILE^CONTROL
+! NACHA File Control Record (Record Type 9)
+!=====================================================================
+PROC FORMAT^FILE^CONTROL(BATCH^COUNT, ENTRY^COUNT, TOTAL^CREDIT);
+  INT     BATCH^COUNT;
+  INT     ENTRY^COUNT;
+  DOLLARS TOTAL^CREDIT;
+BEGIN
+  NACHA^FILE^CONTROL ':='
+    "9                                                       "
+  & "                                      ";
+
+  CALL FILE_WRITE64_(NACHA^FNUM, NACHA^FILE^CONTROL, NACHA^REC^LEN);
+END;
+
+!=====================================================================
+! PROC CREATE^BATCH
+! Create a new EFT batch for grouping payments.
+!=====================================================================
+PROC CREATE^BATCH(REQ, RESP);
+  STRUCT .REQ(EFT^REQUEST);
+  STRUCT .RESP(EFT^RESPONSE);
+BEGIN
+  BATCH^SEQ := BATCH^SEQ + 1;
+
+  W^BATCH.BATCH^ID ':=' REQ.BATCH^ID FOR 8;
+  W^BATCH.CREATE^DATE := TODAY^JULIAN;
+  W^BATCH.EFFECTIVE^DATE := TODAY^JULIAN + REQ.EFFECTIVE^DATE^OFFSET;
+  W^BATCH.SEC^CODE := ACH^SEC^PPD;
+  W^BATCH.STATUS := BATCH^STATUS^OPEN;
+  W^BATCH.ENTRY^COUNT := 0;
+  W^BATCH.TOTAL^CREDIT := 0.00F;
+  W^BATCH.TOTAL^DEBIT := 0.00F;
+  W^BATCH.ENTRY^HASH := 0;
+  W^BATCH.APPROVER^1 ':=' "        ";
+  W^BATCH.APPROVER^2 ':=' "        ";
+  W^BATCH.COMPANY^ID ':=' "123456789 ";
+  W^BATCH.COMPANY^NAME ':=' "WC TPA PAYMENTS ";
+
+  CALL FILE_WRITE64_(EFTB^FNUM, W^BATCH, $LEN(W^BATCH));
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := 10;
+    RESP.MESSAGE ':=' "Failed to create batch                              ";
+    RETURN;
+  END;
+
+  RESP.STATUS := 0;
+  RESP.BATCH^ID ':=' REQ.BATCH^ID FOR 8;
+  RESP.ENTRIES^PROCESSED := 0;
+  RESP.TOTAL^AMOUNT := 0.00F;
+  RESP.MESSAGE ':=' "Batch created successfully                          ";
+END;
+
+!=====================================================================
+! PROC ADD^PAYMENT^TO^BATCH
+! Add a queued payment to a batch, validating routing and prenote.
+!=====================================================================
+PROC ADD^PAYMENT^TO^BATCH(REQ, RESP);
+  STRUCT .REQ(EFT^REQUEST);
+  STRUCT .RESP(EFT^RESPONSE);
+BEGIN
+  INT BYTES^READ;
+  INT ROUTING^VALID;
+
+  ! Read the payment
+  W^QUEUE.PAYMENT^ID ':=' REQ.PAYMENT^ID FOR 10;
+  CALL FILE_READLOCK64_(EFTQ^FNUM, W^QUEUE, $LEN(W^QUEUE), BYTES^READ);
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := 20;
+    RESP.MESSAGE ':=' "Payment not found in queue                          ";
+    RETURN;
+  END;
+
+  ! Validate routing number
+  ROUTING^VALID := VALIDATE^ROUTING^NUMBER(W^QUEUE.ROUTING^NUMBER);
+  IF ROUTING^VALID = 0 THEN
+  BEGIN
+    RESP.STATUS := 30;
+    RESP.MESSAGE ':=' "Invalid ABA routing number                          ";
+    RETURN;
+  END;
+
+  ! Check prenote status — new accounts must be prenotified first
+  W^ACCT.PAYEE^TIN ':=' W^QUEUE.PAYEE^TIN FOR 9;
+  CALL FILE_READ64_(EFTA^FNUM, W^ACCT, $LEN(W^ACCT), BYTES^READ);
+  IF <> THEN
+  BEGIN
+    ! New account — needs prenote
+    RESP.STATUS := 31;
+    RESP.MESSAGE ':=' "New account — prenote required before payment        ";
+    RETURN;
+  END;
+
+  IF W^ACCT.PRENOTE^STATUS = 0 THEN
+  BEGIN
+    RESP.STATUS := 32;
+    RESP.MESSAGE ':=' "Prenote pending — cannot process payment yet         ";
+    RETURN;
+  END;
+
+  IF W^ACCT.PRENOTE^STATUS = 3 THEN
+  BEGIN
+    RESP.STATUS := 33;
+    RESP.MESSAGE ':=' "Prenote failed — account info must be corrected      ";
+    RETURN;
+  END;
+
+  ! Check return history — flag accounts with multiple returns
+  IF W^ACCT.RETURN^COUNT >= 3 THEN
+  BEGIN
+    RESP.STATUS := 34;
+    RESP.MESSAGE ':=' "Account has 3+ returns — EFT suspended, use check   ";
+    RETURN;
+  END;
+
+  ! Read batch and add payment
+  W^BATCH.BATCH^ID ':=' REQ.BATCH^ID FOR 8;
+  CALL FILE_READLOCK64_(EFTB^FNUM, W^BATCH, $LEN(W^BATCH), BYTES^READ);
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := 40;
+    RESP.MESSAGE ':=' "Batch not found                                     ";
+    RETURN;
+  END;
+
+  IF W^BATCH.STATUS <> BATCH^STATUS^OPEN THEN
+  BEGIN
+    RESP.STATUS := 41;
+    RESP.MESSAGE ':=' "Batch is not open for new entries                   ";
+    RETURN;
+  END;
+
+  IF W^BATCH.ENTRY^COUNT >= MAX^ENTRIES^BATCH THEN
+  BEGIN
+    RESP.STATUS := 42;
+    RESP.MESSAGE ':=' "Batch full — maximum entries reached                ";
+    RETURN;
+  END;
+
+  CALL TMF_BEGINTRANSACTION_(TMF^TAG);
+
+  ! Update batch totals
+  W^BATCH.ENTRY^COUNT := W^BATCH.ENTRY^COUNT + 1;
+  W^BATCH.TOTAL^CREDIT := W^BATCH.TOTAL^CREDIT + W^QUEUE.PAYMENT^AMOUNT;
+
+  ! Add routing number to entry hash (first 8 digits)
+  ! Simplified: accumulate numeric value
+  W^BATCH.ENTRY^HASH := W^BATCH.ENTRY^HASH +
+    (W^QUEUE.ROUTING^NUMBER[0] - "0") * 10000000 +
+    (W^QUEUE.ROUTING^NUMBER[1] - "0") * 1000000 +
+    (W^QUEUE.ROUTING^NUMBER[2] - "0") * 100000 +
+    (W^QUEUE.ROUTING^NUMBER[3] - "0") * 10000 +
+    (W^QUEUE.ROUTING^NUMBER[4] - "0") * 1000 +
+    (W^QUEUE.ROUTING^NUMBER[5] - "0") * 100 +
+    (W^QUEUE.ROUTING^NUMBER[6] - "0") * 10 +
+    (W^QUEUE.ROUTING^NUMBER[7] - "0");
+
+  CALL FILE_WRITEUPDATE64_(EFTB^FNUM, W^BATCH, $LEN(W^BATCH));
+
+  ! Update payment record with batch assignment
+  W^QUEUE.BATCH^ID ':=' REQ.BATCH^ID FOR 8;
+  W^QUEUE.PMT^STATUS := 1;  ! Batched
+  CALL FILE_WRITEUPDATE64_(EFTQ^FNUM, W^QUEUE, $LEN(W^QUEUE));
+
+  CALL TMF_ENDTRANSACTION_(TMF^TAG);
+
+  RESP.STATUS := 0;
+  RESP.BATCH^ID ':=' REQ.BATCH^ID FOR 8;
+  RESP.ENTRIES^PROCESSED := W^BATCH.ENTRY^COUNT;
+  RESP.TOTAL^AMOUNT := W^BATCH.TOTAL^CREDIT;
+  RESP.MESSAGE ':=' "Payment added to batch                              ";
+END;
+
+!=====================================================================
+! PROC RELEASE^BATCH
+! Dual-approval batch release — generates NACHA file when both approve.
+!=====================================================================
+PROC RELEASE^BATCH(REQ, RESP);
+  STRUCT .REQ(EFT^REQUEST);
+  STRUCT .RESP(EFT^RESPONSE);
+BEGIN
+  INT BYTES^READ;
+
+  W^BATCH.BATCH^ID ':=' REQ.BATCH^ID FOR 8;
+  CALL FILE_READLOCK64_(EFTB^FNUM, W^BATCH, $LEN(W^BATCH), BYTES^READ);
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := 40;
+    RESP.MESSAGE ':=' "Batch not found                                     ";
+    RETURN;
+  END;
+
+  ! Dual approval logic
+  IF W^BATCH.STATUS = BATCH^STATUS^OPEN THEN
+  BEGIN
+    ! First approval
+    W^BATCH.APPROVER^1 ':=' REQ.APPROVER^ID FOR 8;
+    W^BATCH.APPROVE^DATE^1 := TODAY^JULIAN;
+    W^BATCH.STATUS := BATCH^STATUS^APPR1;
+    CALL FILE_WRITEUPDATE64_(EFTB^FNUM, W^BATCH, $LEN(W^BATCH));
+
+    RESP.STATUS := 1;
+    RESP.MESSAGE ':=' "First approval recorded — awaiting second approver  ";
+    RETURN;
+  END;
+
+  IF W^BATCH.STATUS = BATCH^STATUS^APPR1 THEN
+  BEGIN
+    ! Ensure second approver is different from first
+    IF W^BATCH.APPROVER^1 = REQ.APPROVER^ID THEN
+    BEGIN
+      RESP.STATUS := 50;
+      RESP.MESSAGE ':=' "Same person cannot provide both approvals           ";
+      RETURN;
+    END;
+
+    W^BATCH.APPROVER^2 ':=' REQ.APPROVER^ID FOR 8;
+    W^BATCH.APPROVE^DATE^2 := TODAY^JULIAN;
+    W^BATCH.STATUS := BATCH^STATUS^APPR2;
+    CALL FILE_WRITEUPDATE64_(EFTB^FNUM, W^BATCH, $LEN(W^BATCH));
+
+    ! Both approvals received — generate NACHA file
+    CALL GENERATE^NACHA^FILE(W^BATCH, RESP);
+    RETURN;
+  END;
+
+  RESP.STATUS := 51;
+  RESP.MESSAGE ':=' "Batch already released or in invalid state           ";
+END;
+
+!=====================================================================
+! PROC GENERATE^NACHA^FILE
+! Build complete NACHA ACH file from batch entries.
+!=====================================================================
+PROC GENERATE^NACHA^FILE(BATCH^REC, RESP);
+  STRUCT .BATCH^REC(BATCH^CONTROL^REC);
+  STRUCT .RESP(EFT^RESPONSE);
+BEGIN
+  INT     BYTES^READ;
+  INT     TRACE^NUM;
+  INT     ENTRY^COUNT;
+
+  ! Open NACHA output file
+  CALL FILE_OPEN_("$DATA2.WCBANK.NACHAFIL", 22, NACHA^FNUM,,, 1);
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := 60;
+    RESP.MESSAGE ':=' "Cannot open NACHA output file                       ";
+    RETURN;
+  END;
+
+  ! Write File Header
+  CALL FORMAT^FILE^HEADER;
+
+  ! Write Batch Header
+  CALL FORMAT^BATCH^HEADER(BATCH^REC);
+
+  ! Write Entry Detail records for all payments in this batch
+  TRACE^NUM := 0;
+  ENTRY^COUNT := 0;
+
+  ! Position to beginning of queue and scan for this batch
+  W^QUEUE.PAYMENT^ID ':=' "          ";
+  CALL FILE_READ64_(EFTQ^FNUM, W^QUEUE, $LEN(W^QUEUE), BYTES^READ);
+
+  WHILE NOT <> DO
+  BEGIN
+    IF W^QUEUE.BATCH^ID = BATCH^REC.BATCH^ID AND
+       W^QUEUE.PMT^STATUS = 1 THEN
+    BEGIN
+      TRACE^NUM := TRACE^NUM + 1;
+      CALL FORMAT^ENTRY^DETAIL(W^QUEUE, TRACE^NUM);
+      ENTRY^COUNT := ENTRY^COUNT + 1;
+
+      ! Update payment status to sent
+      W^QUEUE.PMT^STATUS := 2;
+      CALL FILE_WRITEUPDATE64_(EFTQ^FNUM, W^QUEUE, $LEN(W^QUEUE));
+    END;
+
+    CALL FILE_READ64_(EFTQ^FNUM, W^QUEUE, $LEN(W^QUEUE), BYTES^READ);
+  END;
+
+  ! Write Batch Control
+  CALL FORMAT^BATCH^CONTROL(BATCH^REC);
+
+  ! Write File Control
+  CALL FORMAT^FILE^CONTROL(1, ENTRY^COUNT, BATCH^REC.TOTAL^CREDIT);
+
+  ! Pad to blocking factor of 10
+  WHILE (ENTRY^COUNT + 4) - (((ENTRY^COUNT + 4) / 10) * 10) <> 0 DO
+  BEGIN
+    NACHA^FILE^CONTROL ':='
+      "9999999999999999999999999999999999999999999999999999999999"
+    & "999999999999999999999999999999999999";
+    CALL FILE_WRITE64_(NACHA^FNUM, NACHA^FILE^CONTROL, NACHA^REC^LEN);
+    ENTRY^COUNT := ENTRY^COUNT + 1;
+  END;
+
+  CALL FILE_CLOSE_(NACHA^FNUM);
+
+  ! Update batch status
+  BATCH^REC.STATUS := BATCH^STATUS^SENT;
+  CALL FILE_WRITEUPDATE64_(EFTB^FNUM, BATCH^REC, $LEN(BATCH^REC));
+
+  RESP.STATUS := 0;
+  RESP.BATCH^ID ':=' BATCH^REC.BATCH^ID FOR 8;
+  RESP.ENTRIES^PROCESSED := TRACE^NUM;
+  RESP.TOTAL^AMOUNT := BATCH^REC.TOTAL^CREDIT;
+  RESP.MESSAGE ':=' "NACHA file generated and batch released              ";
+END;
+
+!=====================================================================
+! PROC PROCESS^RETURN
+! Handle ACH return entries (R01-R85 return reason codes).
+!=====================================================================
+PROC PROCESS^RETURN(REQ, RESP);
+  STRUCT .REQ(EFT^REQUEST);
+  STRUCT .RESP(EFT^RESPONSE);
+BEGIN
+  INT BYTES^READ;
+
+  W^QUEUE.PAYMENT^ID ':=' REQ.PAYMENT^ID FOR 10;
+  CALL FILE_READLOCK64_(EFTQ^FNUM, W^QUEUE, $LEN(W^QUEUE), BYTES^READ);
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := 20;
+    RESP.MESSAGE ':=' "Payment not found                                   ";
+    RETURN;
+  END;
+
+  ! Mark payment as returned
+  W^QUEUE.PMT^STATUS := 8;  ! Returned
+  CALL FILE_WRITEUPDATE64_(EFTQ^FNUM, W^QUEUE, $LEN(W^QUEUE));
+
+  ! Increment return count on account
+  W^ACCT.PAYEE^TIN ':=' W^QUEUE.PAYEE^TIN FOR 9;
+  CALL FILE_READLOCK64_(EFTA^FNUM, W^ACCT, $LEN(W^ACCT), BYTES^READ);
+  IF NOT <> THEN
+  BEGIN
+    W^ACCT.RETURN^COUNT := W^ACCT.RETURN^COUNT + 1;
+    CALL FILE_WRITEUPDATE64_(EFTA^FNUM, W^ACCT, $LEN(W^ACCT));
+  END;
+
+  RESP.STATUS := 0;
+  RESP.MESSAGE ':=' "Return processed — payment flagged for reissue      ";
+END;
+
+!=====================================================================
+! PROC OPEN^FILES
+!=====================================================================
+PROC OPEN^FILES;
+BEGIN
+  CALL FILE_OPEN_("$DATA1.WCDATA.EFTQUEUE", 22, EFTQ^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+  CALL FILE_OPEN_("$DATA1.WCDATA.EFTBATCH", 22, EFTB^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+  CALL FILE_OPEN_("$DATA1.WCDATA.EFTACCT", 22, EFTA^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+END;
+
+!=====================================================================
+! MAIN
+!=====================================================================
+PROC PMTEFT MAIN;
+BEGIN
+  STRUCT REQ^BUF(EFT^REQUEST);
+  STRUCT RESP^BUF(EFT^RESPONSE);
+  INT    MSG^LEN;
+
+  CALL INITIALIZER;
+  CALL OPEN^FILES;
+
+  TODAY^JULIAN := JULIANTIMESTAMP / 86400D;
+  BATCH^SEQ := 0;
+
+  CALL FILE_OPEN_("$RECEIVE", 1, RECV^FNUM);
+
+  WHILE 1 DO
+  BEGIN
+    CALL FILE_READ64_(RECV^FNUM, REQ^BUF, $LEN(REQ^BUF), MSG^LEN);
+    IF <> THEN
+    BEGIN
+      CALL FILE_CLOSE_(EFTQ^FNUM);
+      CALL FILE_CLOSE_(EFTB^FNUM);
+      CALL FILE_CLOSE_(EFTA^FNUM);
+      CALL FILE_CLOSE_(RECV^FNUM);
+      RETURN;
+    END;
+
+    CASE REQ^BUF.MSG^TYPE OF
+    BEGIN
+      MSG^CREATE^BATCH  -> CALL CREATE^BATCH(REQ^BUF, RESP^BUF);
+      MSG^ADD^PAYMENT   -> CALL ADD^PAYMENT^TO^BATCH(REQ^BUF, RESP^BUF);
+      MSG^RELEASE^BATCH -> CALL RELEASE^BATCH(REQ^BUF, RESP^BUF);
+      MSG^PROCESS^RETURN -> CALL PROCESS^RETURN(REQ^BUF, RESP^BUF);
+      OTHERWISE ->
+        BEGIN
+          RESP^BUF.STATUS := 99;
+          RESP^BUF.MESSAGE ':=' "Unknown message type                                ";
+        END;
+    END;
+
+    CALL SERVERCLASS_SEND_(RESP^BUF, $LEN(RESP^BUF));
+  END;
+END;

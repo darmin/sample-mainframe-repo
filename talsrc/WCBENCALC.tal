@@ -1,0 +1,715 @@
+?SECTION BENEFITS-CALCULATION
+?PAGE "WCBENCALC - Workers' Compensation Benefits Calculation Engine"
+!*********************************************************************
+!*  WCBENCALC -- WC Benefits Calculation Engine                      *
+!*                                                                   *
+!*  Calculates all categories of workers' compensation benefits      *
+!*  including TTD, TPD, PPD, PTD, and death benefits. Applies        *
+!*  jurisdiction-specific rates, waiting periods, maximums, and      *
+!*  COLA adjustments. All monetary calculations use FIXED(2) for     *
+!*  cent-precise arithmetic.                                         *
+!*                                                                   *
+!*  PATHWAY SERVER CLASS: WC-BEN-CALC                                *
+!*  ENSCRIBE FILES:                                                  *
+!*    $DATA1.WCFILES.BENRESLT  -- Benefit calculation results        *
+!*    $DATA1.WCFILES.WAGEDATA  -- Wage records from WCWAGE           *
+!*    $DATA1.WCFILES.JURISBEN  -- Jurisdiction benefit parameters    *
+!*    $DATA1.WCFILES.COLATBL   -- COLA adjustment tables             *
+!*                                                                   *
+!*  MODIFICATION LOG:                                                *
+!*  DATE       PROGRAMMER   DESCRIPTION                              *
+!*  ---------- ------------ ---------------------------------------- *
+!*  2024-02-01 K.PATEL      INITIAL DEVELOPMENT                      *
+!*  2024-04-15 K.PATEL      ADD PPD SCHEDULED/UNSCHEDULED LOGIC      *
+!*  2024-07-20 R.MITCHELL   DEATH BENEFITS & DEPENDENT ALLOWANCES    *
+!*  2024-10-12 K.PATEL      COLA ENGINE FOR LONG-DURATION CLAIMS     *
+!*  2025-02-05 S.CHEN       RETROACTIVE PERIOD CALCULATIONS          *
+!*********************************************************************
+
+?NOLIST
+?SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?SOURCE $DATA1.WCFILES.WCCOMMON
+?LIST
+
+LITERAL DEF^VERSION = "WCBENCALC V2.4.0";
+
+! -------------------------------------------------------------------
+! Benefit type codes
+! -------------------------------------------------------------------
+LITERAL BEN^TTD   = 1;   ! Temporary Total Disability
+LITERAL BEN^TPD   = 2;   ! Temporary Partial Disability
+LITERAL BEN^PPD   = 3;   ! Permanent Partial Disability
+LITERAL BEN^PTD   = 4;   ! Permanent Total Disability
+LITERAL BEN^DEATH = 5;   ! Death benefits
+LITERAL BEN^REHAB = 6;   ! Vocational rehabilitation maintenance
+
+! Calculation status codes
+LITERAL CALC^OK          = 0;
+LITERAL CALC^NO^WAGE     = 1;
+LITERAL CALC^NO^JURIS    = 2;
+LITERAL CALC^INVALID^DOI = 3;
+LITERAL CALC^NO^RATING   = 4;
+
+! Maximum dependents for death benefits
+LITERAL MAX^DEPENDENTS = 12;
+
+! -------------------------------------------------------------------
+! FIXED point declarations for monetary precision
+! -------------------------------------------------------------------
+FIXED(2) .EXT G^AWW;                    ! Average Weekly Wage
+FIXED(2) .EXT G^WEEKLY^RATE;            ! Computed weekly benefit rate
+FIXED(2) .EXT G^MAX^WEEKLY;             ! Jurisdiction maximum weekly
+FIXED(2) .EXT G^MIN^WEEKLY;             ! Jurisdiction minimum weekly
+FIXED(2) .EXT G^TOTAL^BENEFITS;         ! Running total of benefits paid
+
+! -------------------------------------------------------------------
+! Structure definitions
+! -------------------------------------------------------------------
+STRUCT BENEFIT^REQUEST;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT      BENEFIT^TYPE;              ! BEN^TTD, BEN^TPD, etc.
+    STRING   JURISDICTION[0:1];         ! 2-char state code
+    INT(32)  DATE^OF^INJURY;            ! YYYYMMDD
+    INT(32)  DISABILITY^START;          ! YYYYMMDD
+    INT(32)  DISABILITY^END;            ! YYYYMMDD (0 = ongoing)
+    FIXED(2) AVG^WEEKLY^WAGE;           ! Pre-computed AWW
+    INT      NUM^DEPENDENTS;            ! For death benefits
+    INT      DEPENDENT^TYPES[0:MAX^DEPENDENTS - 1]; ! 1=spouse, 2=child, 3=other
+    INT      IMPAIRMENT^RATING;         ! 0-100 for PPD
+    INT      BODY^PART^CODE;            ! NCCI body part for scheduled PPD
+    INT      DOI^YEAR;                  ! Year of injury for rate tables
+    FIXED(2) POST^INJURY^EARNINGS;      ! For TPD calculation
+    INT      APPORTIONMENT^PCT;         ! Pre-existing apportionment
+    INT      COLA^ELIGIBLE;             ! 1=yes, applies COLA
+  END;
+
+STRUCT JURIS^BENEFIT^PARAMS;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      DOI^YEAR^EFF;              ! Effective DOI year
+    FIXED(2) MAX^TTD^WEEKLY;            ! State max weekly TTD
+    FIXED(2) MIN^TTD^WEEKLY;            ! State min weekly TTD
+    INT      TTD^PCT^AWW;               ! Percentage of AWW (typically 66 2/3)
+    INT      TTD^MAX^WEEKS;             ! Maximum weeks of TTD (0=unlimited)
+    FIXED(2) MAX^PPD^WEEKLY;
+    FIXED(2) MIN^PPD^WEEKLY;
+    INT      PPD^PCT^AWW;
+    INT      WAITING^PERIOD^DAYS;       ! 3, 7, or 14 days
+    INT      RETRO^PERIOD^DAYS;         ! Days of disability before retro kicks in
+    FIXED(2) MAX^PTD^WEEKLY;
+    FIXED(2) MIN^PTD^WEEKLY;
+    INT      PTD^PCT^AWW;
+    FIXED(2) DEATH^MAX^WEEKLY;
+    INT      DEATH^PCT^AWW;
+    FIXED(2) BURIAL^ALLOWANCE;
+    INT      COLA^PCT^ANNUAL;           ! Annual COLA percentage * 100
+    INT      COLA^START^YEAR;           ! Years before COLA begins
+    FIXED(2) SAWW;                      ! State Average Weekly Wage
+  END;
+
+STRUCT BENEFIT^RESULT;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT      BENEFIT^TYPE;
+    FIXED(2) WEEKLY^RATE;
+    FIXED(2) TOTAL^AMOUNT;
+    INT(32)  EFFECTIVE^DATE;
+    INT(32)  END^DATE;
+    INT      TOTAL^WEEKS;
+    INT      WAITING^DAYS^APPLIED;
+    INT      RETRO^APPLIED;             ! 1 = waiting period refunded
+    FIXED(2) COLA^ADJUSTMENT;
+    FIXED(2) APPORTIONMENT^REDUCTION;
+    INT      CALC^STATUS;
+  END;
+
+! PPD scheduled loss table entry
+STRUCT SCHED^LOSS^ENTRY;
+  BEGIN
+    INT      BODY^PART^CODE;
+    INT      MAX^WEEKS;                 ! Maximum weeks for this body part
+    FIXED(2) PCT^OF^AWW;               ! Rate as % of AWW
+  END;
+
+! -------------------------------------------------------------------
+! Global working storage
+! -------------------------------------------------------------------
+INT .EXT G^FILENUM^BENRESLT;
+INT .EXT G^FILENUM^WAGEDATA;
+INT .EXT G^FILENUM^JURISBEN;
+INT .EXT G^FILENUM^COLATBL;
+
+STRUCT .EXT G^REQUEST  (BENEFIT^REQUEST);
+STRUCT .EXT G^PARAMS   (JURIS^BENEFIT^PARAMS);
+STRUCT .EXT G^RESULT   (BENEFIT^RESULT);
+STRUCT .EXT G^SCHED    (SCHED^LOSS^ENTRY);
+
+INT .EXT G^TMF^TAG;
+
+! -------------------------------------------------------------------
+! PROC MAIN -- Server startup and Pathway message loop
+! -------------------------------------------------------------------
+PROC MAIN MAIN;
+  BEGIN
+    INT STATUS;
+    INT MSGNUM;
+
+    CALL OPEN^BENEFIT^FILES(STATUS);
+    IF STATUS <> 0 THEN
+      CALL PROCESS_STOP_(, , , 1);
+
+    CALL SERVERCLASS_SEND_INFO_("WC-BEN-CALC");
+
+    WHILE 1 DO
+      BEGIN
+        CALL READ^REQUEST(MSGNUM, STATUS);
+        IF STATUS = 0 THEN
+          CASE MSGNUM OF
+            BEGIN
+              1 -> CALL CALCULATE^BENEFIT;
+              2 -> CALL CALCULATE^TTD;
+              3 -> CALL CALCULATE^TPD;
+              4 -> CALL CALCULATE^PPD;
+              5 -> CALL CALCULATE^PTD;
+              6 -> CALL CALCULATE^DEATH;
+              7 -> CALL APPLY^COLA;
+              8 -> CALL QUERY^BENEFIT^RESULT;
+              OTHERWISE -> CALL REPLY^ERROR(MSGNUM);
+            END;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^BENEFIT -- Dispatch to appropriate benefit calculator
+! -------------------------------------------------------------------
+PROC CALCULATE^BENEFIT;
+  BEGIN
+    INT STATUS;
+
+    ! Load jurisdiction benefit parameters for DOI year
+    CALL LOAD^JURIS^BEN^PARAMS(G^REQUEST.JURISDICTION,
+                                G^REQUEST.DOI^YEAR, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        G^RESULT.CALC^STATUS := CALC^NO^JURIS;
+        CALL REPLY^RESULT;
+        RETURN;
+      END;
+
+    ! Validate AWW
+    IF G^REQUEST.AVG^WEEKLY^WAGE <= 0F THEN
+      BEGIN
+        G^RESULT.CALC^STATUS := CALC^NO^WAGE;
+        CALL REPLY^RESULT;
+        RETURN;
+      END;
+
+    G^AWW := G^REQUEST.AVG^WEEKLY^WAGE;
+
+    CASE G^REQUEST.BENEFIT^TYPE OF
+      BEGIN
+        BEN^TTD   -> CALL CALCULATE^TTD;
+        BEN^TPD   -> CALL CALCULATE^TPD;
+        BEN^PPD   -> CALL CALCULATE^PPD;
+        BEN^PTD   -> CALL CALCULATE^PTD;
+        BEN^DEATH -> CALL CALCULATE^DEATH;
+        OTHERWISE -> CALL REPLY^ERROR(99);
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^TTD -- Temporary Total Disability benefits
+!
+! TTD = AWW * state percentage, subject to min/max caps.
+! Waiting period applies from first day of disability.
+! Retroactive period refunds waiting days if disability exceeds
+! the retro threshold.
+! -------------------------------------------------------------------
+PROC CALCULATE^TTD;
+  BEGIN
+    FIXED(2) RAW^RATE;
+    INT      TOTAL^DAYS;
+    INT      PAYABLE^DAYS;
+    INT      PAYABLE^WEEKS;
+
+    ! Calculate raw weekly rate
+    RAW^RATE := G^AWW * G^PARAMS.TTD^PCT^AWW / 100F;
+
+    ! Apply state max/min caps
+    IF RAW^RATE > G^PARAMS.MAX^TTD^WEEKLY THEN
+      G^WEEKLY^RATE := G^PARAMS.MAX^TTD^WEEKLY
+    ELSE IF RAW^RATE < G^PARAMS.MIN^TTD^WEEKLY THEN
+      BEGIN
+        ! If AWW is below minimum, pay actual AWW (can't exceed earnings)
+        IF G^AWW < G^PARAMS.MIN^TTD^WEEKLY THEN
+          G^WEEKLY^RATE := G^AWW
+        ELSE
+          G^WEEKLY^RATE := G^PARAMS.MIN^TTD^WEEKLY;
+      END
+    ELSE
+      G^WEEKLY^RATE := RAW^RATE;
+
+    ! Calculate total disability days
+    IF G^REQUEST.DISABILITY^END = 0 THEN
+      ! Ongoing -- calculate to current date
+      CALL CALC^DAYS^TO^TODAY(G^REQUEST.DISABILITY^START, TOTAL^DAYS)
+    ELSE
+      TOTAL^DAYS := JULIAN^DIFF(G^REQUEST.DISABILITY^START,
+                                 G^REQUEST.DISABILITY^END);
+
+    ! Apply waiting period
+    PAYABLE^DAYS := TOTAL^DAYS;
+    G^RESULT.WAITING^DAYS^APPLIED := 0;
+    G^RESULT.RETRO^APPLIED := 0;
+
+    IF TOTAL^DAYS <= G^PARAMS.WAITING^PERIOD^DAYS THEN
+      BEGIN
+        ! Entirely within waiting period -- no benefits payable
+        PAYABLE^DAYS := 0;
+        G^RESULT.WAITING^DAYS^APPLIED := TOTAL^DAYS;
+      END
+    ELSE
+      BEGIN
+        ! Check if retroactive period applies
+        IF TOTAL^DAYS >= G^PARAMS.RETRO^PERIOD^DAYS THEN
+          BEGIN
+            ! Disability exceeds retro threshold -- pay from day 1
+            PAYABLE^DAYS := TOTAL^DAYS;
+            G^RESULT.RETRO^APPLIED := 1;
+            G^RESULT.WAITING^DAYS^APPLIED := 0;
+          END
+        ELSE
+          BEGIN
+            ! Deduct waiting period
+            PAYABLE^DAYS := TOTAL^DAYS - G^PARAMS.WAITING^PERIOD^DAYS;
+            G^RESULT.WAITING^DAYS^APPLIED := G^PARAMS.WAITING^PERIOD^DAYS;
+          END;
+      END;
+
+    ! Convert days to weeks (7 days per week, partial weeks prorated)
+    PAYABLE^WEEKS := PAYABLE^DAYS / 7;
+
+    ! Check max weeks cap
+    IF G^PARAMS.TTD^MAX^WEEKS > 0 AND
+       PAYABLE^WEEKS > G^PARAMS.TTD^MAX^WEEKS THEN
+      PAYABLE^WEEKS := G^PARAMS.TTD^MAX^WEEKS;
+
+    ! Calculate total with partial week proration
+    G^RESULT.TOTAL^AMOUNT := G^WEEKLY^RATE * PAYABLE^WEEKS
+                           + G^WEEKLY^RATE * (PAYABLE^DAYS - PAYABLE^WEEKS * 7) / 7F;
+
+    ! Apply apportionment if applicable
+    IF G^REQUEST.APPORTIONMENT^PCT > 0 THEN
+      BEGIN
+        G^RESULT.APPORTIONMENT^REDUCTION :=
+          G^RESULT.TOTAL^AMOUNT * G^REQUEST.APPORTIONMENT^PCT / 100F;
+        G^RESULT.TOTAL^AMOUNT :=
+          G^RESULT.TOTAL^AMOUNT - G^RESULT.APPORTIONMENT^REDUCTION;
+      END;
+
+    ! Apply COLA for long-duration claims
+    IF G^REQUEST.COLA^ELIGIBLE = 1 THEN
+      CALL APPLY^COLA^ADJUSTMENT;
+
+    ! Populate result
+    G^RESULT.CLAIM^NUMBER := G^REQUEST.CLAIM^NUMBER;
+    G^RESULT.BENEFIT^TYPE := BEN^TTD;
+    G^RESULT.WEEKLY^RATE := G^WEEKLY^RATE;
+    G^RESULT.EFFECTIVE^DATE := G^REQUEST.DISABILITY^START;
+    G^RESULT.END^DATE := G^REQUEST.DISABILITY^END;
+    G^RESULT.TOTAL^WEEKS := PAYABLE^WEEKS;
+    G^RESULT.CALC^STATUS := CALC^OK;
+
+    CALL WRITE^BENEFIT^RESULT;
+    CALL REPLY^RESULT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^TPD -- Temporary Partial Disability
+!
+! TPD compensates the difference between pre-injury AWW and
+! post-injury earning capacity, typically at 66 2/3%.
+! -------------------------------------------------------------------
+PROC CALCULATE^TPD;
+  BEGIN
+    FIXED(2) WAGE^LOSS;
+    FIXED(2) RAW^RATE;
+    INT      TOTAL^DAYS;
+    INT      PAYABLE^WEEKS;
+
+    ! Wage loss = AWW - post-injury earnings
+    WAGE^LOSS := G^AWW - G^REQUEST.POST^INJURY^EARNINGS;
+
+    ! If no wage loss, no TPD benefits
+    IF WAGE^LOSS <= 0F THEN
+      BEGIN
+        G^RESULT.WEEKLY^RATE := 0F;
+        G^RESULT.TOTAL^AMOUNT := 0F;
+        G^RESULT.CALC^STATUS := CALC^OK;
+        CALL REPLY^RESULT;
+        RETURN;
+      END;
+
+    ! TPD rate = percentage of wage loss (varies by state, typically 66 2/3%)
+    RAW^RATE := WAGE^LOSS * G^PARAMS.TTD^PCT^AWW / 100F;
+
+    ! Apply caps -- TPD max is typically same as TTD max
+    IF RAW^RATE > G^PARAMS.MAX^TTD^WEEKLY THEN
+      G^WEEKLY^RATE := G^PARAMS.MAX^TTD^WEEKLY
+    ELSE
+      G^WEEKLY^RATE := RAW^RATE;
+
+    ! Calculate duration
+    IF G^REQUEST.DISABILITY^END = 0 THEN
+      CALL CALC^DAYS^TO^TODAY(G^REQUEST.DISABILITY^START, TOTAL^DAYS)
+    ELSE
+      TOTAL^DAYS := JULIAN^DIFF(G^REQUEST.DISABILITY^START,
+                                 G^REQUEST.DISABILITY^END);
+
+    PAYABLE^WEEKS := TOTAL^DAYS / 7;
+    G^RESULT.TOTAL^AMOUNT := G^WEEKLY^RATE * PAYABLE^WEEKS
+                           + G^WEEKLY^RATE * (TOTAL^DAYS - PAYABLE^WEEKS * 7) / 7F;
+
+    ! Apply apportionment
+    IF G^REQUEST.APPORTIONMENT^PCT > 0 THEN
+      BEGIN
+        G^RESULT.APPORTIONMENT^REDUCTION :=
+          G^RESULT.TOTAL^AMOUNT * G^REQUEST.APPORTIONMENT^PCT / 100F;
+        G^RESULT.TOTAL^AMOUNT :=
+          G^RESULT.TOTAL^AMOUNT - G^RESULT.APPORTIONMENT^REDUCTION;
+      END;
+
+    G^RESULT.CLAIM^NUMBER := G^REQUEST.CLAIM^NUMBER;
+    G^RESULT.BENEFIT^TYPE := BEN^TPD;
+    G^RESULT.WEEKLY^RATE := G^WEEKLY^RATE;
+    G^RESULT.TOTAL^WEEKS := PAYABLE^WEEKS;
+    G^RESULT.CALC^STATUS := CALC^OK;
+
+    CALL WRITE^BENEFIT^RESULT;
+    CALL REPLY^RESULT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^PPD -- Permanent Partial Disability
+!
+! Two calculation methods:
+! 1. Scheduled (specific body parts): weeks * rate from schedule
+! 2. Unscheduled (whole body): impairment rating * max weeks * rate
+! -------------------------------------------------------------------
+PROC CALCULATE^PPD;
+  BEGIN
+    FIXED(2) RAW^RATE;
+    INT      MAX^WEEKS;
+    INT      PAYABLE^WEEKS;
+    INT      IS^SCHEDULED;
+    INT      STATUS;
+
+    IF G^REQUEST.IMPAIRMENT^RATING <= 0 OR
+       G^REQUEST.IMPAIRMENT^RATING > 100 THEN
+      BEGIN
+        G^RESULT.CALC^STATUS := CALC^NO^RATING;
+        CALL REPLY^RESULT;
+        RETURN;
+      END;
+
+    ! Determine if this is a scheduled or unscheduled body part
+    CALL LOOKUP^SCHEDULED^LOSS(G^REQUEST.JURISDICTION,
+                                G^REQUEST.BODY^PART^CODE,
+                                IS^SCHEDULED, STATUS);
+
+    IF IS^SCHEDULED = 1 THEN
+      BEGIN
+        ! Scheduled loss: weeks from body part schedule
+        MAX^WEEKS := G^SCHED.MAX^WEEKS;
+        RAW^RATE := G^AWW * G^PARAMS.PPD^PCT^AWW / 100F;
+
+        ! Apply caps
+        IF RAW^RATE > G^PARAMS.MAX^PPD^WEEKLY THEN
+          G^WEEKLY^RATE := G^PARAMS.MAX^PPD^WEEKLY
+        ELSE IF RAW^RATE < G^PARAMS.MIN^PPD^WEEKLY THEN
+          G^WEEKLY^RATE := G^PARAMS.MIN^PPD^WEEKLY
+        ELSE
+          G^WEEKLY^RATE := RAW^RATE;
+
+        ! Payable weeks = max weeks for body part * impairment %
+        PAYABLE^WEEKS := MAX^WEEKS * G^REQUEST.IMPAIRMENT^RATING / 100;
+      END
+    ELSE
+      BEGIN
+        ! Unscheduled (whole body) -- typically 500 weeks max
+        MAX^WEEKS := 500;  ! default, overridden by jurisdiction
+        CALL GET^UNSCHED^MAX^WEEKS(G^REQUEST.JURISDICTION, MAX^WEEKS);
+
+        RAW^RATE := G^AWW * G^PARAMS.PPD^PCT^AWW / 100F;
+
+        IF RAW^RATE > G^PARAMS.MAX^PPD^WEEKLY THEN
+          G^WEEKLY^RATE := G^PARAMS.MAX^PPD^WEEKLY
+        ELSE
+          G^WEEKLY^RATE := RAW^RATE;
+
+        PAYABLE^WEEKS := MAX^WEEKS * G^REQUEST.IMPAIRMENT^RATING / 100;
+      END;
+
+    G^RESULT.TOTAL^AMOUNT := G^WEEKLY^RATE * PAYABLE^WEEKS;
+
+    ! Apply pre-existing apportionment
+    IF G^REQUEST.APPORTIONMENT^PCT > 0 THEN
+      BEGIN
+        G^RESULT.APPORTIONMENT^REDUCTION :=
+          G^RESULT.TOTAL^AMOUNT * G^REQUEST.APPORTIONMENT^PCT / 100F;
+        G^RESULT.TOTAL^AMOUNT :=
+          G^RESULT.TOTAL^AMOUNT - G^RESULT.APPORTIONMENT^REDUCTION;
+      END;
+
+    G^RESULT.CLAIM^NUMBER := G^REQUEST.CLAIM^NUMBER;
+    G^RESULT.BENEFIT^TYPE := BEN^PPD;
+    G^RESULT.WEEKLY^RATE := G^WEEKLY^RATE;
+    G^RESULT.TOTAL^WEEKS := PAYABLE^WEEKS;
+    G^RESULT.CALC^STATUS := CALC^OK;
+
+    CALL WRITE^BENEFIT^RESULT;
+    CALL REPLY^RESULT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^PTD -- Permanent Total Disability (lifetime benefits)
+! -------------------------------------------------------------------
+PROC CALCULATE^PTD;
+  BEGIN
+    FIXED(2) RAW^RATE;
+
+    RAW^RATE := G^AWW * G^PARAMS.PTD^PCT^AWW / 100F;
+
+    IF RAW^RATE > G^PARAMS.MAX^PTD^WEEKLY THEN
+      G^WEEKLY^RATE := G^PARAMS.MAX^PTD^WEEKLY
+    ELSE IF RAW^RATE < G^PARAMS.MIN^PTD^WEEKLY THEN
+      G^WEEKLY^RATE := G^PARAMS.MIN^PTD^WEEKLY
+    ELSE
+      G^WEEKLY^RATE := RAW^RATE;
+
+    ! PTD is lifetime in most jurisdictions -- calculate to current
+    ! Total amount computed for reporting; actual payments are ongoing
+    IF G^REQUEST.DISABILITY^END = 0 THEN
+      BEGIN
+        INT TOTAL^DAYS;
+        CALL CALC^DAYS^TO^TODAY(G^REQUEST.DISABILITY^START, TOTAL^DAYS);
+        G^RESULT.TOTAL^WEEKS := TOTAL^DAYS / 7;
+      END
+    ELSE
+      G^RESULT.TOTAL^WEEKS := JULIAN^DIFF(G^REQUEST.DISABILITY^START,
+                                           G^REQUEST.DISABILITY^END) / 7;
+
+    G^RESULT.TOTAL^AMOUNT := G^WEEKLY^RATE * G^RESULT.TOTAL^WEEKS;
+
+    ! COLA is almost always applicable for PTD
+    IF G^REQUEST.COLA^ELIGIBLE = 1 THEN
+      CALL APPLY^COLA^ADJUSTMENT;
+
+    G^RESULT.CLAIM^NUMBER := G^REQUEST.CLAIM^NUMBER;
+    G^RESULT.BENEFIT^TYPE := BEN^PTD;
+    G^RESULT.WEEKLY^RATE := G^WEEKLY^RATE;
+    G^RESULT.CALC^STATUS := CALC^OK;
+
+    CALL WRITE^BENEFIT^RESULT;
+    CALL REPLY^RESULT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^DEATH -- Death benefits and dependent allowances
+!
+! Death benefits include: burial allowance + weekly benefits to
+! dependents. Dependent allowances vary by type and jurisdiction.
+! -------------------------------------------------------------------
+PROC CALCULATE^DEATH;
+  BEGIN
+    FIXED(2) RAW^RATE;
+    FIXED(2) DEPENDENT^RATE;
+    FIXED(2) BURIAL;
+    INT      I;
+    INT      SPOUSE^COUNT;
+    INT      CHILD^COUNT;
+    INT      OTHER^COUNT;
+
+    ! Count dependent types
+    SPOUSE^COUNT := 0;
+    CHILD^COUNT := 0;
+    OTHER^COUNT := 0;
+
+    FOR I := 0 TO G^REQUEST.NUM^DEPENDENTS - 1 DO
+      CASE G^REQUEST.DEPENDENT^TYPES[I] OF
+        BEGIN
+          1 -> SPOUSE^COUNT := SPOUSE^COUNT + 1;
+          2 -> CHILD^COUNT := CHILD^COUNT + 1;
+          3 -> OTHER^COUNT := OTHER^COUNT + 1;
+        END;
+
+    ! Base death benefit rate
+    RAW^RATE := G^AWW * G^PARAMS.DEATH^PCT^AWW / 100F;
+
+    ! Adjust for dependents -- most states: spouse gets base rate,
+    ! each child adds a percentage increment
+    IF SPOUSE^COUNT > 0 THEN
+      DEPENDENT^RATE := RAW^RATE
+    ELSE IF CHILD^COUNT > 0 THEN
+      ! No spouse -- children split the benefit
+      DEPENDENT^RATE := RAW^RATE
+    ELSE
+      ! No statutory dependents -- some states pay partial benefits
+      DEPENDENT^RATE := RAW^RATE * 50F / 100F;
+
+    ! Add per-child increments (typically 5-10% per child up to max)
+    IF CHILD^COUNT > 0 AND SPOUSE^COUNT > 0 THEN
+      BEGIN
+        FIXED(2) CHILD^ADD;
+        CHILD^ADD := RAW^RATE * 5F / 100F * CHILD^COUNT;
+        DEPENDENT^RATE := DEPENDENT^RATE + CHILD^ADD;
+      END;
+
+    ! Cap at state maximum
+    IF DEPENDENT^RATE > G^PARAMS.DEATH^MAX^WEEKLY THEN
+      G^WEEKLY^RATE := G^PARAMS.DEATH^MAX^WEEKLY
+    ELSE
+      G^WEEKLY^RATE := DEPENDENT^RATE;
+
+    ! Burial allowance is a one-time fixed amount
+    BURIAL := G^PARAMS.BURIAL^ALLOWANCE;
+
+    ! Death benefits duration -- typically until spouse remarries
+    ! or children reach age 18/23 (if in school)
+    ! For calculation, use weeks from DOI to current date
+    IF G^REQUEST.DISABILITY^END = 0 THEN
+      BEGIN
+        INT TOTAL^DAYS;
+        CALL CALC^DAYS^TO^TODAY(G^REQUEST.DISABILITY^START, TOTAL^DAYS);
+        G^RESULT.TOTAL^WEEKS := TOTAL^DAYS / 7;
+      END
+    ELSE
+      G^RESULT.TOTAL^WEEKS := JULIAN^DIFF(G^REQUEST.DISABILITY^START,
+                                           G^REQUEST.DISABILITY^END) / 7;
+
+    G^RESULT.TOTAL^AMOUNT := G^WEEKLY^RATE * G^RESULT.TOTAL^WEEKS + BURIAL;
+
+    G^RESULT.CLAIM^NUMBER := G^REQUEST.CLAIM^NUMBER;
+    G^RESULT.BENEFIT^TYPE := BEN^DEATH;
+    G^RESULT.WEEKLY^RATE := G^WEEKLY^RATE;
+    G^RESULT.CALC^STATUS := CALC^OK;
+
+    CALL WRITE^BENEFIT^RESULT;
+    CALL REPLY^RESULT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC APPLY^COLA^ADJUSTMENT -- Cost of Living Adjustment
+!
+! For claims exceeding COLA^START^YEAR years, apply annual COLA
+! percentage to the weekly rate. Compounds annually.
+! -------------------------------------------------------------------
+PROC APPLY^COLA^ADJUSTMENT;
+  BEGIN
+    INT      YEARS^ON^CLAIM;
+    INT      COLA^YEARS;
+    INT      I;
+    FIXED(2) COLA^FACTOR;
+    FIXED(2) ADJUSTED^RATE;
+    INT(32)  TODAY;
+    INT(32)  DOI;
+
+    CALL TIMESTAMP(TODAY);
+    DOI := G^REQUEST.DATE^OF^INJURY;
+
+    ! Calculate years on claim
+    YEARS^ON^CLAIM := (TODAY / 10000D) - (DOI / 10000D);
+
+    IF YEARS^ON^CLAIM < G^PARAMS.COLA^START^YEAR THEN
+      BEGIN
+        G^RESULT.COLA^ADJUSTMENT := 0F;
+        RETURN;
+      END;
+
+    ! Number of COLA-eligible years
+    COLA^YEARS := YEARS^ON^CLAIM - G^PARAMS.COLA^START^YEAR;
+    IF COLA^YEARS <= 0 THEN
+      BEGIN
+        G^RESULT.COLA^ADJUSTMENT := 0F;
+        RETURN;
+      END;
+
+    ! Compound COLA: rate * (1 + pct/10000) ^ years
+    ADJUSTED^RATE := G^WEEKLY^RATE;
+    COLA^FACTOR := 1F + FIXED(G^PARAMS.COLA^PCT^ANNUAL, 2) / 10000F;
+
+    FOR I := 1 TO COLA^YEARS DO
+      ADJUSTED^RATE := ADJUSTED^RATE * COLA^FACTOR;
+
+    G^RESULT.COLA^ADJUSTMENT := ADJUSTED^RATE - G^WEEKLY^RATE;
+
+    ! Update the weekly rate with COLA
+    G^WEEKLY^RATE := ADJUSTED^RATE;
+
+    ! Recalculate total with COLA-adjusted rate
+    G^RESULT.TOTAL^AMOUNT := G^WEEKLY^RATE * G^RESULT.TOTAL^WEEKS;
+  END;
+
+! -------------------------------------------------------------------
+! PROC WRITE^BENEFIT^RESULT -- Persist result under TMF
+! -------------------------------------------------------------------
+PROC WRITE^BENEFIT^RESULT;
+  BEGIN
+    INT STATUS;
+
+    CALL BEGINTRANSACTION(G^TMF^TAG, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    CALL WRITE_FILE(G^FILENUM^BENRESLT, G^RESULT, $LEN(BENEFIT^RESULT));
+    IF <> THEN
+      BEGIN
+        CALL ABORTTRANSACTION(G^TMF^TAG);
+        CALL REPLY^ERROR(6);
+        RETURN;
+      END;
+
+    CALL LOG^ACTIVITY("BENCALC", G^REQUEST.CLAIM^NUMBER,
+                      G^REQUEST.BENEFIT^TYPE);
+
+    CALL ENDTRANSACTION(G^TMF^TAG);
+  END;
+
+! -------------------------------------------------------------------
+! PROC JULIAN^DIFF -- Days between two YYYYMMDD dates
+! -------------------------------------------------------------------
+INT(32) PROC JULIAN^DIFF(DATE1, DATE2);
+  INT(32) DATE1, DATE2;
+  BEGIN
+    INT(32) J1, J2;
+    INT Y, M, D;
+
+    Y := DATE1 / 10000D;
+    M := (DATE1 - (Y * 10000D)) / 100;
+    D := DATE1 - (Y * 10000D) - (M * 100);
+    J1 := 365 * Y + Y/4 - Y/100 + Y/400 + (153 * (IF M > 2 THEN M - 3 ELSE M + 9) + 2) / 5 + D;
+
+    Y := DATE2 / 10000D;
+    M := (DATE2 - (Y * 10000D)) / 100;
+    D := DATE2 - (Y * 10000D) - (M * 100);
+    J2 := 365 * Y + Y/4 - Y/100 + Y/400 + (153 * (IF M > 2 THEN M - 3 ELSE M + 9) + 2) / 5 + D;
+
+    RETURN J2 - J1;
+  END;
+
+! -------------------------------------------------------------------
+! PROC TIMESTAMP -- Current date as YYYYMMDD
+! -------------------------------------------------------------------
+PROC TIMESTAMP(DATEOUT);
+  INT(32) .DATEOUT;
+  BEGIN
+    INT(32) JULTS;
+    INT YR, MO, DA, HR, MI, SE, MS, DOW;
+    CALL JULIANTIMESTAMP(JULTS);
+    CALL INTERPRETTIMESTAMP(JULTS, YR, MO, DA, HR, MI, SE, MS, DOW);
+    DATEOUT := YR * 10000D + MO * 100 + DA;
+  END;

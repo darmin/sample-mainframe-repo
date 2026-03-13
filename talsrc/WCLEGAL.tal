@@ -1,0 +1,657 @@
+!
+!  WCLEGAL -- Workers' Compensation Legal/Litigation Management Server
+!
+!  Manages the litigation lifecycle for disputed workers' compensation
+!  claims including defense attorney assignment, litigation status
+!  tracking, legal expense management, settlement evaluation,
+!  hearing/trial scheduling, document management, expert witness
+!  tracking, mediation/arbitration, and verdict/appeal handling.
+!
+!  Process: WCLEGAL
+!  Pathway Server Class: LEGAL-SC
+!  Primary Files: LEGALCF (legal case records), LEGEXPF (legal expenses),
+!                 LEGDOCF (document index), LEGEXWF (expert witnesses)
+!
+!  Copyright (c) TPA Systems Inc. All rights reserved.
+!
+
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?LIST
+
+LITERAL MAX^HEARINGS    = 20;
+LITERAL MAX^EXPENSES    = 200;
+LITERAL MAX^DOCUMENTS   = 100;
+LITERAL MAX^EXPERTS     = 10;
+LITERAL MAX^ISSUES      = 10;
+LITERAL BUDGET^WARN^PCT = 80;   ! Warn at 80% of budget
+
+! Litigation status codes
+LITERAL LIT^NONE        = 0;
+LITERAL LIT^PETITION    = 1;    ! Petition/Application filed
+LITERAL LIT^ANSWER      = 2;    ! Answer filed
+LITERAL LIT^DISCOVERY   = 3;    ! Discovery phase
+LITERAL LIT^DEPOSITION  = 4;    ! Depositions scheduled/taken
+LITERAL LIT^MEDIATION   = 5;    ! Mediation/ADR
+LITERAL LIT^TRIAL^SET   = 6;    ! Trial date set
+LITERAL LIT^TRIAL       = 7;    ! Trial in progress
+LITERAL LIT^VERDICT     = 8;    ! Verdict/Award rendered
+LITERAL LIT^APPEAL      = 9;    ! Appeal filed
+LITERAL LIT^SETTLED     = 10;   ! Settled
+LITERAL LIT^DISMISSED   = 11;   ! Dismissed
+LITERAL LIT^CLOSED      = 12;   ! Final closed
+
+! Expense category codes
+LITERAL EXP^ATTORNEY    = 1;    ! Attorney fees
+LITERAL EXP^DEPOSITION  = 2;    ! Deposition costs
+LITERAL EXP^EXPERT^FEE  = 3;    ! Expert witness fees
+LITERAL EXP^COURT^COST  = 4;    ! Court costs and filing fees
+LITERAL EXP^MEDIATION   = 5;    ! Mediation/arbitration fees
+LITERAL EXP^TRAVEL      = 6;    ! Travel expenses
+LITERAL EXP^COPYING     = 7;    ! Document copy/production
+LITERAL EXP^MEDICAL     = 8;    ! Medical record retrieval
+LITERAL EXP^INVESTIG    = 9;    ! Investigation costs
+LITERAL EXP^OTHER       = 10;   ! Other legal expenses
+
+! Issue type codes
+LITERAL ISS^COMPENSABLE  = 1;   ! Compensability dispute
+LITERAL ISS^TREATMENT    = 2;   ! Medical treatment dispute
+LITERAL ISS^DISABILITY   = 3;   ! Disability rating
+LITERAL ISS^TTD          = 4;   ! Temporary total disability
+LITERAL ISS^TPD          = 5;   ! Temporary partial disability
+LITERAL ISS^PPD          = 6;   ! Permanent partial disability
+LITERAL ISS^PTD          = 7;   ! Permanent total disability
+LITERAL ISS^DEATH        = 8;   ! Death benefits
+LITERAL ISS^SETTLEMENT   = 9;   ! Settlement/compromise
+LITERAL ISS^ATTORNEY^FEE = 10;  ! Attorney fee dispute
+
+! Legal case record
+STRUCT LEGAL^CASE (*);
+  BEGIN
+    STRING CLAIM^NUM[0:11];
+    STRING CASE^ID[0:11];        ! Litigation case ID
+    INT    LIT^STATUS;
+    INT    STATUS^DATE[0:2];     ! Date of last status change
+    STRING STATE^JURISDICTION[0:1];
+    STRING VENUE[0:29];          ! Court/Board name
+    STRING DOCKET^NUM[0:19];     ! Court docket number
+    INT    PETITION^DATE[0:2];
+    INT    ANSWER^DATE[0:2];
+    INT    STAT^OF^LIM[0:2];     ! Statute of limitations date
+    ! Defense attorney
+    STRING DEF^ATTY^ID[0:7];
+    STRING DEF^ATTY^NAME[0:29];
+    STRING DEF^ATTY^FIRM[0:39];
+    STRING DEF^ATTY^PHONE[0:9];
+    INT    DEF^ATTY^ASSIGN^DATE[0:2];
+    ! Claimant attorney
+    STRING CLM^ATTY^NAME[0:29];
+    STRING CLM^ATTY^FIRM[0:39];
+    STRING CLM^ATTY^PHONE[0:9];
+    ! Issues in dispute
+    INT    ISSUE^COUNT;
+    INT    ISSUES(0:MAX^ISSUES - 1);
+    ! Financial
+    FIXED  RESERVE^AMOUNT;        ! Legal reserve
+    FIXED  BUDGET^AMOUNT;         ! Legal expense budget
+    FIXED  EXPENSES^TO^DATE;
+    FIXED  SETTLEMENT^DEMAND;
+    FIXED  SETTLEMENT^OFFER;
+    FIXED  SETTLEMENT^AUTH;       ! Maximum settlement authority
+    FIXED  VERDICT^AMOUNT;
+    ! Hearing tracking
+    INT    NEXT^HEARING^DATE[0:2];
+    STRING NEXT^HEARING^TYPE[0:19];
+    STRING NEXT^HEARING^VENUE[0:29];
+    INT    HEARING^COUNT;
+    ! Outcome
+    INT    OUTCOME^TYPE;          ! 0=none, 1=claimant, 2=defense, 3=mixed
+    INT    CLOSE^DATE[0:2];
+    STRING CLOSE^NOTES[0:99];
+    ! Appeal
+    INT    APPEAL^FILED;          ! 0=no, 1=by claimant, 2=by defense
+    INT    APPEAL^DATE[0:2];
+    STRING APPEAL^COURT[0:29];
+    INT    APPEAL^STATUS;         ! 0=pending, 1=affirmed, 2=reversed, 3=remanded
+  END;
+
+! Legal expense record
+STRUCT LEGAL^EXPENSE (*);
+  BEGIN
+    STRING CASE^ID[0:11];
+    INT    EXP^SEQ;
+    INT    EXP^DATE[0:2];
+    INT    EXP^CATEGORY;
+    STRING EXP^VENDOR[0:29];
+    STRING EXP^DESCRIPTION[0:59];
+    FIXED  EXP^AMOUNT;
+    STRING EXP^INVOICE^NUM[0:11];
+    INT    EXP^APPROVED;         ! 0=pending, 1=approved, 2=denied
+    STRING EXP^APPROVER[0:7];
+    INT    EXP^APPROVE^DATE[0:2];
+  END;
+
+! Document index record
+STRUCT LEGAL^DOC (*);
+  BEGIN
+    STRING CASE^ID[0:11];
+    INT    DOC^SEQ;
+    STRING DOC^TITLE[0:49];
+    STRING DOC^TYPE[0:9];        ! PETITION, ANSWER, DEPO, MOTION, etc.
+    INT    DOC^DATE[0:2];
+    STRING DOC^FILED^BY[0:19];   ! CLAIMANT, DEFENSE, COURT
+    STRING DOC^LOCATION[0:39];   ! File/volume reference
+    INT    DOC^PAGES;
+    INT    RESPONSE^DUE[0:2];    ! Response deadline
+    INT    RESPONSE^FILED;       ! 0=no, 1=yes
+  END;
+
+! Expert witness record
+STRUCT EXPERT^WITNESS (*);
+  BEGIN
+    STRING CASE^ID[0:11];
+    INT    EXPERT^SEQ;
+    STRING EXPERT^NAME[0:29];
+    STRING EXPERT^SPECIALTY[0:29];
+    STRING EXPERT^PHONE[0:9];
+    INT    RETAINED^BY;          ! 1=defense, 2=claimant
+    INT    RETAIN^DATE[0:2];
+    INT    DEPO^DATE[0:2];
+    INT    TRIAL^AVAILABLE;      ! 0=no, 1=yes
+    FIXED  HOURLY^RATE;
+    FIXED  DEPO^RATE;
+    FIXED  TRIAL^RATE;
+    FIXED  TOTAL^BILLED;
+    STRING OPINION^SUMMARY[0:99];
+  END;
+
+! Settlement evaluation
+STRUCT SETTLE^EVAL (*);
+  BEGIN
+    STRING CASE^ID[0:11];
+    INT    EVAL^DATE[0:2];
+    FIXED  PROBABLE^VERDICT;     ! If case goes to trial
+    FIXED  BEST^CASE;
+    FIXED  WORST^CASE;
+    INT    WIN^PROBABILITY;      ! 0-100%
+    FIXED  EXPECTED^DEFENSE^COST; ! Remaining legal costs to trial
+    FIXED  RECOMMENDED^SETTLE;
+    STRING EVALUATOR[0:29];
+    STRING RATIONALE[0:199];
+  END;
+
+! Working storage
+STRUCT W^CASE (LEGAL^CASE);
+STRUCT W^EXP  (LEGAL^EXPENSE);
+STRUCT W^DOC  (LEGAL^DOC);
+STRUCT W^EXPERT (EXPERT^WITNESS);
+STRUCT W^SETTLE (SETTLE^EVAL);
+
+! File numbers
+INT CASE^FNUM;
+INT EXP^FNUM;
+INT DOC^FNUM;
+INT EXPERT^FNUM;
+INT AUDIT^FNUM;
+
+!---------------------------------------------------------------
+! PROC ASSIGN^DEFENSE^ATTORNEY -- Assign defense counsel
+!---------------------------------------------------------------
+PROC ASSIGN^DEFENSE^ATTORNEY(CASE^REC, ATTY^DATA);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  STRING .ATTY^DATA[0:119];
+  BEGIN
+    CASE^REC.DEF^ATTY^ID ':=' ATTY^DATA FOR 8;
+    CASE^REC.DEF^ATTY^NAME ':=' ATTY^DATA[8] FOR 30;
+    CASE^REC.DEF^ATTY^FIRM ':=' ATTY^DATA[38] FOR 40;
+    CASE^REC.DEF^ATTY^PHONE ':=' ATTY^DATA[78] FOR 10;
+
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+    CASE^REC.DEF^ATTY^ASSIGN^DATE ':=' TIMESTAMP FOR 6;
+
+    ! Set initial budget based on jurisdiction complexity
+    ! Simple: $15K, Moderate: $30K, Complex: $60K
+    IF CASE^REC.ISSUE^COUNT <= 2 THEN
+      CASE^REC.BUDGET^AMOUNT := 15000F
+    ELSE IF CASE^REC.ISSUE^COUNT <= 5 THEN
+      CASE^REC.BUDGET^AMOUNT := 30000F
+    ELSE
+      CASE^REC.BUDGET^AMOUNT := 60000F;
+
+    CALL WRITE^AUDIT("ATTORNEY ASSIGNED", CASE^REC.CASE^ID,
+                      CASE^REC.DEF^ATTY^NAME);
+  END;
+
+!---------------------------------------------------------------
+! PROC UPDATE^LITIGATION^STATUS -- Advance litigation status
+!---------------------------------------------------------------
+INT PROC UPDATE^LITIGATION^STATUS(CASE^REC, NEW^STATUS);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  INT    NEW^STATUS;
+  BEGIN
+    INT OLD^STATUS := CASE^REC.LIT^STATUS;
+
+    ! Validate status transitions
+    IF NEW^STATUS <= OLD^STATUS AND
+       NEW^STATUS <> LIT^SETTLED AND
+       NEW^STATUS <> LIT^DISMISSED THEN
+      RETURN -1;  ! Invalid backward transition
+
+    ! Special validation for settlement
+    IF NEW^STATUS = LIT^SETTLED AND CASE^REC.SETTLEMENT^OFFER <= 0F
+    THEN
+      RETURN -2;  ! Cannot settle without an offer
+
+    ! Special validation for appeal
+    IF NEW^STATUS = LIT^APPEAL AND OLD^STATUS <> LIT^VERDICT THEN
+      RETURN -3;  ! Can only appeal after verdict
+
+    CASE^REC.LIT^STATUS := NEW^STATUS;
+
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+    CASE^REC.STATUS^DATE ':=' TIMESTAMP FOR 6;
+
+    ! Auto-actions based on status
+    IF NEW^STATUS = LIT^SETTLED OR NEW^STATUS = LIT^DISMISSED THEN
+      BEGIN
+        CASE^REC.CLOSE^DATE ':=' TIMESTAMP FOR 6;
+        IF NEW^STATUS = LIT^DISMISSED THEN
+          CASE^REC.OUTCOME^TYPE := 2;  ! Defense win
+      END;
+
+    CALL WRITE^AUDIT("STATUS CHANGE", CASE^REC.CASE^ID, " ");
+    RETURN 0;
+  END;
+
+!---------------------------------------------------------------
+! PROC RECORD^EXPENSE -- Record legal expense with budget check
+!---------------------------------------------------------------
+INT PROC RECORD^EXPENSE(CASE^REC, EXP^REC);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  STRUCT .EXP^REC  (LEGAL^EXPENSE);
+  BEGIN
+    ! Write expense record
+    CALL WRITE(EXP^FNUM, EXP^REC, $LEN(LEGAL^EXPENSE));
+    IF <> THEN RETURN -1;
+
+    ! Update case totals
+    CASE^REC.EXPENSES^TO^DATE := CASE^REC.EXPENSES^TO^DATE +
+                                  EXP^REC.EXP^AMOUNT;
+
+    ! Budget check
+    IF CASE^REC.BUDGET^AMOUNT > 0F THEN
+      BEGIN
+        FIXED PCT^USED := (CASE^REC.EXPENSES^TO^DATE * 100F) /
+                           CASE^REC.BUDGET^AMOUNT;
+        IF PCT^USED >= 100F THEN
+          BEGIN
+            CALL WRITE^AUDIT("BUDGET EXCEEDED", CASE^REC.CASE^ID, " ");
+            RETURN 2;  ! Over budget
+          END
+        ELSE IF PCT^USED >= $FIXED(BUDGET^WARN^PCT) THEN
+          RETURN 1;  ! Warning threshold
+      END;
+
+    RETURN 0;
+  END;
+
+!---------------------------------------------------------------
+! PROC EVALUATE^SETTLEMENT -- Calculate settlement recommendation
+!---------------------------------------------------------------
+PROC EVALUATE^SETTLEMENT(CASE^REC, EVAL);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  STRUCT .EVAL     (SETTLE^EVAL);
+  BEGIN
+    FIXED EXPECTED^VALUE;
+    FIXED RISK^ADJUSTED;
+
+    ! Expected value = probability-weighted average of outcomes
+    ! EV = (Win% * BestCase) + ((100-Win%) * WorstCase)
+    EXPECTED^VALUE :=
+      ($FIXED(EVAL.WIN^PROBABILITY) * EVAL.BEST^CASE / 100F) +
+      ($FIXED(100 - EVAL.WIN^PROBABILITY) * EVAL.WORST^CASE / 100F);
+
+    ! Add remaining defense costs (saved if settled)
+    RISK^ADJUSTED := EXPECTED^VALUE + EVAL.EXPECTED^DEFENSE^COST;
+
+    ! Settlement recommendation = risk-adjusted value * 0.85
+    ! (15% discount for certainty of outcome)
+    EVAL.RECOMMENDED^SETTLE := RISK^ADJUSTED * 85F / 100F;
+
+    EVAL.CASE^ID ':=' CASE^REC.CASE^ID FOR 12;
+
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+    EVAL.EVAL^DATE ':=' TIMESTAMP FOR 6;
+
+    ! Check if recommendation is within settlement authority
+    IF EVAL.RECOMMENDED^SETTLE > CASE^REC.SETTLEMENT^AUTH THEN
+      CALL WRITE^AUDIT("SETTLEMENT EXCEEDS AUTHORITY",
+                        CASE^REC.CASE^ID, " ");
+  END;
+
+!---------------------------------------------------------------
+! PROC SCHEDULE^HEARING -- Add hearing/trial date to case
+!---------------------------------------------------------------
+PROC SCHEDULE^HEARING(CASE^REC, HEARING^DATE, HEARING^TYPE,
+                      HEARING^VENUE);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  INT    .HEARING^DATE[0:2];
+  STRING .HEARING^TYPE[0:19];
+  STRING .HEARING^VENUE[0:29];
+  BEGIN
+    CASE^REC.NEXT^HEARING^DATE ':=' HEARING^DATE FOR 6;
+    CASE^REC.NEXT^HEARING^TYPE ':=' HEARING^TYPE FOR 20;
+    CASE^REC.NEXT^HEARING^VENUE ':=' HEARING^VENUE FOR 30;
+    CASE^REC.HEARING^COUNT := CASE^REC.HEARING^COUNT + 1;
+
+    CALL WRITE^AUDIT("HEARING SCHEDULED", CASE^REC.CASE^ID,
+                      HEARING^TYPE);
+  END;
+
+!---------------------------------------------------------------
+! PROC INDEX^DOCUMENT -- Add document to case index
+!---------------------------------------------------------------
+PROC INDEX^DOCUMENT(DOC^REC);
+  STRUCT .DOC^REC (LEGAL^DOC);
+  BEGIN
+    CALL WRITE(DOC^FNUM, DOC^REC, $LEN(LEGAL^DOC));
+    IF <> THEN
+      CALL LOG^ERROR("DOCUMENT INDEX WRITE FAILED", $RDSTATUS);
+
+    ! Check if response is required
+    IF DOC^REC.RESPONSE^DUE[0] > 0 THEN
+      CALL WRITE^AUDIT("RESPONSE DUE", DOC^REC.CASE^ID,
+                        DOC^REC.DOC^TITLE);
+  END;
+
+!---------------------------------------------------------------
+! PROC RETAIN^EXPERT -- Add expert witness to case
+!---------------------------------------------------------------
+PROC RETAIN^EXPERT(CASE^REC, EXP^WIT);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  STRUCT .EXP^WIT  (EXPERT^WITNESS);
+  BEGIN
+    EXP^WIT.CASE^ID ':=' CASE^REC.CASE^ID FOR 12;
+
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+    EXP^WIT.RETAIN^DATE ':=' TIMESTAMP FOR 6;
+
+    CALL WRITE(EXPERT^FNUM, EXP^WIT, $LEN(EXPERT^WITNESS));
+
+    ! Create retention expense
+    STRUCT RETAINER^EXP (LEGAL^EXPENSE);
+    RETAINER^EXP.CASE^ID ':=' CASE^REC.CASE^ID FOR 12;
+    RETAINER^EXP.EXP^CATEGORY := EXP^EXPERT^FEE;
+    RETAINER^EXP.EXP^VENDOR ':=' EXP^WIT.EXPERT^NAME FOR 30;
+    RETAINER^EXP.EXP^DESCRIPTION ':='
+      "EXPERT WITNESS RETAINER FEE                                 " FOR 60;
+    RETAINER^EXP.EXP^AMOUNT := EXP^WIT.HOURLY^RATE * 5F;  ! 5-hour retainer
+    RETAINER^EXP.EXP^APPROVED := 1;
+    RETAINER^EXP.EXP^DATE ':=' TIMESTAMP FOR 6;
+
+    INT BUDGET^STATUS;
+    BUDGET^STATUS := RECORD^EXPENSE(CASE^REC, RETAINER^EXP);
+
+    CALL WRITE^AUDIT("EXPERT RETAINED", CASE^REC.CASE^ID,
+                      EXP^WIT.EXPERT^NAME);
+  END;
+
+!---------------------------------------------------------------
+! PROC RECORD^VERDICT -- Record trial verdict/award
+!---------------------------------------------------------------
+PROC RECORD^VERDICT(CASE^REC, AMOUNT, OUTCOME^TYPE);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  FIXED  AMOUNT;
+  INT    OUTCOME^TYPE;
+  BEGIN
+    CASE^REC.VERDICT^AMOUNT := AMOUNT;
+    CASE^REC.OUTCOME^TYPE := OUTCOME^TYPE;
+
+    INT RESULT;
+    RESULT := UPDATE^LITIGATION^STATUS(CASE^REC, LIT^VERDICT);
+
+    ! Log for reserve adjustment
+    IF AMOUNT > CASE^REC.RESERVE^AMOUNT THEN
+      CALL WRITE^AUDIT("VERDICT EXCEEDS RESERVE", CASE^REC.CASE^ID,
+                        " ");
+  END;
+
+!---------------------------------------------------------------
+! PROC FILE^APPEAL -- Process appeal filing
+!---------------------------------------------------------------
+INT PROC FILE^APPEAL(CASE^REC, FILED^BY, COURT);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  INT    FILED^BY;               ! 1=claimant, 2=defense
+  STRING .COURT[0:29];
+  BEGIN
+    IF CASE^REC.LIT^STATUS <> LIT^VERDICT THEN
+      RETURN -1;  ! Can only appeal verdicts
+
+    CASE^REC.APPEAL^FILED := FILED^BY;
+    CASE^REC.APPEAL^COURT ':=' COURT FOR 30;
+    CASE^REC.APPEAL^STATUS := 0;  ! Pending
+
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+    CASE^REC.APPEAL^DATE ':=' TIMESTAMP FOR 6;
+
+    INT RESULT;
+    RESULT := UPDATE^LITIGATION^STATUS(CASE^REC, LIT^APPEAL);
+
+    ! Increase budget for appeal costs
+    CASE^REC.BUDGET^AMOUNT := CASE^REC.BUDGET^AMOUNT + 25000F;
+
+    CALL WRITE^AUDIT("APPEAL FILED", CASE^REC.CASE^ID, COURT);
+    RETURN 0;
+  END;
+
+!---------------------------------------------------------------
+! PROC RESOLVE^APPEAL -- Record appeal outcome
+!---------------------------------------------------------------
+PROC RESOLVE^APPEAL(CASE^REC, APPEAL^RESULT);
+  STRUCT .CASE^REC (LEGAL^CASE);
+  INT    APPEAL^RESULT;
+  BEGIN
+    CASE^REC.APPEAL^STATUS := APPEAL^RESULT;
+
+    IF APPEAL^RESULT = 1 THEN      ! Affirmed
+      BEGIN
+        ! Original verdict stands
+        CASE^REC.CLOSE^NOTES ':='
+          "APPEAL AFFIRMED - ORIGINAL VERDICT STANDS                    "
+          & "                                    " FOR 100;
+      END
+    ELSE IF APPEAL^RESULT = 2 THEN  ! Reversed
+      BEGIN
+        CASE^REC.VERDICT^AMOUNT := 0F;
+        CASE^REC.OUTCOME^TYPE := 0;
+        CASE^REC.CLOSE^NOTES ':='
+          "APPEAL REVERSED - VERDICT VACATED                            "
+          & "                                    " FOR 100;
+      END
+    ELSE IF APPEAL^RESULT = 3 THEN  ! Remanded
+      BEGIN
+        ! Send back to lower court -- revert status
+        CASE^REC.LIT^STATUS := LIT^DISCOVERY;
+        CASE^REC.CLOSE^NOTES ':='
+          "APPEAL REMANDED - CASE RETURNED FOR FURTHER PROCEEDINGS      "
+          & "                                    " FOR 100;
+        RETURN;  ! Don't close
+      END;
+
+    ! Close the case (unless remanded)
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+    CASE^REC.CLOSE^DATE ':=' TIMESTAMP FOR 6;
+    CASE^REC.LIT^STATUS := LIT^CLOSED;
+  END;
+
+!---------------------------------------------------------------
+! PROC CALC^EXPENSE^SUMMARY -- Summarize expenses by category
+!---------------------------------------------------------------
+PROC CALC^EXPENSE^SUMMARY(CASE^ID, SUMMARY);
+  STRING .CASE^ID[0:11];
+  FIXED  .SUMMARY(0:10);         ! Totals by expense category
+  BEGIN
+    INT I;
+    STRUCT EXP^REC (LEGAL^EXPENSE);
+
+    FOR I := 0 TO 10 DO SUMMARY(I) := 0F;
+
+    CALL KEYPOSITION(EXP^FNUM, CASE^ID, , 0, 2);
+    WHILE 1 DO
+      BEGIN
+        CALL READ(EXP^FNUM, EXP^REC, $LEN(LEGAL^EXPENSE));
+        IF <> THEN RETURN;
+        IF EXP^REC.CASE^ID <> CASE^ID FOR 12 THEN RETURN;
+
+        IF EXP^REC.EXP^CATEGORY >= 1 AND
+           EXP^REC.EXP^CATEGORY <= 10 AND
+           EXP^REC.EXP^APPROVED = 1 THEN
+          SUMMARY(EXP^REC.EXP^CATEGORY) :=
+            SUMMARY(EXP^REC.EXP^CATEGORY) + EXP^REC.EXP^AMOUNT;
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC WRITE^AUDIT -- Write audit trail record
+!---------------------------------------------------------------
+PROC WRITE^AUDIT(ACTION, CASE^ID, DETAIL);
+  STRING .ACTION[0:29];
+  STRING .CASE^ID[0:11];
+  STRING .DETAIL[0:29];
+  BEGIN
+    STRING AUDIT^BUF[0:99];
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+
+    AUDIT^BUF ':=' CASE^ID FOR 12;
+    AUDIT^BUF[12] ':=' " " FOR 1;
+    AUDIT^BUF[13] ':=' ACTION FOR 30;
+    AUDIT^BUF[43] ':=' " " FOR 1;
+    AUDIT^BUF[44] ':=' DETAIL FOR 30;
+
+    CALL WRITE(AUDIT^FNUM, AUDIT^BUF, 100);
+  END;
+
+!---------------------------------------------------------------
+! PROC PROCESS^REQUEST -- Route incoming request to handler
+!---------------------------------------------------------------
+PROC PROCESS^REQUEST(MSGCODE, REQ^BUF, RESP^BUF, RESP^LEN);
+  INT    MSGCODE;
+  STRING .REQ^BUF[0:4095];
+  STRING .RESP^BUF[0:4095];
+  INT    .RESP^LEN;
+  BEGIN
+    STRUCT REQ^CASE (LEGAL^CASE);
+
+    IF MSGCODE = 1 THEN       ! Create litigation case
+      BEGIN
+        REQ^CASE ':=' REQ^BUF FOR $LEN(LEGAL^CASE);
+        REQ^CASE.LIT^STATUS := LIT^PETITION;
+        REQ^CASE.EXPENSES^TO^DATE := 0F;
+        REQ^CASE.HEARING^COUNT := 0;
+        CALL WRITE(CASE^FNUM, REQ^CASE, $LEN(LEGAL^CASE));
+        RESP^BUF ':=' REQ^CASE FOR $LEN(LEGAL^CASE);
+        RESP^LEN := $LEN(LEGAL^CASE);
+      END
+    ELSE IF MSGCODE = 2 THEN  ! Assign attorney
+      BEGIN
+        REQ^CASE ':=' REQ^BUF FOR $LEN(LEGAL^CASE);
+        CALL ASSIGN^DEFENSE^ATTORNEY(REQ^CASE, REQ^BUF[$LEN(LEGAL^CASE)]);
+        CALL REWRITE^CASE(REQ^CASE);
+        RESP^BUF ':=' REQ^CASE FOR $LEN(LEGAL^CASE);
+        RESP^LEN := $LEN(LEGAL^CASE);
+      END
+    ELSE IF MSGCODE = 3 THEN  ! Update status
+      BEGIN
+        REQ^CASE ':=' REQ^BUF FOR $LEN(LEGAL^CASE);
+        INT NEW^STAT := REQ^BUF.$INT($LEN(LEGAL^CASE));
+        INT RESULT := UPDATE^LITIGATION^STATUS(REQ^CASE, NEW^STAT);
+        CALL REWRITE^CASE(REQ^CASE);
+        RESP^BUF ':=' REQ^CASE FOR $LEN(LEGAL^CASE);
+        RESP^BUF[$LEN(LEGAL^CASE)] ':=' RESULT FOR 2;
+        RESP^LEN := $LEN(LEGAL^CASE) + 2;
+      END
+    ELSE IF MSGCODE = 4 THEN  ! Record expense
+      BEGIN
+        STRUCT REQ^EXP (LEGAL^EXPENSE);
+        REQ^EXP ':=' REQ^BUF FOR $LEN(LEGAL^EXPENSE);
+        CALL READ^CASE^BY^ID(REQ^EXP.CASE^ID, REQ^CASE);
+        INT BUDGET^STAT := RECORD^EXPENSE(REQ^CASE, REQ^EXP);
+        CALL REWRITE^CASE(REQ^CASE);
+        RESP^BUF.$INT(0) := BUDGET^STAT;
+        RESP^LEN := 2;
+      END
+    ELSE IF MSGCODE = 5 THEN  ! Settlement evaluation
+      BEGIN
+        W^SETTLE ':=' REQ^BUF FOR $LEN(SETTLE^EVAL);
+        CALL READ^CASE^BY^ID(W^SETTLE.CASE^ID, REQ^CASE);
+        CALL EVALUATE^SETTLEMENT(REQ^CASE, W^SETTLE);
+        RESP^BUF ':=' W^SETTLE FOR $LEN(SETTLE^EVAL);
+        RESP^LEN := $LEN(SETTLE^EVAL);
+      END
+    ELSE IF MSGCODE = 6 THEN  ! Schedule hearing
+      BEGIN
+        REQ^CASE ':=' REQ^BUF FOR $LEN(LEGAL^CASE);
+        CALL SCHEDULE^HEARING(REQ^CASE,
+          REQ^BUF[$LEN(LEGAL^CASE)],
+          REQ^BUF[$LEN(LEGAL^CASE) + 6],
+          REQ^BUF[$LEN(LEGAL^CASE) + 26]);
+        CALL REWRITE^CASE(REQ^CASE);
+        RESP^BUF ':=' REQ^CASE FOR $LEN(LEGAL^CASE);
+        RESP^LEN := $LEN(LEGAL^CASE);
+      END
+    ELSE IF MSGCODE = 7 THEN  ! File appeal
+      BEGIN
+        REQ^CASE ':=' REQ^BUF FOR $LEN(LEGAL^CASE);
+        INT FILED^BY := REQ^BUF.$INT($LEN(LEGAL^CASE));
+        INT RESULT := FILE^APPEAL(REQ^CASE, FILED^BY,
+          REQ^BUF[$LEN(LEGAL^CASE) + 2]);
+        CALL REWRITE^CASE(REQ^CASE);
+        RESP^BUF ':=' REQ^CASE FOR $LEN(LEGAL^CASE);
+        RESP^LEN := $LEN(LEGAL^CASE);
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC SERVER^MAIN -- Pathway server main loop
+!---------------------------------------------------------------
+PROC SERVER^MAIN MAIN;
+  BEGIN
+    INT RECV^FNUM;
+    STRING REQ^BUF[0:4095];
+    STRING RESP^BUF[0:4095];
+    INT RESP^LEN;
+    INT MSGCODE;
+
+    CALL OPEN^FILES;
+    CALL WRITE^AUDIT("SERVER STARTED ", "            ", " ");
+
+    CALL OPEN(RECV^FNUM, "$RECEIVE", 1);
+    IF <> THEN CALL ABEND^PROCESS(99);
+
+    WHILE 1 DO
+      BEGIN
+        CALL READ(RECV^FNUM, REQ^BUF, 4096);
+        IF < THEN CALL READUPDATE(RECV^FNUM, REQ^BUF, 4096);
+
+        MSGCODE := $MSGCODE;
+
+        IF MSGCODE = -30 THEN
+          CALL REPLY(, , 0)
+        ELSE IF MSGCODE = -33 THEN
+          CALL REPLY(, , 0)
+        ELSE IF MSGCODE >= 1 AND MSGCODE <= 10 THEN
+          BEGIN
+            CALL PROCESS^REQUEST(MSGCODE, REQ^BUF, RESP^BUF, RESP^LEN);
+            CALL REPLY(RESP^BUF, RESP^LEN);
+          END
+        ELSE
+          CALL REPLY(, , 2);
+      END;
+  END;

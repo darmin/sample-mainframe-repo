@@ -1,0 +1,535 @@
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?LIST
+!*********************************************************************
+!*  FNOLPROC -- First Notice of Loss Processing Server
+!*  Workers' Compensation TPA System
+!*  HPE NonStop Guardian Environment
+!*
+!*  Purpose: Receives FNOL reports via PATHSEND from terminal
+!*           servers and batch feeds, validates employer notification,
+!*           classifies injury type, auto-assigns adjuster, creates
+!*           diary entries, detects duplicates, and triggers
+!*           initial reserve setup.
+!*
+!*  Process:  Pathway serverclass FNOL-SVR, MAXSERVERS 4
+!*  Files:    FNOLFILE (key-seq), CLAIMIDX (alt-key), ADJQUEUE,
+!*            DIARYFIL, EMPFILE
+!*********************************************************************
+
+LITERAL
+  MAX^MSG^LEN        = 4096,
+  MAX^REPLY^LEN      = 2048,
+  FNOL^FILE^NUM      = 0,
+  CLAIM^IDX^NUM      = 1,
+  ADJ^QUEUE^NUM      = 2,
+  DIARY^FILE^NUM     = 3,
+  EMP^FILE^NUM       = 4,
+  !-- Injury classification codes
+  INJ^MEDICAL^ONLY   = 1,
+  INJ^LOST^TIME      = 2,
+  INJ^PERMANENT      = 3,
+  INJ^FATALITY       = 4,
+  INJ^OCCUPATIONAL   = 5,
+  !-- FNOL status codes
+  STAT^RECEIVED      = 0,
+  STAT^VALIDATED     = 1,
+  STAT^ASSIGNED      = 2,
+  STAT^DUPLICATE     = 3,
+  STAT^REJECTED      = 4,
+  !-- Diary priority
+  PRI^URGENT         = 1,
+  PRI^HIGH           = 2,
+  PRI^NORMAL         = 3,
+  PRI^LOW            = 4,
+  !-- Error codes
+  ERR^NONE           = 0,
+  ERR^DUP^CLAIM      = 100,
+  ERR^INV^EMPLOYER   = 101,
+  ERR^INV^EMPLOYEE   = 102,
+  ERR^INV^INJURY     = 103,
+  ERR^NO^ADJUSTER    = 104,
+  ERR^FILE^ERROR     = 200,
+  ERR^TMF^ERROR      = 201,
+  !-- Reserve trigger amounts by injury class
+  RSV^MED^ONLY       = 500000,    ! $5,000.00 in cents
+  RSV^LOST^TIME      = 2500000,   ! $25,000.00
+  RSV^PERMANENT      = 10000000,  ! $100,000.00
+  RSV^FATALITY       = 25000000,  ! $250,000.00
+  RSV^OCCUPATIONAL   = 5000000;   ! $50,000.00
+
+!-- FNOL request message structure
+STRUCT FNOL^REQUEST;
+  BEGIN
+    INT(32)  MSG^TYPE;
+    INT(32)  MSG^LENGTH;
+    STRING   EMPLOYER^FEIN[0:8];
+    STRING   POLICY^NUMBER[0:14];
+    STRING   EMPLOYER^NAME[0:59];
+    STRING   EMPLOYEE^SSN[0:8];
+    STRING   EMPLOYEE^LAST[0:29];
+    STRING   EMPLOYEE^FIRST[0:19];
+    STRING   EMPLOYEE^DOB[0:7];         ! YYYYMMDD
+    STRING   DATE^OF^INJURY[0:7];       ! YYYYMMDD
+    STRING   DATE^REPORTED[0:7];        ! YYYYMMDD
+    STRING   INJURY^STATE[0:1];         ! 2-char state code
+    INT(32)  BODY^PART^CODE;            ! NCCI body part
+    INT(32)  NATURE^CODE;               ! NCCI nature of injury
+    INT(32)  CAUSE^CODE;                ! NCCI cause of injury
+    STRING   INJURY^DESC[0:199];
+    INT(32)  LOST^TIME^DAYS;
+    INT(32)  HOSPITALIZED^FLAG;
+    INT(32)  FATALITY^FLAG;
+    STRING   TREATING^PHYSICIAN[0:49];
+    STRING   WITNESS^NAME[0:49];
+    STRING   EMPLOYER^CONTACT[0:49];
+    STRING   EMPLOYER^PHONE[0:11];
+    INT(32)  OCCUPATION^CODE;
+    STRING   HIRE^DATE[0:7];
+    INT(32)  AVG^WEEKLY^WAGE;           ! in cents
+  END;
+
+!-- FNOL reply message
+STRUCT FNOL^REPLY;
+  BEGIN
+    INT(32)  REPLY^CODE;
+    INT(32)  ERROR^CODE;
+    STRING   CLAIM^NUMBER[0:14];
+    STRING   ASSIGNED^ADJUSTER[0:7];
+    INT(32)  INJURY^CLASS;
+    STRING   ERROR^MESSAGE[0:79];
+  END;
+
+!-- Claim index record for duplicate detection
+STRUCT CLAIM^INDEX^REC;
+  BEGIN
+    STRING   EMPLOYEE^SSN[0:8];
+    STRING   DATE^OF^INJURY[0:7];
+    STRING   EMPLOYER^FEIN[0:8];
+    INT(32)  BODY^PART^CODE;
+    STRING   CLAIM^NUMBER[0:14];
+    INT(32)  CLAIM^STATUS;
+    STRING   DATE^CREATED[0:7];
+  END;
+
+!-- Adjuster queue record
+STRUCT ADJUSTER^REC;
+  BEGIN
+    STRING   ADJUSTER^ID[0:7];
+    STRING   ADJUSTER^NAME[0:39];
+    STRING   JURISDICTION[0:1];
+    INT(32)  TEAM^CODE;            ! 1=med-only, 2=lost-time, 3=lit
+    INT(32)  OPEN^CLAIMS;
+    INT(32)  MAX^CLAIMS;
+    INT(32)  ACTIVE^FLAG;
+  END;
+
+!-- Diary entry record
+STRUCT DIARY^REC;
+  BEGIN
+    STRING   CLAIM^NUMBER[0:14];
+    STRING   DIARY^DATE[0:7];
+    STRING   DUE^DATE[0:7];
+    INT(32)  PRIORITY;
+    INT(32)  DIARY^TYPE;           ! 1=follow-up, 2=review, 3=statutory
+    STRING   ADJUSTER^ID[0:7];
+    STRING   DESCRIPTION[0:119];
+    INT(32)  COMPLETED^FLAG;
+  END;
+
+!-- File numbers
+INT  FNOL^FNUM,
+     CLMIDX^FNUM,
+     ADJQ^FNUM,
+     DIARY^FNUM,
+     EMP^FNUM;
+
+!-- Working variables
+INT(32) RESULT;
+INT     ERROR;
+INT(32) COUNT^READ;
+STRING  WORK^CLAIM^NUM[0:14];
+
+!*********************************************************************
+!*  OPEN^FILES -- Open all Enscribe files
+!*********************************************************************
+PROC OPEN^FILES;
+  BEGIN
+    INT  FERR;
+
+    CALL FILE_OPEN_("$FNOL", 5, FNOL^FNUM, , , 1);   ! read-write, excl
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$CLMIDX", 7, CLMIDX^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$ADJQ", 6, ADJQ^FNUM, , , 0);   ! read-only
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$DIARY", 7, DIARY^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$EMPFL", 5, EMP^FNUM, , , 0);
+    IF <> THEN CALL PROCESS_STOP_;
+  END;
+
+!*********************************************************************
+!*  CHECK^DUPLICATE -- Detect duplicate FNOL by SSN+DOI+FEIN
+!*  Returns: claim number if dup found, spaces if not
+!*********************************************************************
+PROC CHECK^DUPLICATE(REQ, DUP^CLAIMNO);
+  STRING .EXT REQ(FNOL^REQUEST);
+  STRING .DUP^CLAIMNO[0:14];
+  BEGIN
+    STRUCT .SRCH^REC(CLAIM^INDEX^REC);
+    INT    BYTES^READ;
+    INT    FSTATUS;
+
+    DUP^CLAIMNO ':=' "               ";  ! 15 spaces
+
+    !-- Build partial key: SSN + DOI + FEIN
+    SRCH^REC.EMPLOYEE^SSN ':=' REQ.EMPLOYEE^SSN FOR 9;
+    SRCH^REC.DATE^OF^INJURY ':=' REQ.DATE^OF^INJURY FOR 8;
+    SRCH^REC.EMPLOYER^FEIN ':=' REQ.EMPLOYER^FEIN FOR 9;
+
+    CALL KEYPOSITION(CLMIDX^FNUM, SRCH^REC, 26, 0, 2); ! approx
+    IF <> THEN RETURN;
+
+    CALL READX(CLMIDX^FNUM, SRCH^REC, $LEN(CLAIM^INDEX^REC),
+               BYTES^READ);
+    IF <> THEN RETURN;
+
+    !-- Compare SSN, DOI, and FEIN for exact match
+    IF SRCH^REC.EMPLOYEE^SSN = REQ.EMPLOYEE^SSN FOR 9 AND
+       SRCH^REC.DATE^OF^INJURY = REQ.DATE^OF^INJURY FOR 8 AND
+       SRCH^REC.EMPLOYER^FEIN = REQ.EMPLOYER^FEIN FOR 9 THEN
+      BEGIN
+        DUP^CLAIMNO ':=' SRCH^REC.CLAIM^NUMBER FOR 15;
+      END;
+  END;
+
+!*********************************************************************
+!*  CLASSIFY^INJURY -- Determine injury classification
+!*  Uses fatality flag, lost time days, hospitalization,
+!*  nature code, and body part to classify.
+!*********************************************************************
+INT(32) PROC CLASSIFY^INJURY(REQ);
+  STRING .EXT REQ(FNOL^REQUEST);
+  BEGIN
+    INT(32) CLASSIFICATION;
+
+    IF REQ.FATALITY^FLAG <> 0 THEN
+      CLASSIFICATION := INJ^FATALITY
+
+    !-- Occupational disease: nature codes 60-89 per NCCI
+    ELSE IF REQ.NATURE^CODE >= 60 AND REQ.NATURE^CODE <= 89 THEN
+      CLASSIFICATION := INJ^OCCUPATIONAL
+
+    !-- Permanent disability indicators
+    ELSE IF REQ.NATURE^CODE >= 50 AND REQ.NATURE^CODE <= 59 THEN
+      CLASSIFICATION := INJ^PERMANENT
+
+    !-- Lost time: more than 7 days or hospitalized
+    ELSE IF REQ.LOST^TIME^DAYS > 7 OR REQ.HOSPITALIZED^FLAG <> 0 THEN
+      CLASSIFICATION := INJ^LOST^TIME
+
+    ELSE
+      CLASSIFICATION := INJ^MEDICAL^ONLY;
+
+    RETURN CLASSIFICATION;
+  END;
+
+!*********************************************************************
+!*  FIND^ADJUSTER -- Auto-assign adjuster based on jurisdiction,
+!*  injury class, and workload. Returns adjuster ID.
+!*********************************************************************
+PROC FIND^ADJUSTER(JURISDICTION, INJ^CLASS, ADJ^ID);
+  STRING .JURISDICTION[0:1];
+  INT(32) INJ^CLASS;
+  STRING .ADJ^ID[0:7];
+  BEGIN
+    STRUCT .ADJ^BUF(ADJUSTER^REC);
+    INT    BYTES^READ;
+    INT(32) BEST^LOAD;
+    STRING  BEST^ADJ[0:7];
+    INT(32) TARGET^TEAM;
+    INT     FOUND;
+
+    !-- Determine team based on injury class
+    IF INJ^CLASS = INJ^MEDICAL^ONLY THEN
+      TARGET^TEAM := 1                    ! medical-only team
+    ELSE IF INJ^CLASS = INJ^FATALITY OR INJ^CLASS = INJ^PERMANENT THEN
+      TARGET^TEAM := 3                    ! litigation/complex team
+    ELSE
+      TARGET^TEAM := 2;                   ! lost-time team
+
+    BEST^LOAD := 9999;
+    FOUND := 0;
+    ADJ^ID ':=' "        ";              ! 8 spaces
+
+    !-- Sequential scan of adjuster queue for jurisdiction + team
+    CALL KEYPOSITION(ADJQ^FNUM, , 0, 0, 0);  ! position to beginning
+    IF <> THEN RETURN;
+
+    WHILE 1 DO
+      BEGIN
+        CALL READX(ADJQ^FNUM, ADJ^BUF, $LEN(ADJUSTER^REC),
+                    BYTES^READ);
+        IF <> THEN
+          BEGIN
+            IF FOUND THEN
+              ADJ^ID ':=' BEST^ADJ FOR 8;
+            RETURN;
+          END;
+
+        !-- Match jurisdiction, team, active, and under max load
+        IF ADJ^BUF.JURISDICTION = JURISDICTION FOR 2 AND
+           ADJ^BUF.TEAM^CODE = TARGET^TEAM AND
+           ADJ^BUF.ACTIVE^FLAG <> 0 AND
+           ADJ^BUF.OPEN^CLAIMS < ADJ^BUF.MAX^CLAIMS THEN
+          BEGIN
+            IF ADJ^BUF.OPEN^CLAIMS < BEST^LOAD THEN
+              BEGIN
+                BEST^LOAD := ADJ^BUF.OPEN^CLAIMS;
+                BEST^ADJ ':=' ADJ^BUF.ADJUSTER^ID FOR 8;
+                FOUND := 1;
+              END;
+          END;
+      END;
+  END;
+
+!*********************************************************************
+!*  CREATE^DIARY -- Create a diary entry for the new claim
+!*********************************************************************
+PROC CREATE^DIARY(CLAIM^NO, ADJ^ID, DUE^DT, PRI, DTYPE, DESC);
+  STRING .CLAIM^NO[0:14];
+  STRING .ADJ^ID[0:7];
+  STRING .DUE^DT[0:7];
+  INT     PRI;
+  INT     DTYPE;
+  STRING .DESC[0:119];
+  BEGIN
+    STRUCT .DREC(DIARY^REC);
+    STRING  TODAY^BUF[0:7];
+    INT(32) TSTAMP[0:2];
+
+    CALL JULIANTIMESTAMP(TSTAMP);
+
+    DREC.CLAIM^NUMBER ':=' CLAIM^NO FOR 15;
+    DREC.DUE^DATE ':=' DUE^DT FOR 8;
+    DREC.PRIORITY := PRI;
+    DREC.DIARY^TYPE := DTYPE;
+    DREC.ADJUSTER^ID ':=' ADJ^ID FOR 8;
+    DREC.DESCRIPTION ':=' DESC FOR 120;
+    DREC.COMPLETED^FLAG := 0;
+
+    !-- Write diary record
+    CALL WRITEX(DIARY^FNUM, DREC, $LEN(DIARY^REC));
+    IF <> THEN
+      BEGIN
+        ! Log error but don't fail the FNOL
+      END;
+  END;
+
+!*********************************************************************
+!*  CREATE^INITIAL^DIARIES -- Set up standard diary entries
+!*  for a new claim based on injury classification.
+!*********************************************************************
+PROC CREATE^INITIAL^DIARIES(CLAIM^NO, ADJ^ID, INJ^CLASS, DOI);
+  STRING .CLAIM^NO[0:14];
+  STRING .ADJ^ID[0:7];
+  INT(32) INJ^CLASS;
+  STRING .DOI[0:7];
+  BEGIN
+    STRING DUE^30[0:7];
+    STRING DUE^60[0:7];
+    STRING DUE^90[0:7];
+    STRING DUE^3DAY[0:7];
+
+    !-- 3-day contact diary (all claims)
+    CALL CREATE^DIARY(CLAIM^NO, ADJ^ID, DUE^3DAY,
+         PRI^HIGH, 1, "Initial claimant contact - 3 business days    " &
+         "                                                            " &
+         "          ");
+
+    !-- 30-day review
+    CALL CREATE^DIARY(CLAIM^NO, ADJ^ID, DUE^30,
+         PRI^NORMAL, 2, "30-day claim review - verify treatment, RTW " &
+         "status, reserve adequacy                                    " &
+         "          ");
+
+    !-- Fatality and permanent get urgent supervisor review
+    IF INJ^CLASS = INJ^FATALITY OR INJ^CLASS = INJ^PERMANENT THEN
+      BEGIN
+        CALL CREATE^DIARY(CLAIM^NO, ADJ^ID, DUE^3DAY,
+             PRI^URGENT, 2, "SUPERVISOR REVIEW REQUIRED - High severity " &
+             "claim - fatality or permanent disability                  " &
+             "            ");
+      END;
+
+    !-- Lost-time claims: 60 and 90 day reviews
+    IF INJ^CLASS >= INJ^LOST^TIME THEN
+      BEGIN
+        CALL CREATE^DIARY(CLAIM^NO, ADJ^ID, DUE^60,
+             PRI^NORMAL, 2, "60-day claim review - compensability, IME " &
+             "need, settlement potential                                " &
+             "           ");
+
+        CALL CREATE^DIARY(CLAIM^NO, ADJ^ID, DUE^90,
+             PRI^NORMAL, 2, "90-day claim review - litigation risk, FCE" &
+             " referral, vocational rehab evaluation                    " &
+             "           ");
+      END;
+  END;
+
+!*********************************************************************
+!*  GET^INITIAL^RESERVE -- Determine initial reserve amount
+!*  based on injury classification and jurisdiction factors.
+!*********************************************************************
+INT(32) PROC GET^INITIAL^RESERVE(INJ^CLASS, STATE);
+  INT(32) INJ^CLASS;
+  STRING .STATE[0:1];
+  BEGIN
+    INT(32) BASE^RESERVE;
+
+    CASE INJ^CLASS OF
+      BEGIN
+        INJ^MEDICAL^ONLY  -> BASE^RESERVE := RSV^MED^ONLY;
+        INJ^LOST^TIME     -> BASE^RESERVE := RSV^LOST^TIME;
+        INJ^PERMANENT     -> BASE^RESERVE := RSV^PERMANENT;
+        INJ^FATALITY      -> BASE^RESERVE := RSV^FATALITY;
+        INJ^OCCUPATIONAL  -> BASE^RESERVE := RSV^OCCUPATIONAL;
+        OTHERWISE          -> BASE^RESERVE := RSV^MED^ONLY;
+      END;
+
+    !-- State-specific adjustments (high-cost jurisdictions)
+    IF STATE = "CA" OR STATE = "NY" OR STATE = "FL" THEN
+      BASE^RESERVE := BASE^RESERVE + (BASE^RESERVE / 4);  ! +25%
+
+    IF STATE = "IL" OR STATE = "PA" OR STATE = "NJ" THEN
+      BASE^RESERVE := BASE^RESERVE + (BASE^RESERVE / 5);  ! +20%
+
+    RETURN BASE^RESERVE;
+  END;
+
+!*********************************************************************
+!*  PROCESS^FNOL -- Main FNOL processing logic
+!*********************************************************************
+PROC PROCESS^FNOL(REQ^BUF, REQ^LEN, REPLY^BUF, REPLY^LEN);
+  STRING .REQ^BUF(FNOL^REQUEST);
+  INT     REQ^LEN;
+  STRING .REPLY^BUF(FNOL^REPLY);
+  INT    .REPLY^LEN;
+  BEGIN
+    STRING   DUP^CLAIM[0:14];
+    INT(32)  INJ^CLASS;
+    STRING   ADJ^ID[0:7];
+    INT(32)  RESERVE^AMT;
+    INT      STATUS;
+
+    !-- Initialize reply
+    REPLY^BUF.REPLY^CODE := 0;
+    REPLY^BUF.ERROR^CODE := ERR^NONE;
+    REPLY^BUF.CLAIM^NUMBER ':=' "               ";
+    REPLY^BUF.ASSIGNED^ADJUSTER ':=' "        ";
+    REPLY^BUF.INJURY^CLASS := 0;
+    REPLY^BUF.ERROR^MESSAGE ':=' [40 * ["  "]];
+
+    !-- Step 1: Duplicate detection
+    CALL CHECK^DUPLICATE(REQ^BUF, DUP^CLAIM);
+    IF DUP^CLAIM <> "               " THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^DUP^CLAIM;
+        REPLY^BUF.CLAIM^NUMBER ':=' DUP^CLAIM FOR 15;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "DUPLICATE: Existing claim found for SSN/DOI/Employer combination " &
+          "               ";
+        REPLY^LEN := $LEN(FNOL^REPLY);
+        RETURN;
+      END;
+
+    !-- Step 2: Classify injury
+    INJ^CLASS := CLASSIFY^INJURY(REQ^BUF);
+    REPLY^BUF.INJURY^CLASS := INJ^CLASS;
+
+    !-- Step 3: Find adjuster
+    CALL FIND^ADJUSTER(REQ^BUF.INJURY^STATE, INJ^CLASS, ADJ^ID);
+    IF ADJ^ID = "        " THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^NO^ADJUSTER;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "No available adjuster for jurisdiction/injury type. Manual assign " &
+          "required.      ";
+        REPLY^LEN := $LEN(FNOL^REPLY);
+        RETURN;
+      END;
+    REPLY^BUF.ASSIGNED^ADJUSTER ':=' ADJ^ID FOR 8;
+
+    !-- Step 4: Trigger claim setup via PATHSEND to CLMSETUP server
+    ! (PATHSEND call to $CLMS serverclass omitted for brevity;
+    !  claim number returned in WORK^CLAIM^NUM)
+
+    REPLY^BUF.CLAIM^NUMBER ':=' WORK^CLAIM^NUM FOR 15;
+
+    !-- Step 5: Create initial diary entries
+    CALL CREATE^INITIAL^DIARIES(WORK^CLAIM^NUM, ADJ^ID,
+         INJ^CLASS, REQ^BUF.DATE^OF^INJURY);
+
+    !-- Step 6: Determine initial reserve
+    RESERVE^AMT := GET^INITIAL^RESERVE(INJ^CLASS,
+                   REQ^BUF.INJURY^STATE);
+
+    !-- Step 7: Write FNOL record to file
+    CALL WRITEX(FNOL^FNUM, REQ^BUF, REQ^LEN);
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^FILE^ERROR;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "File system error writing FNOL record. Contact system support.    " &
+          "               ";
+        REPLY^LEN := $LEN(FNOL^REPLY);
+        RETURN;
+      END;
+
+    !-- Success
+    REPLY^BUF.REPLY^CODE := 0;
+    REPLY^LEN := $LEN(FNOL^REPLY);
+  END;
+
+!*********************************************************************
+!*  MAIN -- Pathway server main loop (SERVERCLASS_SEND_)
+!*********************************************************************
+PROC MAIN;
+  BEGIN
+    STRING  REQ^BUFFER[0:MAX^MSG^LEN - 1];
+    STRING  REPLY^BUFFER[0:MAX^REPLY^LEN - 1];
+    INT     REQ^LENGTH;
+    INT     REPLY^LENGTH;
+    INT     OPEN^FNUM;
+    INT     FSTATUS;
+
+    CALL OPEN^FILES;
+
+    !-- Pathway server loop
+    WHILE 1 DO
+      BEGIN
+        CALL SERVERCLASS_SEND_INFO_(, , OPEN^FNUM);
+
+        CALL READUPDATEX(OPEN^FNUM, REQ^BUFFER, MAX^MSG^LEN,
+                         REQ^LENGTH);
+        IF <> THEN
+          BEGIN
+            CALL SERVERCLASS_SEND_INFO_(, , OPEN^FNUM);
+          END
+        ELSE
+          BEGIN
+            REPLY^LENGTH := 0;
+            CALL PROCESS^FNOL(REQ^BUFFER, REQ^LENGTH,
+                              REPLY^BUFFER, REPLY^LENGTH);
+            CALL REPLYX(REPLY^BUFFER, REPLY^LENGTH);
+          END;
+      END;
+  END;

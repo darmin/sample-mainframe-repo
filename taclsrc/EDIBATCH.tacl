@@ -1,0 +1,357 @@
+?SECTION EDIBATCH ROUTINE
+!==================================================================!
+! SCRIPT:     EDIBATCH                                             !
+! AUTHOR:     MAINFRAMEMOD TPA SYSTEMS                             !
+! DATE:       2024-02-15                                           !
+! PURPOSE:    EDI BATCH PROCESSING SCRIPT                          !
+!             INBOUND 837, OUTBOUND 835, STATE FILINGS,            !
+!             ACKNOWLEDGMENTS, ERROR HANDLING, RETRY LOGIC          !
+! PLATFORM:   HPE NONSTOP / GUARDIAN / TACL                        !
+!==================================================================!
+! CHANGE LOG:                                                      !
+! 2024-02-15  INITIAL DEVELOPMENT                                  !
+! 2024-05-01  ADDED RETRY LOGIC FOR FAILED TRANSMISSIONS           !
+! 2024-08-20  ADDED STATE EDI FILING SUPPORT                       !
+! 2024-11-05  ENHANCED TRANSMISSION LOG MANAGEMENT                 !
+!==================================================================!
+
+! Configuration
+#SET EDI^HOME $DATA1.EDIFILES
+#SET EDI^INBOUND [EDI^HOME].INBOUND
+#SET EDI^OUTBOUND [EDI^HOME].OUTBOUND
+#SET EDI^ARCHIVE [EDI^HOME].ARCHIVE
+#SET EDI^ERROR [EDI^HOME].ERRORS
+#SET EDI^LOG $DATA1.WCFILES.EDILOG
+#SET EDI^TRANS^LOG $DATA1.WCFILES.EDITRANS
+
+! Processing control
+#SET EDI^STATUS 0
+#SET EDI^STEP 0
+#SET EDI^ERRORS 0
+#SET MAX^RETRIES 3
+#SET RETRY^DELAY^SEC 60
+#SET CLEARINGHOUSE^HOST EDICLEAR.TPACOMPANY.COM
+#SET STATE^FILING^HOST STATEFILING.IAIABC.COM
+
+! File counters
+#SET FILES^837^RECEIVED 0
+#SET FILES^837^PROCESSED 0
+#SET FILES^837^FAILED 0
+#SET FILES^835^GENERATED 0
+#SET FILES^835^TRANSMITTED 0
+#SET FILES^STATE^FILED 0
+#SET FILES^ACK^PROCESSED 0
+
+!------------------------------------------------------------------!
+! MAIN EDI BATCH CONTROL                                           !
+!------------------------------------------------------------------!
+#PUSH ERRTEXT
+
+SINK [#LOG^FILE OPEN [EDI^LOG]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: EDI BATCH PROCESSING STARTED"]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: RUN TIME = " [#TIMESTAMP]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "=================================================="]
+
+!------------------------------------------------------------------!
+! PHASE 1: INBOUND EDI FILE PICKUP FROM CLEARINGHOUSE              !
+!------------------------------------------------------------------!
+#SET EDI^STEP 1
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 1: INBOUND FILE PICKUP - STARTED"]
+
+! Connect to clearinghouse and download pending files
+#SET PICKUP^STATUS 0
+#SET RETRY^COUNT 0
+
+PICKUP^RETRY:
+[#IF [RETRY^COUNT] >= [MAX^RETRIES] |THEN|
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 1: *** FAILED *** MAX RETRIES EXCEEDED FOR PICKUP"]
+  #SET EDI^ERRORS [EDI^ERRORS] + 1
+  #GOTO PHASE2
+]
+
+! FTP GET from clearinghouse incoming directory
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 1: CONNECTING TO " [CLEARINGHOUSE^HOST] " (ATTEMPT " -
+  [RETRY^COUNT] + 1 ")"]
+
+#SET FTP^STATUS [#NEWPROCESS $SYSTEM.SYSTEM.FTP /NAME $EFTP/ -
+  IN  [EDI^HOME].FTPCMDS.PICKUP, -
+  OUT [EDI^HOME].FTPLOGS.PICKUP]
+#SET FTP^CC [#PROCESSWAIT $EFTP]
+
+[#IF [FTP^CC] <> 0 |THEN|
+  #SET RETRY^COUNT [RETRY^COUNT] + 1
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 1: FTP FAILED RC=" [FTP^CC] " - RETRYING IN " -
+    [RETRY^DELAY^SEC] " SECONDS"]
+  DELAY [RETRY^DELAY^SEC]
+  #GOTO PICKUP^RETRY
+|ELSE|
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 1: FILE PICKUP SUCCESSFUL"]
+]
+
+! Count received files
+FILEINFO [EDI^INBOUND].E837*, DETAIL
+#SET FILES^837^RECEIVED [#COMPLETIONCODE]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 1: FILES RECEIVED = " [FILES^837^RECEIVED]]
+
+!------------------------------------------------------------------!
+! PHASE 2: PROCESS INBOUND 837 (MEDICAL CLAIM) FILES               !
+!------------------------------------------------------------------!
+PHASE2:
+#SET EDI^STEP 2
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 2: 837 PROCESSING - STARTED"]
+
+! Process each inbound 837 file
+#SET FILE^IDX 0
+EVERY [EDI^INBOUND].E837*  FILE^NAME
+  #SET FILE^IDX [FILE^IDX] + 1
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 2: PROCESSING FILE " [FILE^IDX] " - " [FILE^NAME]]
+
+  #SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCEDI837 /NAME $E837/ -
+    IN  [FILE^NAME], -
+    OUT [EDI^OUTBOUND].ACK[FILE^IDX]]
+  #SET STEP^CC [#PROCESSWAIT $E837]
+
+  [#IF [STEP^CC] = 0 |THEN|
+    #SET FILES^837^PROCESSED [FILES^837^PROCESSED] + 1
+    ! Archive successfully processed file
+    COPY [FILE^NAME] [EDI^ARCHIVE].[FILE^NAME]
+    PURGE [FILE^NAME]
+    SINK [#LOG^FILE WRITE [EDI^LOG] -
+      "PHASE 2: FILE " [FILE^NAME] " PROCESSED AND ARCHIVED"]
+    ! Log transmission record
+    SINK [#LOG^FILE WRITE [EDI^TRANS^LOG] -
+      "837|IN|" [FILE^NAME] "|" [#TIMESTAMP] "|OK|PROCESSED"]
+  |ELSE|
+    #SET FILES^837^FAILED [FILES^837^FAILED] + 1
+    ! Move failed file to error directory
+    COPY [FILE^NAME] [EDI^ERROR].[FILE^NAME]
+    SINK [#LOG^FILE WRITE [EDI^LOG] -
+      "PHASE 2: *** ERROR *** FILE " [FILE^NAME] " FAILED RC=" [STEP^CC]]
+    SINK [#LOG^FILE WRITE [EDI^TRANS^LOG] -
+      "837|IN|" [FILE^NAME] "|" [#TIMESTAMP] "|FAIL|RC=" [STEP^CC]]
+  ]
+END-EVERY
+
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 2: 837 PROCESSING COMPLETE - " [FILES^837^PROCESSED] -
+  " PROCESSED, " [FILES^837^FAILED] " FAILED"]
+
+!------------------------------------------------------------------!
+! PHASE 3: GENERATE OUTBOUND 835 (REMITTANCE ADVICE) FILES         !
+!------------------------------------------------------------------!
+#SET EDI^STEP 3
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 3: 835 GENERATION - STARTED"]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCEDI835 /NAME $E835/ -
+  IN  [DATA^VOL].WCFILES.PAYIN, -
+  OUT [EDI^OUTBOUND].E835OUT]
+#SET STEP^CC [#PROCESSWAIT $E835]
+
+[#IF [STEP^CC] = 0 |THEN|
+  #SET FILES^835^GENERATED [FILES^835^GENERATED] + 1
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 3: 835 FILE GENERATED SUCCESSFULLY"]
+  SINK [#LOG^FILE WRITE [EDI^TRANS^LOG] -
+    "835|OUT|E835OUT|" [#TIMESTAMP] "|OK|GENERATED"]
+|ELSE|
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 3: *** ERROR *** 835 GENERATION FAILED RC=" [STEP^CC]]
+  #SET EDI^ERRORS [EDI^ERRORS] + 1
+]
+
+!------------------------------------------------------------------!
+! PHASE 4: TRANSMIT 835 FILES TO CLEARINGHOUSE                     !
+!------------------------------------------------------------------!
+#SET EDI^STEP 4
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 4: 835 TRANSMISSION - STARTED"]
+
+#SET RETRY^COUNT 0
+TRANSMIT^835^RETRY:
+[#IF [RETRY^COUNT] >= [MAX^RETRIES] |THEN|
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 4: *** FAILED *** MAX RETRIES EXCEEDED FOR 835 TRANSMISSION"]
+  #SET EDI^ERRORS [EDI^ERRORS] + 1
+  #GOTO PHASE5
+]
+
+#SET FTP^STATUS [#NEWPROCESS $SYSTEM.SYSTEM.FTP /NAME $EFTP/ -
+  IN  [EDI^HOME].FTPCMDS.SEND835, -
+  OUT [EDI^HOME].FTPLOGS.SEND835]
+#SET FTP^CC [#PROCESSWAIT $EFTP]
+
+[#IF [FTP^CC] <> 0 |THEN|
+  #SET RETRY^COUNT [RETRY^COUNT] + 1
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 4: TRANSMISSION FAILED - RETRY " [RETRY^COUNT] "/" [MAX^RETRIES]]
+  DELAY [RETRY^DELAY^SEC]
+  #GOTO TRANSMIT^835^RETRY
+|ELSE|
+  #SET FILES^835^TRANSMITTED [FILES^835^TRANSMITTED] + 1
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 4: 835 TRANSMITTED SUCCESSFULLY"]
+  SINK [#LOG^FILE WRITE [EDI^TRANS^LOG] -
+    "835|OUT|E835OUT|" [#TIMESTAMP] "|OK|TRANSMITTED"]
+  ! Archive transmitted file
+  COPY [EDI^OUTBOUND].E835OUT [EDI^ARCHIVE].E835OUT[#JULIANTIMESTAMP]
+]
+
+!------------------------------------------------------------------!
+! PHASE 5: STATE EDI FILING (FROI/SROI)                             !
+!------------------------------------------------------------------!
+PHASE5:
+#SET EDI^STEP 5
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 5: STATE EDI FILING - STARTED"]
+
+! Check if state filings are pending
+[#IF [#FILEEXISTS [DATA^VOL].WCFILES.FILOUT] |THEN|
+  ! Transmit to state filing clearinghouse
+  #SET RETRY^COUNT 0
+  STATE^RETRY:
+  [#IF [RETRY^COUNT] >= [MAX^RETRIES] |THEN|
+    SINK [#LOG^FILE WRITE [EDI^LOG] -
+      "PHASE 5: *** FAILED *** STATE FILING TRANSMISSION FAILED"]
+    #SET EDI^ERRORS [EDI^ERRORS] + 1
+    #GOTO PHASE6
+  ]
+
+  #SET FTP^STATUS [#NEWPROCESS $SYSTEM.SYSTEM.FTP /NAME $SFTP/ -
+    IN  [EDI^HOME].FTPCMDS.STATEFIL, -
+    OUT [EDI^HOME].FTPLOGS.STATEFIL]
+  #SET FTP^CC [#PROCESSWAIT $SFTP]
+
+  [#IF [FTP^CC] <> 0 |THEN|
+    #SET RETRY^COUNT [RETRY^COUNT] + 1
+    SINK [#LOG^FILE WRITE [EDI^LOG] -
+      "PHASE 5: STATE FILING FAILED - RETRY " [RETRY^COUNT]]
+    DELAY [RETRY^DELAY^SEC]
+    #GOTO STATE^RETRY
+  |ELSE|
+    #SET FILES^STATE^FILED [FILES^STATE^FILED] + 1
+    SINK [#LOG^FILE WRITE [EDI^LOG] -
+      "PHASE 5: STATE FILINGS TRANSMITTED"]
+    SINK [#LOG^FILE WRITE [EDI^TRANS^LOG] -
+      "STATE|OUT|FILOUT|" [#TIMESTAMP] "|OK|TRANSMITTED"]
+  ]
+|ELSE|
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 5: NO STATE FILINGS PENDING"]
+]
+
+!------------------------------------------------------------------!
+! PHASE 6: PROCESS ACKNOWLEDGMENTS (TA1/999)                       !
+!------------------------------------------------------------------!
+PHASE6:
+#SET EDI^STEP 6
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 6: ACKNOWLEDGMENT PROCESSING - STARTED"]
+
+! Process each acknowledgment file
+EVERY [EDI^INBOUND].ACK*  ACK^FILE
+  #SET FILES^ACK^PROCESSED [FILES^ACK^PROCESSED] + 1
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 6: PROCESSING ACK FILE " [ACK^FILE]]
+
+  ! Parse acknowledgment and update claim status
+  #SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCACKPR /NAME $WACK/ -
+    IN  [ACK^FILE], -
+    OUT [EDI^HOME].ACKLOGS.ACKOUT]
+  #SET STEP^CC [#PROCESSWAIT $WACK]
+
+  [#IF [STEP^CC] = 0 |THEN|
+    COPY [ACK^FILE] [EDI^ARCHIVE].[ACK^FILE]
+    PURGE [ACK^FILE]
+    SINK [#LOG^FILE WRITE [EDI^TRANS^LOG] -
+      "ACK|IN|" [ACK^FILE] "|" [#TIMESTAMP] "|OK|PROCESSED"]
+  |ELSE|
+    SINK [#LOG^FILE WRITE [EDI^LOG] -
+      "PHASE 6: *** ERROR *** ACK FILE " [ACK^FILE] " FAILED"]
+    SINK [#LOG^FILE WRITE [EDI^TRANS^LOG] -
+      "ACK|IN|" [ACK^FILE] "|" [#TIMESTAMP] "|FAIL|RC=" [STEP^CC]]
+  ]
+END-EVERY
+
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 6: ACK PROCESSING COMPLETE - " [FILES^ACK^PROCESSED] " FILES"]
+
+!------------------------------------------------------------------!
+! PHASE 7: ERROR REPORT GENERATION                                 !
+!------------------------------------------------------------------!
+#SET EDI^STEP 7
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "PHASE 7: ERROR REPORT GENERATION - STARTED"]
+
+! Count files in error directory
+#SET ERR^FILE^COUNT 0
+EVERY [EDI^ERROR].*  ERR^FILE
+  #SET ERR^FILE^COUNT [ERR^FILE^COUNT] + 1
+END-EVERY
+
+[#IF [ERR^FILE^COUNT] > 0 |THEN|
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 7: " [ERR^FILE^COUNT] " FILES IN ERROR DIRECTORY"]
+  ! Generate error summary report
+  #SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCEDIERR /NAME $WERR/ -
+    IN  [EDI^ERROR].*, -
+    OUT [DATA^VOL].WCRPTS.EDIERRPT]
+  #SET STEP^CC [#PROCESSWAIT $WERR]
+|ELSE|
+  SINK [#LOG^FILE WRITE [EDI^LOG] -
+    "PHASE 7: NO ERROR FILES TO PROCESS"]
+]
+
+!------------------------------------------------------------------!
+! EDI BATCH COMPLETION                                             !
+!------------------------------------------------------------------!
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: EDI BATCH PROCESSING COMPLETED"]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: END TIME            = " [#TIMESTAMP]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: 837 FILES RECEIVED  = " [FILES^837^RECEIVED]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: 837 FILES PROCESSED = " [FILES^837^PROCESSED]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: 837 FILES FAILED    = " [FILES^837^FAILED]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: 835 FILES GENERATED = " [FILES^835^GENERATED]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: 835 FILES SENT      = " [FILES^835^TRANSMITTED]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: STATE FILES SENT    = " [FILES^STATE^FILED]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: ACK FILES PROCESSED = " [FILES^ACK^PROCESSED]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "EDIBATCH: TOTAL ERRORS        = " [EDI^ERRORS]]
+SINK [#LOG^FILE WRITE [EDI^LOG] -
+  "=================================================="]
+
+! Archive transmission log
+COPY [EDI^TRANS^LOG] [EDI^ARCHIVE].EDITRANS[#JULIANTIMESTAMP]
+
+SINK [#LOG^FILE CLOSE [EDI^LOG]]
+
+#POP ERRTEXT
+
+[#IF [EDI^ERRORS] > 0 |THEN|
+  #SET #COMPLETIONCODE 4
+|ELSE|
+  #SET #COMPLETIONCODE 0
+]

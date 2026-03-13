@@ -1,0 +1,500 @@
+?page "DIARYSCR - Diary Management Screen"
+?section IDENTIFICATION
+*
+*  SCREEN NAME:   DIARYSCR
+*  DESCRIPTION:   Adjuster Diary and Follow-up Management Screen
+*  SYSTEM:        Claims Management System (CMS)
+*  PATHWAY:       CLMSRV (Claims Server Class)
+*  AUTHOR:        TPA Systems Development
+*  DATE:          2024-05-20
+*  MODIFIED:      2025-03-01 - Added priority filtering, pagination
+*
+*  Diary management is critical for TPA compliance. State regulators
+*  audit diary follow-up timeliness. Overdue diaries generate
+*  automatic supervisor notifications. This screen supports both
+*  adjuster-level workload management and supervisor oversight.
+*
+*  Diary categories: CLM=Claim Review, MED=Medical Update,
+*  RSV=Reserve Review, LGL=Legal, RTW=Return to Work,
+*  SET=Settlement, SBR=Subrogation, DOC=Documentation,
+*  STA=Statutory Filing, COM=Compensability
+*
+?section DATA
+*
+SCREEN DIARYSCR.
+*
+    01 DRY-SCREEN-RECORD.
+*
+*--- Adjuster Workload Summary (Lines 1-2)
+*
+       05 DRY-ADJ-NAME            PIC X(25)
+           AT 1, 2
+           DISPLAY LENGTH 25
+           PROTECTED
+           VALUE SPACES.
+       05 DRY-ADJ-ID              PIC X(8)
+           AT 1, 30
+           DISPLAY LENGTH 8
+           PROTECTED
+           VALUE SPACES.
+       05 DRY-DATE-TODAY           PIC X(10)
+           AT 1, 68
+           DISPLAY LENGTH 10
+           PROTECTED.
+*
+       05 DRY-OPEN-COUNT-LABEL   PIC X(12)
+           AT 2, 2
+           DISPLAY LENGTH 12
+           PROTECTED
+           VALUE "Open Diaries".
+       05 DRY-OPEN-COUNT         PIC ZZ,ZZ9
+           AT 2, 16
+           DISPLAY LENGTH 6
+           PROTECTED.
+       05 DRY-OVERDUE-LABEL      PIC X(8)
+           AT 2, 26
+           DISPLAY LENGTH 8
+           PROTECTED
+           VALUE "Overdue:".
+       05 DRY-OVERDUE-COUNT      PIC ZZ,ZZ9
+           AT 2, 36
+           DISPLAY LENGTH 6
+           PROTECTED REVERSE.
+       05 DRY-DUE-TODAY-LABEL    PIC X(10)
+           AT 2, 46
+           DISPLAY LENGTH 10
+           PROTECTED
+           VALUE "Due Today:".
+       05 DRY-DUE-TODAY-COUNT    PIC ZZ,ZZ9
+           AT 2, 58
+           DISPLAY LENGTH 6
+           PROTECTED.
+       05 DRY-PAGE-INDICATOR     PIC X(10)
+           AT 2, 68
+           DISPLAY LENGTH 10
+           PROTECTED.
+*
+*--- Filter Controls (Line 3)
+*
+       05 DRY-FILTER-STATUS      PIC X(1)
+           AT 3, 10
+           DISPLAY LENGTH 1
+           UPSHIFT.
+       05 DRY-FILTER-STATUS-HELP PIC X(18)
+           AT 3, 13
+           DISPLAY LENGTH 18
+           PROTECTED
+           VALUE "(A=All O=Open Only)".
+       05 DRY-FILTER-DATE-FROM   PIC X(10)
+           AT 3, 38
+           DISPLAY LENGTH 10.
+       05 DRY-FILTER-DATE-TO     PIC X(10)
+           AT 3, 52
+           DISPLAY LENGTH 10.
+       05 DRY-FILTER-PRIORITY    PIC X(1)
+           AT 3, 72
+           DISPLAY LENGTH 1
+           UPSHIFT.
+       05 DRY-FILTER-PRI-HELP    PIC X(5)
+           AT 3, 75
+           DISPLAY LENGTH 5
+           PROTECTED
+           VALUE "(1-5)".
+*
+*--- Diary List Header (Line 5)
+*
+       05 DRY-LIST-HEADER        PIC X(78)
+           AT 5, 1
+           DISPLAY LENGTH 78
+           PROTECTED
+           VALUE " S Due Date  P Claim#       "
+           &     "Category Description"
+           &     "                    Status".
+*
+*--- Diary List Lines 1-12 (Lines 6-17)
+*
+       05 DRY-LINE OCCURS 12 TIMES.
+          10 DRY-SEL              PIC X(1)
+              DISPLAY LENGTH 1
+              UPSHIFT.
+          10 DRY-DUE-DATE         PIC X(10)
+              DISPLAY LENGTH 10
+              PROTECTED.
+          10 DRY-PRIORITY         PIC X(1)
+              DISPLAY LENGTH 1
+              PROTECTED.
+          10 DRY-CLAIM-NBR        PIC X(12)
+              DISPLAY LENGTH 12
+              PROTECTED.
+          10 DRY-CATEGORY         PIC X(3)
+              DISPLAY LENGTH 3
+              PROTECTED.
+          10 DRY-DESCRIPTION      PIC X(35)
+              DISPLAY LENGTH 35
+              PROTECTED.
+          10 DRY-STATUS           PIC X(8)
+              DISPLAY LENGTH 8
+              PROTECTED.
+*
+*   Position diary list lines on screen
+*
+       05 DRY-LINE-POS REDEFINES DRY-LINE.
+          10 DRY-LINE-1.
+             15 FILLER            OCCURS 12 TIMES.
+*
+*--- New Diary Entry Area (Lines 19-21)
+*
+       05 DRY-NEW-LABEL          PIC X(16)
+           AT 19, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "New Diary Entry:".
+       05 DRY-NEW-CLAIM          PIC X(12)
+           AT 19, 18
+           DISPLAY LENGTH 12
+           UPSHIFT.
+       05 DRY-NEW-DUE-DATE       PIC X(10)
+           AT 19, 33
+           DISPLAY LENGTH 10.
+       05 DRY-NEW-PRIORITY       PIC X(1)
+           AT 19, 47
+           DISPLAY LENGTH 1
+           UPSHIFT.
+       05 DRY-NEW-CATEGORY       PIC X(3)
+           AT 19, 52
+           DISPLAY LENGTH 3
+           UPSHIFT.
+       05 DRY-NEW-CAT-HELP       PIC X(20)
+           AT 19, 58
+           DISPLAY LENGTH 20
+           PROTECTED
+           VALUE "(CLM MED RSV LGL...)".
+*
+       05 DRY-NEW-DESC-L1        PIC X(60)
+           AT 20, 18
+           DISPLAY LENGTH 60.
+       05 DRY-NEW-DESC-L2        PIC X(60)
+           AT 21, 18
+           DISPLAY LENGTH 60.
+*
+*--- Message and Function Key Area (Lines 23-24)
+*
+       05 DRY-MESSAGE-AREA       PIC X(78)
+           AT 23, 1
+           DISPLAY LENGTH 78
+           PROTECTED.
+       05 DRY-FKEY-LINE          PIC X(78)
+           AT 24, 1
+           DISPLAY LENGTH 78
+           PROTECTED
+           VALUE "F3=Exit F4=Complete F5=Add New "
+           &     "F7=Claim Dtl F8=Next F16=Prev".
+*
+*--- Hidden Fields
+*
+       05 DRY-USER-ID            PIC X(8)   HIDDEN.
+       05 DRY-FUNCTION-CODE      PIC X(2)   HIDDEN.
+       05 DRY-CURRENT-PAGE       PIC 9(4)   HIDDEN.
+       05 DRY-TOTAL-PAGES        PIC 9(4)   HIDDEN.
+       05 DRY-SELECTED-DIARY-KEY PIC X(15)  HIDDEN.
+       05 DRY-SUPERVISOR-FLAG    PIC X(1)   HIDDEN.
+       05 DRY-TIMESTAMP          PIC X(26)  HIDDEN.
+*
+?section LOGIC
+*
+*================================================================
+*  MAIN PROCESSING LOGIC
+*================================================================
+*
+PROCEDURE DIARYSCR-MAIN.
+*
+    PERFORM DRY-INITIALIZE.
+    PERFORM DRY-PROCESS UNTIL DRY-FUNCTION-CODE = "EX".
+    PERFORM DRY-TERMINATE.
+*
+END PROCEDURE.
+*
+*================================================================
+*  INITIALIZE SCREEN - Load adjuster's diary list
+*================================================================
+*
+PROCEDURE DRY-INITIALIZE.
+*
+    DISPLAY BASE DRY-SCREEN-RECORD.
+    MOVE SPACES TO DRY-MESSAGE-AREA.
+    MOVE "O" TO DRY-FILTER-STATUS.
+    MOVE SPACES TO DRY-FILTER-PRIORITY.
+    MOVE 1 TO DRY-CURRENT-PAGE.
+    MOVE "IN" TO DRY-FUNCTION-CODE.
+*
+    SEND DRY-SCREEN-RECORD TO CLMSRV
+        REPLY LENGTH 4096
+        TIMEOUT 30.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE DRY-SCREEN-RECORD FROM CLMSRV
+        PERFORM DRY-FORMAT-PAGE-IND
+        DISPLAY OVERLAY DRY-SCREEN-RECORD
+    ELSE
+        MOVE "ERROR: Unable to load diary list"
+            TO DRY-MESSAGE-AREA
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  FORMAT PAGE INDICATOR
+*================================================================
+*
+PROCEDURE DRY-FORMAT-PAGE-IND.
+*
+    STRING "Pg " DRY-CURRENT-PAGE "/" DRY-TOTAL-PAGES
+        DELIMITED SIZE
+        INTO DRY-PAGE-INDICATOR.
+*
+END PROCEDURE.
+*
+*================================================================
+*  MAIN PROCESS LOOP
+*================================================================
+*
+PROCEDURE DRY-PROCESS.
+*
+    ACCEPT DRY-SCREEN-RECORD UNTIL
+        F3-KEY, F4-KEY, F5-KEY, F7-KEY, F8-KEY, F16-KEY.
+*
+    EVALUATE TRUE
+        WHEN F3-KEY
+            MOVE "EX" TO DRY-FUNCTION-CODE
+*
+        WHEN F4-KEY
+            PERFORM DRY-COMPLETE-DIARY
+*
+        WHEN F5-KEY
+            PERFORM DRY-ADD-NEW-DIARY
+*
+        WHEN F7-KEY
+            PERFORM DRY-VIEW-CLAIM
+*
+        WHEN F8-KEY
+            PERFORM DRY-NEXT-PAGE
+*
+        WHEN F16-KEY
+            PERFORM DRY-PREV-PAGE
+*
+    END-EVALUATE.
+*
+END PROCEDURE.
+*
+*================================================================
+*  COMPLETE SELECTED DIARY ENTRY
+*================================================================
+*
+PROCEDURE DRY-COMPLETE-DIARY.
+*
+    MOVE SPACES TO DRY-MESSAGE-AREA.
+    MOVE SPACES TO DRY-SELECTED-DIARY-KEY.
+*
+*   Find selected line
+*
+    PERFORM VARYING WS-IDX FROM 1 BY 1
+        UNTIL WS-IDX > 12
+        IF DRY-SEL(WS-IDX) = "X" OR DRY-SEL(WS-IDX) = "x"
+            MOVE DRY-CLAIM-NBR(WS-IDX) TO DRY-SELECTED-DIARY-KEY
+        END-IF
+    END-PERFORM.
+*
+    IF DRY-SELECTED-DIARY-KEY = SPACES
+        MOVE "Select a diary entry with 'X' to complete"
+            TO DRY-MESSAGE-AREA
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    ELSE
+        MOVE "CP" TO DRY-FUNCTION-CODE
+        SEND DRY-SCREEN-RECORD TO CLMSRV
+            REPLY LENGTH 4096
+            TIMEOUT 15
+        IF TERMINATION-STATUS = 0
+            RECEIVE DRY-SCREEN-RECORD FROM CLMSRV
+            DISPLAY OVERLAY DRY-SCREEN-RECORD
+            MOVE "Diary entry marked complete" TO DRY-MESSAGE-AREA
+        ELSE
+            MOVE "ERROR: Could not complete diary entry"
+                TO DRY-MESSAGE-AREA
+        END-IF
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    END-IF.
+*
+*   Clear selection indicators
+*
+    PERFORM VARYING WS-IDX FROM 1 BY 1
+        UNTIL WS-IDX > 12
+        MOVE SPACES TO DRY-SEL(WS-IDX)
+    END-PERFORM.
+*
+END PROCEDURE.
+*
+*================================================================
+*  ADD NEW DIARY ENTRY
+*================================================================
+*
+PROCEDURE DRY-ADD-NEW-DIARY.
+*
+    MOVE SPACES TO DRY-MESSAGE-AREA.
+*
+*   Validate new diary fields
+*
+    IF DRY-NEW-CLAIM = SPACES
+        MOVE "Claim number required for new diary" TO DRY-MESSAGE-AREA
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    END-IF.
+*
+    IF DRY-MESSAGE-AREA = SPACES
+        IF DRY-NEW-DUE-DATE = SPACES
+            MOVE "Due date required for new diary" TO DRY-MESSAGE-AREA
+            DISPLAY OVERLAY DRY-MESSAGE-AREA
+        END-IF
+    END-IF.
+*
+    IF DRY-MESSAGE-AREA = SPACES
+        IF DRY-NEW-PRIORITY < "1" OR DRY-NEW-PRIORITY > "5"
+            MOVE "Priority must be 1-5 (1=Highest)" TO DRY-MESSAGE-AREA
+            DISPLAY OVERLAY DRY-MESSAGE-AREA
+        END-IF
+    END-IF.
+*
+    IF DRY-MESSAGE-AREA = SPACES
+        IF DRY-NEW-CATEGORY = SPACES
+            MOVE "Category code required" TO DRY-MESSAGE-AREA
+            DISPLAY OVERLAY DRY-MESSAGE-AREA
+        END-IF
+    END-IF.
+*
+    IF DRY-MESSAGE-AREA = SPACES
+        IF DRY-NEW-DESC-L1 = SPACES
+            MOVE "Description required for new diary"
+                TO DRY-MESSAGE-AREA
+            DISPLAY OVERLAY DRY-MESSAGE-AREA
+        END-IF
+    END-IF.
+*
+    IF DRY-MESSAGE-AREA = SPACES
+        MOVE "AD" TO DRY-FUNCTION-CODE
+        SEND DRY-SCREEN-RECORD TO CLMSRV
+            REPLY LENGTH 4096
+            TIMEOUT 15
+        IF TERMINATION-STATUS = 0
+            RECEIVE DRY-SCREEN-RECORD FROM CLMSRV
+            DISPLAY OVERLAY DRY-SCREEN-RECORD
+            MOVE "New diary entry added" TO DRY-MESSAGE-AREA
+*           Clear entry fields
+            MOVE SPACES TO DRY-NEW-CLAIM
+            MOVE SPACES TO DRY-NEW-DUE-DATE
+            MOVE SPACES TO DRY-NEW-PRIORITY
+            MOVE SPACES TO DRY-NEW-CATEGORY
+            MOVE SPACES TO DRY-NEW-DESC-L1
+            MOVE SPACES TO DRY-NEW-DESC-L2
+            DISPLAY OVERLAY DRY-NEW-CLAIM
+            DISPLAY OVERLAY DRY-NEW-DUE-DATE
+            DISPLAY OVERLAY DRY-NEW-PRIORITY
+            DISPLAY OVERLAY DRY-NEW-CATEGORY
+            DISPLAY OVERLAY DRY-NEW-DESC-L1
+            DISPLAY OVERLAY DRY-NEW-DESC-L2
+        ELSE
+            MOVE "ERROR: Could not add diary entry - claim may not exist"
+                TO DRY-MESSAGE-AREA
+        END-IF
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  VIEW CLAIM DETAIL FOR SELECTED DIARY
+*================================================================
+*
+PROCEDURE DRY-VIEW-CLAIM.
+*
+    MOVE SPACES TO DRY-SELECTED-DIARY-KEY.
+*
+    PERFORM VARYING WS-IDX FROM 1 BY 1
+        UNTIL WS-IDX > 12
+        IF DRY-SEL(WS-IDX) = "X" OR DRY-SEL(WS-IDX) = "x"
+            MOVE DRY-CLAIM-NBR(WS-IDX) TO DRY-SELECTED-DIARY-KEY
+        END-IF
+    END-PERFORM.
+*
+    IF DRY-SELECTED-DIARY-KEY = SPACES
+        MOVE "Select a diary entry to view claim detail"
+            TO DRY-MESSAGE-AREA
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    ELSE
+        MOVE "CD" TO DRY-FUNCTION-CODE
+        SEND DRY-SCREEN-RECORD TO CLMSRV
+            REPLY LENGTH 4096
+            TIMEOUT 15
+        IF TERMINATION-STATUS = 0
+            RECEIVE DRY-SCREEN-RECORD FROM CLMSRV
+            ESCAPE TO CLMINQ
+        ELSE
+            MOVE "ERROR: Unable to retrieve claim detail"
+                TO DRY-MESSAGE-AREA
+            DISPLAY OVERLAY DRY-MESSAGE-AREA
+        END-IF
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  PAGE NAVIGATION
+*================================================================
+*
+PROCEDURE DRY-NEXT-PAGE.
+*
+    IF DRY-CURRENT-PAGE < DRY-TOTAL-PAGES
+        ADD 1 TO DRY-CURRENT-PAGE
+        MOVE "NP" TO DRY-FUNCTION-CODE
+        SEND DRY-SCREEN-RECORD TO CLMSRV
+            REPLY LENGTH 4096
+            TIMEOUT 15
+        IF TERMINATION-STATUS = 0
+            RECEIVE DRY-SCREEN-RECORD FROM CLMSRV
+            PERFORM DRY-FORMAT-PAGE-IND
+            DISPLAY OVERLAY DRY-SCREEN-RECORD
+        END-IF
+    ELSE
+        MOVE "Already on last page" TO DRY-MESSAGE-AREA
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+PROCEDURE DRY-PREV-PAGE.
+*
+    IF DRY-CURRENT-PAGE > 1
+        SUBTRACT 1 FROM DRY-CURRENT-PAGE
+        MOVE "PP" TO DRY-FUNCTION-CODE
+        SEND DRY-SCREEN-RECORD TO CLMSRV
+            REPLY LENGTH 4096
+            TIMEOUT 15
+        IF TERMINATION-STATUS = 0
+            RECEIVE DRY-SCREEN-RECORD FROM CLMSRV
+            PERFORM DRY-FORMAT-PAGE-IND
+            DISPLAY OVERLAY DRY-SCREEN-RECORD
+        END-IF
+    ELSE
+        MOVE "Already on first page" TO DRY-MESSAGE-AREA
+        DISPLAY OVERLAY DRY-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  TERMINATE SCREEN
+*================================================================
+*
+PROCEDURE DRY-TERMINATE.
+*
+    ESCAPE TO CLMMENU.
+*
+END PROCEDURE.

@@ -1,0 +1,612 @@
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?LIST
+!*********************************************************************
+!*  CLMDIARY -- Claim Diary/Notes Management Server
+!*  Workers' Compensation TPA System
+!*  HPE NonStop Guardian Environment
+!*
+!*  Purpose: Manages diary entries with due dates, priorities,
+!*           auto-generated system diaries (30/60/90/statutory),
+!*           escalation of overdue items, adjuster queue mgmt,
+!*           and bulk operations for team reassignment.
+!*
+!*  Process:  Pathway serverclass DIARY-SVR, MAXSERVERS 4
+!*  Files:    DIARYFL (key-seq by claim#+seq#),
+!*            DQUEUE (alt-key by adjuster+due-date),
+!*            NOTETYPE (reference), ACTLOG
+!*********************************************************************
+
+LITERAL
+  MAX^MSG^LEN          = 4096,
+  MAX^REPLY^LEN        = 2048,
+  MAX^DIARY^ENTRIES    = 500,
+  !-- Message types
+  MSG^CREATE^DIARY     = 1,
+  MSG^COMPLETE^DIARY   = 2,
+  MSG^ESCALATE         = 3,
+  MSG^GET^QUEUE        = 4,
+  MSG^BULK^TRANSFER    = 5,
+  MSG^AUTO^GENERATE    = 6,
+  MSG^ADD^NOTE         = 7,
+  MSG^GET^NOTES        = 8,
+  !-- Diary types
+  DTYPE^FOLLOWUP       = 1,
+  DTYPE^REVIEW^30      = 2,
+  DTYPE^REVIEW^60      = 3,
+  DTYPE^REVIEW^90      = 4,
+  DTYPE^STATUTORY      = 5,
+  DTYPE^MEDICAL        = 6,
+  DTYPE^LEGAL          = 7,
+  DTYPE^SUPERVISOR     = 8,
+  DTYPE^SYSTEM         = 9,
+  !-- Note types
+  NTYPE^ADJUSTER       = 1,
+  NTYPE^MEDICAL        = 2,
+  NTYPE^LEGAL          = 3,
+  NTYPE^SUPERVISOR     = 4,
+  NTYPE^SYSTEM         = 5,
+  NTYPE^CLAIMANT       = 6,
+  NTYPE^EMPLOYER       = 7,
+  !-- Priority levels
+  PRI^CRITICAL         = 0,
+  PRI^URGENT           = 1,
+  PRI^HIGH             = 2,
+  PRI^NORMAL           = 3,
+  PRI^LOW              = 4,
+  !-- Status
+  DSTAT^OPEN           = 0,
+  DSTAT^COMPLETED      = 1,
+  DSTAT^ESCALATED      = 2,
+  DSTAT^TRANSFERRED    = 3,
+  DSTAT^CANCELLED      = 4,
+  !-- Escalation thresholds (days overdue)
+  ESC^WARN             = 3,
+  ESC^ESCALATE         = 7,
+  ESC^CRITICAL         = 14,
+  !-- Errors
+  ERR^NONE             = 0,
+  ERR^NOT^FOUND        = 401,
+  ERR^ALREADY^DONE     = 402,
+  ERR^FILE^ERROR       = 403,
+  ERR^INV^REQUEST      = 404;
+
+!-- Diary master record (key: claim_number + seq_number)
+STRUCT DIARY^MASTER^REC;
+  BEGIN
+    STRING   CLAIM^NUMBER[0:14];       ! Part of primary key
+    INT(32)  SEQ^NUMBER;               ! Part of primary key
+    STRING   CREATED^DATE[0:7];        ! YYYYMMDD
+    STRING   CREATED^TIME[0:5];        ! HHMMSS
+    STRING   DUE^DATE[0:7];
+    STRING   COMPLETED^DATE[0:7];
+    INT(32)  PRIORITY;
+    INT(32)  DIARY^TYPE;
+    INT(32)  DIARY^STATUS;
+    STRING   ADJUSTER^ID[0:7];
+    STRING   CREATED^BY[0:7];
+    STRING   COMPLETED^BY[0:7];
+    STRING   SUBJECT[0:59];
+    STRING   DESCRIPTION[0:239];
+    INT(32)  ESCALATION^LEVEL;         ! 0=none, 1=warn, 2=esc, 3=crit
+    STRING   ESCALATED^TO[0:7];        ! Supervisor ID if escalated
+  END;
+
+!-- Adjuster diary queue record (alt key: adjuster+due_date)
+STRUCT DIARY^QUEUE^REC;
+  BEGIN
+    STRING   ADJUSTER^ID[0:7];
+    STRING   DUE^DATE[0:7];
+    STRING   CLAIM^NUMBER[0:14];
+    INT(32)  SEQ^NUMBER;
+    INT(32)  PRIORITY;
+    INT(32)  DIARY^TYPE;
+    STRING   SUBJECT[0:59];
+    INT(32)  DIARY^STATUS;
+  END;
+
+!-- Note record (appended to claim diary)
+STRUCT NOTE^REC;
+  BEGIN
+    STRING   CLAIM^NUMBER[0:14];
+    INT(32)  NOTE^SEQ;
+    STRING   NOTE^DATE[0:7];
+    STRING   NOTE^TIME[0:5];
+    INT(32)  NOTE^TYPE;
+    STRING   AUTHOR^ID[0:7];
+    STRING   AUTHOR^NAME[0:39];
+    STRING   NOTE^TEXT[0:499];
+    INT(32)  CONFIDENTIAL^FLAG;        ! 1=supervisor-only visibility
+  END;
+
+!-- Create diary request message
+STRUCT CREATE^DIARY^MSG;
+  BEGIN
+    INT(32)  MSG^TYPE;
+    STRING   CLAIM^NUMBER[0:14];
+    STRING   DUE^DATE[0:7];
+    INT(32)  PRIORITY;
+    INT(32)  DIARY^TYPE;
+    STRING   ADJUSTER^ID[0:7];
+    STRING   CREATED^BY[0:7];
+    STRING   SUBJECT[0:59];
+    STRING   DESCRIPTION[0:239];
+  END;
+
+!-- Complete diary request
+STRUCT COMPLETE^DIARY^MSG;
+  BEGIN
+    INT(32)  MSG^TYPE;
+    STRING   CLAIM^NUMBER[0:14];
+    INT(32)  SEQ^NUMBER;
+    STRING   COMPLETED^BY[0:7];
+    STRING   COMPLETION^NOTE[0:239];
+  END;
+
+!-- Queue request (get diaries for adjuster)
+STRUCT QUEUE^REQUEST^MSG;
+  BEGIN
+    INT(32)  MSG^TYPE;
+    STRING   ADJUSTER^ID[0:7];
+    STRING   FROM^DATE[0:7];
+    STRING   TO^DATE[0:7];
+    INT(32)  INCLUDE^COMPLETED;
+    INT(32)  MAX^ENTRIES;
+  END;
+
+!-- Bulk transfer request
+STRUCT BULK^TRANSFER^MSG;
+  BEGIN
+    INT(32)  MSG^TYPE;
+    STRING   FROM^ADJUSTER[0:7];
+    STRING   TO^ADJUSTER[0:7];
+    STRING   CLAIM^NUMBER[0:14];    ! Specific claim or spaces=all
+    STRING   TRANSFERRED^BY[0:7];
+  END;
+
+!-- Generic reply
+STRUCT DIARY^REPLY;
+  BEGIN
+    INT(32)  REPLY^CODE;
+    INT(32)  ERROR^CODE;
+    INT(32)  ENTRIES^AFFECTED;
+    STRING   MESSAGE[0:79];
+  END;
+
+!-- File numbers
+INT  DIARY^FNUM,
+     DQUEUE^FNUM,
+     NOTE^FNUM,
+     ACTLOG^FNUM;
+
+!-- Sequence counter for diary entries per claim
+INT(32) NEXT^DIARY^SEQ;
+
+!-- Working variables
+STRING WORK^DATE[0:7];
+STRING WORK^TIME[0:5];
+
+!*********************************************************************
+!*  OPEN^FILES
+!*********************************************************************
+PROC OPEN^FILES;
+  BEGIN
+    CALL FILE_OPEN_("$DIARYFL", 7, DIARY^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$DQUEUE", 7, DQUEUE^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$NOTEFL", 7, NOTE^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$ACTLOG", 7, ACTLOG^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+  END;
+
+!*********************************************************************
+!*  GET^TIMESTAMP
+!*********************************************************************
+PROC GET^TIMESTAMP(DATE^BUF, TIME^BUF);
+  STRING .DATE^BUF[0:7];
+  STRING .TIME^BUF[0:5];
+  BEGIN
+    INT(32) JTS[0:2];
+    INT     YEAR, MONTH, DAY, HOUR, MINUTE;
+    STRING  NUM^BUF[0:3];
+
+    CALL JULIANTIMESTAMP(JTS);
+    CALL INTERPRETTIMESTAMP(JTS, YEAR, MONTH, DAY, HOUR, MINUTE);
+
+    CALL NUMOUT(YEAR, NUM^BUF, 10, 4);
+    DATE^BUF ':=' NUM^BUF FOR 4;
+    CALL NUMOUT(MONTH, NUM^BUF, 10, 2);
+    DATE^BUF[4] ':=' NUM^BUF FOR 2;
+    CALL NUMOUT(DAY, NUM^BUF, 10, 2);
+    DATE^BUF[6] ':=' NUM^BUF FOR 2;
+
+    CALL NUMOUT(HOUR, NUM^BUF, 10, 2);
+    TIME^BUF ':=' NUM^BUF FOR 2;
+    CALL NUMOUT(MINUTE, NUM^BUF, 10, 2);
+    TIME^BUF[2] ':=' NUM^BUF FOR 2;
+    TIME^BUF[4] ':=' "00";
+  END;
+
+!*********************************************************************
+!*  GET^NEXT^SEQ -- Get next diary sequence for a claim
+!*********************************************************************
+INT(32) PROC GET^NEXT^SEQ(CLAIM^NO);
+  STRING .CLAIM^NO[0:14];
+  BEGIN
+    STRUCT .DREC(DIARY^MASTER^REC);
+    INT    BYTES^READ;
+    INT(32) LAST^SEQ;
+
+    LAST^SEQ := 0;
+
+    !-- Position to last record for this claim
+    DREC.CLAIM^NUMBER ':=' CLAIM^NO FOR 15;
+    DREC.SEQ^NUMBER := 999999;
+
+    CALL KEYPOSITION(DIARY^FNUM, DREC, 19, 0, 2);  ! approx <=
+    IF <> THEN RETURN 1;
+
+    CALL READX(DIARY^FNUM, DREC, $LEN(DIARY^MASTER^REC), BYTES^READ);
+    IF <> THEN RETURN 1;
+
+    IF DREC.CLAIM^NUMBER = CLAIM^NO FOR 15 THEN
+      LAST^SEQ := DREC.SEQ^NUMBER;
+
+    RETURN LAST^SEQ + 1;
+  END;
+
+!*********************************************************************
+!*  PROCESS^CREATE -- Create a new diary entry
+!*********************************************************************
+PROC PROCESS^CREATE(MSG^BUF, REPLY^BUF);
+  STRING .MSG^BUF(CREATE^DIARY^MSG);
+  STRING .REPLY^BUF(DIARY^REPLY);
+  BEGIN
+    STRUCT .DREC(DIARY^MASTER^REC);
+    STRUCT .QREC(DIARY^QUEUE^REC);
+    INT(32) NEW^SEQ;
+
+    NEW^SEQ := GET^NEXT^SEQ(MSG^BUF.CLAIM^NUMBER);
+
+    !-- Build diary master record
+    DREC.CLAIM^NUMBER ':=' MSG^BUF.CLAIM^NUMBER FOR 15;
+    DREC.SEQ^NUMBER := NEW^SEQ;
+    CALL GET^TIMESTAMP(DREC.CREATED^DATE, DREC.CREATED^TIME);
+    DREC.DUE^DATE ':=' MSG^BUF.DUE^DATE FOR 8;
+    DREC.COMPLETED^DATE ':=' "        ";
+    DREC.PRIORITY := MSG^BUF.PRIORITY;
+    DREC.DIARY^TYPE := MSG^BUF.DIARY^TYPE;
+    DREC.DIARY^STATUS := DSTAT^OPEN;
+    DREC.ADJUSTER^ID ':=' MSG^BUF.ADJUSTER^ID FOR 8;
+    DREC.CREATED^BY ':=' MSG^BUF.CREATED^BY FOR 8;
+    DREC.COMPLETED^BY ':=' "        ";
+    DREC.SUBJECT ':=' MSG^BUF.SUBJECT FOR 60;
+    DREC.DESCRIPTION ':=' MSG^BUF.DESCRIPTION FOR 240;
+    DREC.ESCALATION^LEVEL := 0;
+    DREC.ESCALATED^TO ':=' "        ";
+
+    CALL WRITEX(DIARY^FNUM, DREC, $LEN(DIARY^MASTER^REC));
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^FILE^ERROR;
+        REPLY^BUF.MESSAGE ':='
+          "Failed to write diary master record                             " &
+          "               ";
+        RETURN;
+      END;
+
+    !-- Write queue entry for adjuster's diary view
+    QREC.ADJUSTER^ID ':=' MSG^BUF.ADJUSTER^ID FOR 8;
+    QREC.DUE^DATE ':=' MSG^BUF.DUE^DATE FOR 8;
+    QREC.CLAIM^NUMBER ':=' MSG^BUF.CLAIM^NUMBER FOR 15;
+    QREC.SEQ^NUMBER := NEW^SEQ;
+    QREC.PRIORITY := MSG^BUF.PRIORITY;
+    QREC.DIARY^TYPE := MSG^BUF.DIARY^TYPE;
+    QREC.SUBJECT ':=' MSG^BUF.SUBJECT FOR 60;
+    QREC.DIARY^STATUS := DSTAT^OPEN;
+
+    CALL WRITEX(DQUEUE^FNUM, QREC, $LEN(DIARY^QUEUE^REC));
+    ! Queue write failure is non-fatal
+
+    REPLY^BUF.REPLY^CODE := 0;
+    REPLY^BUF.ERROR^CODE := ERR^NONE;
+    REPLY^BUF.ENTRIES^AFFECTED := 1;
+    REPLY^BUF.MESSAGE ':='
+      "Diary entry created successfully                                  " &
+      "         ";
+  END;
+
+!*********************************************************************
+!*  PROCESS^COMPLETE -- Mark a diary entry as completed
+!*********************************************************************
+PROC PROCESS^COMPLETE(MSG^BUF, REPLY^BUF);
+  STRING .MSG^BUF(COMPLETE^DIARY^MSG);
+  STRING .REPLY^BUF(DIARY^REPLY);
+  BEGIN
+    STRUCT .DREC(DIARY^MASTER^REC);
+    INT    BYTES^READ;
+
+    !-- Position and read for update
+    DREC.CLAIM^NUMBER ':=' MSG^BUF.CLAIM^NUMBER FOR 15;
+    DREC.SEQ^NUMBER := MSG^BUF.SEQ^NUMBER;
+
+    CALL KEYPOSITION(DIARY^FNUM, DREC, 19, 0, 0);  ! exact
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^NOT^FOUND;
+        REPLY^BUF.MESSAGE ':='
+          "Diary entry not found                                           " &
+          "               ";
+        RETURN;
+      END;
+
+    CALL READUPDATEX(DIARY^FNUM, DREC, $LEN(DIARY^MASTER^REC),
+                     BYTES^READ);
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^NOT^FOUND;
+        REPLY^BUF.MESSAGE ':='
+          "Diary entry not found for update                                " &
+          "               ";
+        RETURN;
+      END;
+
+    !-- Check not already completed
+    IF DREC.DIARY^STATUS = DSTAT^COMPLETED THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^ALREADY^DONE;
+        REPLY^BUF.MESSAGE ':='
+          "Diary entry already completed                                   " &
+          "               ";
+        RETURN;
+      END;
+
+    !-- Update status
+    DREC.DIARY^STATUS := DSTAT^COMPLETED;
+    CALL GET^TIMESTAMP(DREC.COMPLETED^DATE, WORK^TIME);
+    DREC.COMPLETED^BY ':=' MSG^BUF.COMPLETED^BY FOR 8;
+
+    CALL WRITEUPDATEX(DIARY^FNUM, DREC, $LEN(DIARY^MASTER^REC));
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^FILE^ERROR;
+        REPLY^BUF.MESSAGE ':='
+          "Failed to update diary record                                   " &
+          "               ";
+        RETURN;
+      END;
+
+    REPLY^BUF.REPLY^CODE := 0;
+    REPLY^BUF.ERROR^CODE := ERR^NONE;
+    REPLY^BUF.ENTRIES^AFFECTED := 1;
+    REPLY^BUF.MESSAGE ':='
+      "Diary entry completed                                             " &
+      "       ";
+  END;
+
+!*********************************************************************
+!*  PROCESS^ESCALATE -- Check and escalate overdue diaries
+!*  Scans all open diaries, compares due date to current date,
+!*  updates escalation level and notifies supervisor.
+!*********************************************************************
+PROC PROCESS^ESCALATE(REPLY^BUF);
+  STRING .REPLY^BUF(DIARY^REPLY);
+  BEGIN
+    STRUCT .DREC(DIARY^MASTER^REC);
+    INT    BYTES^READ;
+    INT(32) ESCALATED^COUNT;
+    STRING  TODAY[0:7];
+
+    ESCALATED^COUNT := 0;
+    CALL GET^TIMESTAMP(TODAY, WORK^TIME);
+
+    !-- Scan from beginning of diary file
+    CALL KEYPOSITION(DIARY^FNUM, , 0, 0, 0);
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^FILE^ERROR;
+        RETURN;
+      END;
+
+    WHILE 1 DO
+      BEGIN
+        CALL READUPDATEX(DIARY^FNUM, DREC, $LEN(DIARY^MASTER^REC),
+                         BYTES^READ);
+        IF <> THEN
+          BEGIN
+            ! End of file or error -- finish
+            REPLY^BUF.REPLY^CODE := 0;
+            REPLY^BUF.ERROR^CODE := ERR^NONE;
+            REPLY^BUF.ENTRIES^AFFECTED := ESCALATED^COUNT;
+            REPLY^BUF.MESSAGE ':='
+              "Escalation scan complete                                        " &
+              "               ";
+            RETURN;
+          END;
+
+        !-- Only process open, non-escalated-to-critical entries
+        IF DREC.DIARY^STATUS = DSTAT^OPEN AND
+           DREC.DUE^DATE < TODAY THEN
+          BEGIN
+            !-- Determine escalation level based on days overdue
+            !-- (simplified: compare date strings for ordering)
+            IF DREC.ESCALATION^LEVEL < 3 THEN
+              BEGIN
+                DREC.ESCALATION^LEVEL := DREC.ESCALATION^LEVEL + 1;
+
+                IF DREC.ESCALATION^LEVEL >= 2 THEN
+                  BEGIN
+                    !-- Escalate to supervisor: change priority
+                    DREC.PRIORITY := PRI^URGENT;
+                    DREC.DIARY^STATUS := DSTAT^ESCALATED;
+                  END;
+
+                CALL WRITEUPDATEX(DIARY^FNUM, DREC,
+                     $LEN(DIARY^MASTER^REC));
+                IF = THEN
+                  ESCALATED^COUNT := ESCALATED^COUNT + 1;
+              END
+            ELSE
+              BEGIN
+                !-- Already at critical, just unlock
+                CALL UNLOCKREC(DIARY^FNUM);
+              END;
+          END
+        ELSE
+          BEGIN
+            CALL UNLOCKREC(DIARY^FNUM);
+          END;
+      END;
+  END;
+
+!*********************************************************************
+!*  PROCESS^BULK^TRANSFER -- Transfer all open diaries between
+!*  adjusters, used during reassignment or adjuster departure.
+!*********************************************************************
+PROC PROCESS^BULK^TRANSFER(MSG^BUF, REPLY^BUF);
+  STRING .MSG^BUF(BULK^TRANSFER^MSG);
+  STRING .REPLY^BUF(DIARY^REPLY);
+  BEGIN
+    STRUCT .DREC(DIARY^MASTER^REC);
+    INT    BYTES^READ;
+    INT(32) XFER^COUNT;
+    INT     MATCH^CLAIM;
+
+    XFER^COUNT := 0;
+    MATCH^CLAIM := 0;
+    IF MSG^BUF.CLAIM^NUMBER <> "               " THEN
+      MATCH^CLAIM := 1;
+
+    !-- Scan all diary entries
+    CALL KEYPOSITION(DIARY^FNUM, , 0, 0, 0);
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^FILE^ERROR;
+        RETURN;
+      END;
+
+    WHILE 1 DO
+      BEGIN
+        CALL READUPDATEX(DIARY^FNUM, DREC, $LEN(DIARY^MASTER^REC),
+                         BYTES^READ);
+        IF <> THEN
+          BEGIN
+            REPLY^BUF.REPLY^CODE := 0;
+            REPLY^BUF.ERROR^CODE := ERR^NONE;
+            REPLY^BUF.ENTRIES^AFFECTED := XFER^COUNT;
+            REPLY^BUF.MESSAGE ':='
+              "Bulk transfer complete                                          " &
+              "               ";
+            RETURN;
+          END;
+
+        !-- Match: open diary, belongs to source adjuster
+        IF DREC.DIARY^STATUS = DSTAT^OPEN AND
+           DREC.ADJUSTER^ID = MSG^BUF.FROM^ADJUSTER FOR 8 THEN
+          BEGIN
+            !-- If specific claim, check match
+            IF MATCH^CLAIM AND
+               DREC.CLAIM^NUMBER <> MSG^BUF.CLAIM^NUMBER FOR 15 THEN
+              BEGIN
+                CALL UNLOCKREC(DIARY^FNUM);
+              END
+            ELSE
+              BEGIN
+                DREC.ADJUSTER^ID ':=' MSG^BUF.TO^ADJUSTER FOR 8;
+                DREC.DIARY^STATUS := DSTAT^TRANSFERRED;
+
+                CALL WRITEUPDATEX(DIARY^FNUM, DREC,
+                     $LEN(DIARY^MASTER^REC));
+                IF = THEN
+                  XFER^COUNT := XFER^COUNT + 1;
+              END;
+          END
+        ELSE
+          BEGIN
+            CALL UNLOCKREC(DIARY^FNUM);
+          END;
+      END;
+  END;
+
+!*********************************************************************
+!*  PROCESS^MESSAGE -- Route incoming message to handler
+!*********************************************************************
+PROC PROCESS^MESSAGE(REQ^BUF, REQ^LEN, REPLY^BUF, REPLY^LEN);
+  STRING .REQ^BUF;
+  INT     REQ^LEN;
+  STRING .REPLY^BUF(DIARY^REPLY);
+  INT    .REPLY^LEN;
+  BEGIN
+    INT(32) MSG^TYPE;
+
+    MSG^TYPE := REQ^BUF[0].<0:32>;    ! First 4 bytes = msg type
+
+    !-- Initialize reply
+    REPLY^BUF.REPLY^CODE := 0;
+    REPLY^BUF.ERROR^CODE := ERR^NONE;
+    REPLY^BUF.ENTRIES^AFFECTED := 0;
+    REPLY^BUF.MESSAGE ':=' [40 * ["  "]];
+
+    CASE MSG^TYPE OF
+      BEGIN
+        MSG^CREATE^DIARY  -> CALL PROCESS^CREATE(REQ^BUF, REPLY^BUF);
+        MSG^COMPLETE^DIARY -> CALL PROCESS^COMPLETE(REQ^BUF, REPLY^BUF);
+        MSG^ESCALATE      -> CALL PROCESS^ESCALATE(REPLY^BUF);
+        MSG^BULK^TRANSFER -> CALL PROCESS^BULK^TRANSFER(REQ^BUF, REPLY^BUF);
+        OTHERWISE ->
+          BEGIN
+            REPLY^BUF.REPLY^CODE := 1;
+            REPLY^BUF.ERROR^CODE := ERR^INV^REQUEST;
+            REPLY^BUF.MESSAGE ':='
+              "Invalid message type                                            " &
+              "               ";
+          END;
+      END;
+
+    REPLY^LEN := $LEN(DIARY^REPLY);
+  END;
+
+!*********************************************************************
+!*  MAIN -- Pathway server main loop
+!*********************************************************************
+PROC MAIN;
+  BEGIN
+    STRING  REQ^BUFFER[0:MAX^MSG^LEN - 1];
+    STRING  REPLY^BUFFER[0:MAX^REPLY^LEN - 1];
+    INT     REQ^LENGTH;
+    INT     REPLY^LENGTH;
+    INT     OPEN^FNUM;
+
+    CALL OPEN^FILES;
+
+    WHILE 1 DO
+      BEGIN
+        CALL SERVERCLASS_SEND_INFO_(, , OPEN^FNUM);
+
+        CALL READUPDATEX(OPEN^FNUM, REQ^BUFFER, MAX^MSG^LEN,
+                         REQ^LENGTH);
+        IF <> THEN
+          BEGIN
+            CALL SERVERCLASS_SEND_INFO_(, , OPEN^FNUM);
+          END
+        ELSE
+          BEGIN
+            REPLY^LENGTH := 0;
+            CALL PROCESS^MESSAGE(REQ^BUFFER, REQ^LENGTH,
+                                 REPLY^BUFFER, REPLY^LENGTH);
+            CALL REPLYX(REPLY^BUFFER, REPLY^LENGTH);
+          END;
+      END;
+  END;

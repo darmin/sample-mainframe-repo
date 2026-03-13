@@ -1,0 +1,427 @@
+?SECTION RPTBATCH ROUTINE
+!==================================================================!
+! SCRIPT:     RPTBATCH                                             !
+! AUTHOR:     MAINFRAMEMOD TPA SYSTEMS                             !
+! DATE:       2024-03-01                                           !
+! PURPOSE:    REPORTING BATCH SCRIPT - GENERATES MONTHLY            !
+!             MANAGEMENT AND COMPLIANCE REPORTS                    !
+!             LOSS RUNS, AGING, RESERVES, PAYMENTS, PERFORMANCE    !
+! PLATFORM:   HPE NONSTOP / GUARDIAN / TACL                        !
+!==================================================================!
+! CHANGE LOG:                                                      !
+! 2024-03-01  INITIAL DEVELOPMENT - CORE REPORTS                   !
+! 2024-05-20  ADDED ADJUSTER PERFORMANCE METRICS                   !
+! 2024-08-10  ADDED JURISDICTION COMPLIANCE STATUS                 !
+! 2024-11-15  ADDED LARGE LOSS AND LITIGATION REPORTS              !
+!==================================================================!
+
+! Configuration
+#SET RPT^HOME $DATA3.WCRPTS
+#SET RPT^LOG $DATA1.WCFILES.RPTLOG
+#SET RPT^QUEUE $RPTQ
+#SET DATA^VOL $DATA1
+#SET PRINT^DEST $S.#LP01
+#SET EMAIL^DIST WCREPORTS@TPACOMPANY.COM
+
+! Report generation control
+#SET RPT^STATUS 0
+#SET RPT^COUNT 0
+#SET RPT^ERRORS 0
+#SET TOTAL^REPORTS 8
+#SET RPT^RUN^DATE [#TIMESTAMP]
+
+! Report output file names
+#SET RPT^LOSSRUN [RPT^HOME].LOSSRUN
+#SET RPT^AGING   [RPT^HOME].CLMAGING
+#SET RPT^RESERVE [RPT^HOME].RSRVADQ
+#SET RPT^PAYMENT [RPT^HOME].PYMTREG
+#SET RPT^ADJPERF [RPT^HOME].ADJPERF
+#SET RPT^COMPLY  [RPT^HOME].JURCMPL
+#SET RPT^LGLOSS  [RPT^HOME].LGLOSS
+#SET RPT^LITIG   [RPT^HOME].LITRPT
+
+! Large loss threshold
+#SET LARGE^LOSS^THRESHOLD 100000
+
+!------------------------------------------------------------------!
+! MAIN REPORT BATCH CONTROL                                        !
+!------------------------------------------------------------------!
+#PUSH ERRTEXT
+
+SINK [#LOG^FILE OPEN [RPT^LOG]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "RPTBATCH: REPORT GENERATION STARTED"]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "RPTBATCH: RUN DATE     = " [RPT^RUN^DATE]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "RPTBATCH: TOTAL REPORTS = " [TOTAL^REPORTS]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "=================================================="]
+
+!------------------------------------------------------------------!
+! REPORT 1: LOSS RUNS BY EMPLOYER/POLICY                           !
+!   Sorted by employer FEIN, then policy number                    !
+!   Includes incurred, paid, reserved, and open claim counts       !
+!   Break totals at employer and policy level                      !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 1
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 1/" [TOTAL^REPORTS] ": LOSS RUNS - STARTED " [RPT^START]]
+
+! Purge old report file if exists
+[#IF [#FILEEXISTS [RPT^LOSSRUN]] |THEN|
+  PURGE [RPT^LOSSRUN]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTLR /NAME $RLR/ -
+  IN  [DATA^VOL].WCFILES.CLMDATA, -
+  OUT [RPT^LOSSRUN], -
+  PARAM "SORT=EMPLOYER,POLICY;BREAK=EMPLOYER,POLICY,GRAND"]
+#SET STEP^CC [#PROCESSWAIT $RLR]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 1: LOSS RUNS GENERATED SUCCESSFULLY"]
+  ! Route to employer distribution list
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 1: ROUTING TO EMPLOYER DISTRIBUTION"]
+  COPY [RPT^LOSSRUN] [PRINT^DEST]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 1: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT 2: CLAIMS AGING REPORT                                    !
+!   Buckets: 0-30, 31-60, 61-90, 91-180, 181-365, >365 days       !
+!   Shows open claim count and incurred by aging bucket             !
+!   Highlights claims over 180 days without activity                !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 2
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 2/" [TOTAL^REPORTS] ": CLAIMS AGING - STARTED " [RPT^START]]
+
+[#IF [#FILEEXISTS [RPT^AGING]] |THEN|
+  PURGE [RPT^AGING]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTAG /NAME $RAG/ -
+  IN  [DATA^VOL].WCFILES.CLMDATA, -
+  OUT [RPT^AGING], -
+  PARAM "BUCKETS=30,60,90,180,365;STATUS=OPEN;HIGHLIGHT=180NOACT"]
+#SET STEP^CC [#PROCESSWAIT $RAG]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 2: CLAIMS AGING GENERATED SUCCESSFULLY"]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 2: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT 3: RESERVE ADEQUACY REPORT                                !
+!   Compares current reserves to actuarial expectations             !
+!   Flags under-reserved claims (reserve < 80% of expected)        !
+!   Flags over-reserved claims (reserve > 150% of expected)        !
+!   Sorted by adjuster, then by variance percentage                !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 3
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 3/" [TOTAL^REPORTS] ": RESERVE ADEQUACY - STARTED " [RPT^START]]
+
+[#IF [#FILEEXISTS [RPT^RESERVE]] |THEN|
+  PURGE [RPT^RESERVE]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTRV /NAME $RRV/ -
+  IN  [DATA^VOL].WCFILES.CLMDATA, -
+  OUT [RPT^RESERVE], -
+  PARAM "UNDER=80;OVER=150;SORT=ADJUSTER,VARIANCE"]
+#SET STEP^CC [#PROCESSWAIT $RRV]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 3: RESERVE ADEQUACY GENERATED SUCCESSFULLY"]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 3: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT 4: PAYMENT REGISTER                                       !
+!   All payments issued during reporting period                    !
+!   Grouped by payment type (medical, indemnity, expense)          !
+!   Includes check number, payee, amount, claim reference          !
+!   Control totals by type and grand total                         !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 4
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 4/" [TOTAL^REPORTS] ": PAYMENT REGISTER - STARTED " [RPT^START]]
+
+[#IF [#FILEEXISTS [RPT^PAYMENT]] |THEN|
+  PURGE [RPT^PAYMENT]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTPM /NAME $RPM/ -
+  IN  [DATA^VOL].WCFILES.PYMTLOG, -
+  OUT [RPT^PAYMENT], -
+  PARAM "GROUP=PAYTYPE;TOTALS=TYPE,GRAND;PERIOD=MONTH"]
+#SET STEP^CC [#PROCESSWAIT $RPM]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 4: PAYMENT REGISTER GENERATED SUCCESSFULLY"]
+  ! Route payment register to accounting
+  COPY [RPT^PAYMENT] [PRINT^DEST]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 4: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT 5: ADJUSTER PERFORMANCE METRICS                           !
+!   Claims per adjuster, closure rate, avg days to close           !
+!   Reserve accuracy (actual vs initial estimate)                  !
+!   Diary compliance percentage                                    !
+!   Customer satisfaction scores (if available)                    !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 5
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 5/" [TOTAL^REPORTS] ": ADJUSTER PERFORMANCE - STARTED " [RPT^START]]
+
+[#IF [#FILEEXISTS [RPT^ADJPERF]] |THEN|
+  PURGE [RPT^ADJPERF]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTAP /NAME $RAP/ -
+  IN  [DATA^VOL].WCFILES.CLMDATA, -
+  OUT [RPT^ADJPERF], -
+  PARAM "METRICS=CASELOAD,CLOSURE,AVGDAYS,RSRVACCUR,DIARY"]
+#SET STEP^CC [#PROCESSWAIT $RAP]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 5: ADJUSTER PERFORMANCE GENERATED SUCCESSFULLY"]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 5: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT 6: JURISDICTION COMPLIANCE STATUS                          !
+!   Filing compliance by state (FROI/SROI timeliness)              !
+!   Penalty exposure for late filings                              !
+!   Electronic filing success rates                                !
+!   Acknowledgment rejection analysis                              !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 6
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 6/" [TOTAL^REPORTS] ": JURISDICTION COMPLIANCE - STARTED " [RPT^START]]
+
+[#IF [#FILEEXISTS [RPT^COMPLY]] |THEN|
+  PURGE [RPT^COMPLY]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTJC /NAME $RJC/ -
+  IN  [DATA^VOL].WCFILES.FILHIST, -
+  OUT [RPT^COMPLY], -
+  PARAM "TYPE=FROI,SROI;METRICS=TIMELINESS,PENALTY,ACKRATE"]
+#SET STEP^CC [#PROCESSWAIT $RJC]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 6: JURISDICTION COMPLIANCE GENERATED SUCCESSFULLY"]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 6: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT 7: LARGE LOSS REPORT                                      !
+!   Claims with total incurred > threshold ($100K default)         !
+!   Includes reserve detail, payment history, subrogation status   !
+!   Sorted by total incurred descending                            !
+!   Flags claims approaching excess/reinsurance attachment point   !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 7
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 7/" [TOTAL^REPORTS] ": LARGE LOSS - STARTED " [RPT^START]]
+
+[#IF [#FILEEXISTS [RPT^LGLOSS]] |THEN|
+  PURGE [RPT^LGLOSS]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTLL /NAME $RLL/ -
+  IN  [DATA^VOL].WCFILES.CLMDATA, -
+  OUT [RPT^LGLOSS], -
+  PARAM "THRESHOLD=" [LARGE^LOSS^THRESHOLD] -
+        ";SORT=INCURRED_DESC;FLAG=EXCESS"]
+#SET STEP^CC [#PROCESSWAIT $RLL]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 7: LARGE LOSS REPORT GENERATED SUCCESSFULLY"]
+  ! Large loss report always goes to management
+  COPY [RPT^LGLOSS] [PRINT^DEST]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 7: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT 8: LITIGATION SUMMARY REPORT                              !
+!   All claims in litigation status                                !
+!   Attorney information, trial dates, settlement authority        !
+!   Litigation expense tracking                                    !
+!   Expected outcome and financial exposure analysis               !
+!------------------------------------------------------------------!
+#SET RPT^COUNT 8
+#SET RPT^START [#TIMESTAMP]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT 8/" [TOTAL^REPORTS] ": LITIGATION SUMMARY - STARTED " [RPT^START]]
+
+[#IF [#FILEEXISTS [RPT^LITIG]] |THEN|
+  PURGE [RPT^LITIG]
+]
+
+#SET STEP^STATUS [#NEWPROCESS $DATA1.WCOBJ.WCRPTLT /NAME $RLT/ -
+  IN  [DATA^VOL].WCFILES.LITDATA, -
+  OUT [RPT^LITIG], -
+  PARAM "STATUS=ACTIVE;DETAIL=ATTORNEY,TRIAL,EXPENSE,EXPOSURE"]
+#SET STEP^CC [#PROCESSWAIT $RLT]
+
+[#IF [STEP^CC] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 8: LITIGATION SUMMARY GENERATED SUCCESSFULLY"]
+|ELSE|
+  #SET RPT^ERRORS [RPT^ERRORS] + 1
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "REPORT 8: *** FAILED *** RC=" [STEP^CC]]
+]
+
+!------------------------------------------------------------------!
+! REPORT DISTRIBUTION                                              !
+!------------------------------------------------------------------!
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "DISTRIBUTION: ROUTING REPORTS TO RECIPIENTS"]
+
+! Create consolidated report package
+#SET PKG^NAME [RPT^HOME].RPTPKG[#JULIANTIMESTAMP]
+
+! Copy all successful reports to package directory
+[#IF [#FILEEXISTS [RPT^LOSSRUN]] |THEN|
+  COPY [RPT^LOSSRUN] [PKG^NAME]LR
+]
+[#IF [#FILEEXISTS [RPT^AGING]] |THEN|
+  COPY [RPT^AGING] [PKG^NAME]AG
+]
+[#IF [#FILEEXISTS [RPT^RESERVE]] |THEN|
+  COPY [RPT^RESERVE] [PKG^NAME]RV
+]
+[#IF [#FILEEXISTS [RPT^PAYMENT]] |THEN|
+  COPY [RPT^PAYMENT] [PKG^NAME]PM
+]
+[#IF [#FILEEXISTS [RPT^ADJPERF]] |THEN|
+  COPY [RPT^ADJPERF] [PKG^NAME]AP
+]
+[#IF [#FILEEXISTS [RPT^COMPLY]] |THEN|
+  COPY [RPT^COMPLY] [PKG^NAME]JC
+]
+[#IF [#FILEEXISTS [RPT^LGLOSS]] |THEN|
+  COPY [RPT^LGLOSS] [PKG^NAME]LL
+]
+[#IF [#FILEEXISTS [RPT^LITIG]] |THEN|
+  COPY [RPT^LITIG] [PKG^NAME]LT
+]
+
+! FTP report package to shared drive for web access
+FTP [PKG^NAME]* REPORTS.TPACOMPANY.COM/MONTHLY/
+
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "DISTRIBUTION: REPORT PACKAGE CREATED AND TRANSMITTED"]
+
+!------------------------------------------------------------------!
+! REPORT BATCH COMPLETION                                          !
+!------------------------------------------------------------------!
+#SET RPT^END [#TIMESTAMP]
+#SET RPT^SUCCESSFUL [TOTAL^REPORTS] - [RPT^ERRORS]
+
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "RPTBATCH: REPORT GENERATION COMPLETED"]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "RPTBATCH: END TIME            = " [RPT^END]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "RPTBATCH: REPORTS GENERATED   = " [RPT^SUCCESSFUL] "/" [TOTAL^REPORTS]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "RPTBATCH: REPORTS FAILED      = " [RPT^ERRORS]]
+
+[#IF [RPT^ERRORS] = 0 |THEN|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "RPTBATCH: STATUS = ALL REPORTS SUCCESSFUL"]
+|ELSE|
+  SINK [#LOG^FILE WRITE [RPT^LOG] -
+    "RPTBATCH: STATUS = COMPLETED WITH " [RPT^ERRORS] " FAILURE(S)"]
+]
+
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "=================================================="]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "REPORT SUMMARY:"]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  1. LOSS RUNS BY EMPLOYER/POLICY  : " -
+  [#IF [#FILEEXISTS [RPT^LOSSRUN]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  2. CLAIMS AGING REPORT           : " -
+  [#IF [#FILEEXISTS [RPT^AGING]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  3. RESERVE ADEQUACY REPORT       : " -
+  [#IF [#FILEEXISTS [RPT^RESERVE]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  4. PAYMENT REGISTER              : " -
+  [#IF [#FILEEXISTS [RPT^PAYMENT]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  5. ADJUSTER PERFORMANCE METRICS  : " -
+  [#IF [#FILEEXISTS [RPT^ADJPERF]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  6. JURISDICTION COMPLIANCE STATUS: " -
+  [#IF [#FILEEXISTS [RPT^COMPLY]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  7. LARGE LOSS REPORT             : " -
+  [#IF [#FILEEXISTS [RPT^LGLOSS]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "  8. LITIGATION SUMMARY REPORT     : " -
+  [#IF [#FILEEXISTS [RPT^LITIG]] |THEN| "OK" |ELSE| "FAILED"]]
+SINK [#LOG^FILE WRITE [RPT^LOG] -
+  "=================================================="]
+
+! Archive report log
+COPY [RPT^LOG] [RPT^HOME].RPTLOG[#JULIANTIMESTAMP]
+
+SINK [#LOG^FILE CLOSE [RPT^LOG]]
+
+#POP ERRTEXT
+
+[#IF [RPT^ERRORS] > 0 |THEN|
+  #SET #COMPLETIONCODE 4
+|ELSE|
+  #SET #COMPLETIONCODE 0
+]

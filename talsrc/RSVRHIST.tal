@@ -1,0 +1,633 @@
+?SECTION RSVRHIST
+?PAGE "Reserve History Tracking Server — Workers' Compensation TPA"
+!---------------------------------------------------------------------
+! RSVRHIST — Reserve History Tracking Server
+!
+! Maintains full reserve transaction history for workers' compensation
+! claims. Tracks all categories (medical, indemnity TTD/TPD/PPD/PTD,
+! expense, legal, subrogation). Computes incurred values, collects
+! reserve development triangle data, and supports point-in-time
+! snapshots for actuarial analysis.
+!
+! Process: RSVRHIST
+! Pathway Server Class: RSHST-SVR
+! TMF Protected: Yes
+! Enscribe Files:
+!   RSVHCUR (key-seq) — Current reserve summary by claim
+!   RSVHIST (relative) — Full transaction history (append)
+!   RSVSNAP (key-seq) — Point-in-time snapshots
+!   RSVTRI  (key-seq) — Development triangle data
+!---------------------------------------------------------------------
+
+?NOLIST
+?SOURCE $SYSTEM.SYSTEM.EXTDECS0 (INITIALIZER, SERVERCLASS_SEND_,
+   FILE_OPEN_, FILE_READ64_, FILE_READLOCK64_, FILE_WRITE64_,
+   FILE_WRITEUPDATE64_, FILE_CLOSE_, FILE_GETINFO_,
+   PROCESS_GETINFO_, ABEND,
+   TMF_BEGINTRANSACTION_, TMF_ENDTRANSACTION_,
+   TMF_ABORTTRANSACTION_, TIMESTAMP, JULIANTIMESTAMP)
+?LIST
+
+LITERAL MAX^CATEGORIES     = 8;
+LITERAL CAT^MEDICAL        = 0;
+LITERAL CAT^TTD            = 1;
+LITERAL CAT^TPD            = 2;
+LITERAL CAT^PPD            = 3;
+LITERAL CAT^PTD            = 4;
+LITERAL CAT^EXPENSE        = 5;
+LITERAL CAT^LEGAL          = 6;
+LITERAL CAT^SUBROGATION    = 7;
+
+LITERAL MSG^ADD^TRANS       = 1;   ! Add a reserve transaction
+LITERAL MSG^GET^HISTORY     = 2;   ! Retrieve claim history
+LITERAL MSG^TAKE^SNAPSHOT   = 3;   ! Point-in-time snapshot
+LITERAL MSG^TRIANGLE^DATA   = 4;   ! Development triangle query
+LITERAL MSG^BULK^ADJUST     = 5;   ! Bulk reserve adjustment
+LITERAL MSG^INCURRED^CALC   = 6;   ! Incurred calculation
+
+LITERAL MAX^HISTORY^PER^CLM = 999; ! Max transactions per claim
+LITERAL MAX^DEV^PERIODS     = 12;  ! Development periods (months)
+LITERAL REASON^INITIAL      = 01;
+LITERAL REASON^REVIEW       = 02;
+LITERAL REASON^STAIRCASE    = 03;
+LITERAL REASON^PAYMENT      = 04;
+LITERAL REASON^RECOVERY     = 05;
+LITERAL REASON^CLOSURE      = 06;
+LITERAL REASON^REOPEN       = 07;
+LITERAL REASON^BULK^ADJ     = 08;
+LITERAL REASON^ACTUARIAL    = 09;
+
+DEFINE DOLLARS = FIXED(2);
+
+!---------------------------------------------------------------------
+! Reserve Transaction Record (history file — relative/append)
+!---------------------------------------------------------------------
+STRUCT RSV^TRANSACTION^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];
+    INT(32) TRANSACTION^DATE;            ! Julian date
+    INT(32) TRANSACTION^TIME;            ! Timestamp microseconds
+    INT     SEQUENCE^NUM;                ! Seq within claim
+    INT     CATEGORY;                    ! 0-7 per CAT^ literals
+    INT     REASON^CODE;
+    DOLLARS PRIOR^RESERVE;               ! Before this transaction
+    DOLLARS NEW^RESERVE;                 ! After this transaction
+    DOLLARS CHANGE^AMOUNT;               ! Delta
+    DOLLARS PAID^TO^DATE;                ! Cumulative paid at time of txn
+    DOLLARS INCURRED^AT^TXN;             ! Paid + Outstanding at time
+    STRING  REQUESTED^BY[0:7];
+    STRING  APPROVED^BY[0:7];
+    STRING  REASON^TEXT[0:39];
+    INT     APPROVAL^STATUS;             ! 0=auto, 1=manual, 2=pending
+  END;
+
+!---------------------------------------------------------------------
+! Current Reserve Summary (key-seq by claim + category)
+!---------------------------------------------------------------------
+STRUCT RSV^CURRENT^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];          ! Key part 1
+    INT     CATEGORY;                    ! Key part 2
+    DOLLARS CURRENT^RESERVE;             ! Outstanding reserve
+    DOLLARS INITIAL^RESERVE;             ! Original reserve set
+    DOLLARS HIGHEST^RESERVE;             ! High-water mark
+    DOLLARS TOTAL^PAID;                  ! Cumulative payments
+    DOLLARS TOTAL^RECOVERED;             ! Subrogation/SIF recovery
+    DOLLARS INCURRED;                    ! Paid + Outstanding - Recovery
+    INT     TRANSACTION^COUNT;
+    INT(32) LAST^CHANGE^DATE;
+    INT(32) INITIAL^SET^DATE;
+    STRING  LAST^CHANGED^BY[0:7];
+  END;
+
+!---------------------------------------------------------------------
+! Point-in-Time Snapshot (key-seq by claim + date + category)
+!---------------------------------------------------------------------
+STRUCT RSV^SNAPSHOT^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];          ! Key part 1
+    INT(32) SNAPSHOT^DATE;               ! Key part 2
+    INT     CATEGORY;                    ! Key part 3
+    DOLLARS RESERVE^AMOUNT;
+    DOLLARS PAID^AMOUNT;
+    DOLLARS INCURRED^AMOUNT;
+    STRING  SNAPSHOT^REASON[0:19];       ! "MONTHLY", "QUARTERLY", "ADHOC"
+  END;
+
+!---------------------------------------------------------------------
+! Development Triangle Record (key-seq by accident year + dev month)
+!---------------------------------------------------------------------
+STRUCT RSV^TRIANGLE^REC;
+  BEGIN
+    INT     ACCIDENT^YEAR;               ! Key part 1
+    INT     DEVELOPMENT^MONTH;           ! Key part 2 (0, 12, 24, ...)
+    INT     CATEGORY;                    ! Key part 3
+    INT     CLAIM^COUNT;
+    DOLLARS TOTAL^RESERVES;
+    DOLLARS TOTAL^PAID;
+    DOLLARS TOTAL^INCURRED;
+    DOLLARS AVG^RESERVE^PER^CLAIM;
+    DOLLARS AVG^INCURRED^PER^CLAIM;
+  END;
+
+!---------------------------------------------------------------------
+! Message structures
+!---------------------------------------------------------------------
+STRUCT ADD^TRANS^REQUEST;
+  BEGIN
+    INT     MSG^TYPE;                    ! = MSG^ADD^TRANS
+    STRING  CLAIM^NUMBER[0:11];
+    INT     CATEGORY;
+    INT     REASON^CODE;
+    DOLLARS NEW^RESERVE^AMOUNT;
+    DOLLARS PAYMENT^AMOUNT;              ! If reason=PAYMENT
+    STRING  REQUESTED^BY[0:7];
+    STRING  APPROVED^BY[0:7];
+    STRING  REASON^TEXT[0:39];
+    INT     APPROVAL^STATUS;
+  END;
+
+STRUCT HISTORY^REQUEST;
+  BEGIN
+    INT     MSG^TYPE;                    ! = MSG^GET^HISTORY
+    STRING  CLAIM^NUMBER[0:11];
+    INT     CATEGORY;                    ! -1 = all categories
+    INT     MAX^RECORDS;                 ! Max records to return
+  END;
+
+STRUCT SNAPSHOT^REQUEST;
+  BEGIN
+    INT     MSG^TYPE;                    ! = MSG^TAKE^SNAPSHOT
+    STRING  CLAIM^NUMBER[0:11];
+    STRING  SNAPSHOT^REASON[0:19];
+  END;
+
+STRUCT TRIANGLE^REQUEST;
+  BEGIN
+    INT     MSG^TYPE;                    ! = MSG^TRIANGLE^DATA
+    INT     ACCIDENT^YEAR;
+    INT     CATEGORY;
+  END;
+
+STRUCT BULK^ADJUST^REQUEST;
+  BEGIN
+    INT     MSG^TYPE;                    ! = MSG^BULK^ADJUST
+    INT     CATEGORY;                    ! Which reserve category
+    INT     REASON^CODE;
+    FIXED   ADJUSTMENT^FACTOR;           ! Multiply by this factor
+    DOLLARS MAX^ADJUSTMENT;              ! Cap per claim
+    STRING  ADJUSTED^BY[0:7];
+    STRING  REASON^TEXT[0:39];
+    INT     INJURY^TYPE^FILTER;          ! -1 = all
+    STRING  JURISDICTION^FILTER[0:1];    ! "  " = all
+  END;
+
+STRUCT INCURRED^RESPONSE;
+  BEGIN
+    INT     STATUS;
+    STRING  CLAIM^NUMBER[0:11];
+    DOLLARS TOTAL^PAID;
+    DOLLARS TOTAL^OUTSTANDING;
+    DOLLARS TOTAL^RECOVERED;
+    DOLLARS NET^INCURRED;                ! Paid + Outstanding - Recovery
+    DOLLARS RESERVES^BY^CAT[0:MAX^CATEGORIES - 1];
+    DOLLARS PAID^BY^CAT[0:MAX^CATEGORIES - 1];
+  END;
+
+STRUCT GENERAL^RESPONSE;
+  BEGIN
+    INT     STATUS;                      ! 0=OK, >0=error
+    INT     RECORDS^PROCESSED;
+    STRING  MESSAGE[0:59];
+  END;
+
+!---------------------------------------------------------------------
+! File numbers
+!---------------------------------------------------------------------
+INT     RSVHCUR^FNUM;       ! Current reserves (key-seq)
+INT     RSVHIST^FNUM;       ! Transaction history (relative)
+INT     RSVSNAP^FNUM;       ! Snapshots (key-seq)
+INT     RSVTRI^FNUM;        ! Triangle data (key-seq)
+INT     RECV^FNUM;           ! $RECEIVE
+
+!---------------------------------------------------------------------
+! Working storage
+!---------------------------------------------------------------------
+STRUCT  W^TRANS(RSV^TRANSACTION^REC);
+STRUCT  W^CURRENT(RSV^CURRENT^REC);
+STRUCT  W^SNAP(RSV^SNAPSHOT^REC);
+STRUCT  W^TRI(RSV^TRIANGLE^REC);
+INT(32) TODAY^JULIAN;
+INT(32) NOW^TIMESTAMP;
+INT     TMF^TAG;
+
+!=====================================================================
+! PROC ADD^RESERVE^TRANSACTION
+! Record a reserve change and update current summary.
+!=====================================================================
+PROC ADD^RESERVE^TRANSACTION(REQ);
+  STRUCT .REQ(ADD^TRANS^REQUEST);
+BEGIN
+  INT     BYTES^READ;
+  INT     FSTATUS;
+  DOLLARS PRIOR^AMOUNT;
+
+  ! Begin TMF
+  CALL TMF_BEGINTRANSACTION_(TMF^TAG);
+
+  ! Read current record for this claim+category (lock for update)
+  W^CURRENT.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+  W^CURRENT.CATEGORY := REQ.CATEGORY;
+
+  CALL FILE_READLOCK64_(RSVHCUR^FNUM, W^CURRENT, $LEN(W^CURRENT),
+                         BYTES^READ);
+  IF <> THEN
+  BEGIN
+    ! First transaction for this claim+category — initialize
+    W^CURRENT.CURRENT^RESERVE := 0.00F;
+    W^CURRENT.INITIAL^RESERVE := REQ.NEW^RESERVE^AMOUNT;
+    W^CURRENT.HIGHEST^RESERVE := 0.00F;
+    W^CURRENT.TOTAL^PAID := 0.00F;
+    W^CURRENT.TOTAL^RECOVERED := 0.00F;
+    W^CURRENT.INCURRED := 0.00F;
+    W^CURRENT.TRANSACTION^COUNT := 0;
+    W^CURRENT.INITIAL^SET^DATE := TODAY^JULIAN;
+    PRIOR^AMOUNT := 0.00F;
+  END
+  ELSE
+    PRIOR^AMOUNT := W^CURRENT.CURRENT^RESERVE;
+
+  ! Update current reserve summary
+  IF REQ.REASON^CODE = REASON^PAYMENT THEN
+  BEGIN
+    ! Payment reduces reserves and increases paid
+    W^CURRENT.TOTAL^PAID := W^CURRENT.TOTAL^PAID + REQ.PAYMENT^AMOUNT;
+    W^CURRENT.CURRENT^RESERVE := REQ.NEW^RESERVE^AMOUNT;
+  END
+  ELSE IF REQ.REASON^CODE = REASON^RECOVERY THEN
+  BEGIN
+    ! Recovery (subrogation) reduces incurred
+    W^CURRENT.TOTAL^RECOVERED := W^CURRENT.TOTAL^RECOVERED +
+                                  REQ.PAYMENT^AMOUNT;
+    W^CURRENT.CURRENT^RESERVE := REQ.NEW^RESERVE^AMOUNT;
+  END
+  ELSE
+    ! Standard reserve change
+    W^CURRENT.CURRENT^RESERVE := REQ.NEW^RESERVE^AMOUNT;
+
+  ! Track high-water mark
+  IF W^CURRENT.CURRENT^RESERVE > W^CURRENT.HIGHEST^RESERVE THEN
+    W^CURRENT.HIGHEST^RESERVE := W^CURRENT.CURRENT^RESERVE;
+
+  ! Recalculate incurred: Paid + Outstanding - Recovery
+  W^CURRENT.INCURRED := W^CURRENT.TOTAL^PAID +
+                         W^CURRENT.CURRENT^RESERVE -
+                         W^CURRENT.TOTAL^RECOVERED;
+
+  W^CURRENT.TRANSACTION^COUNT := W^CURRENT.TRANSACTION^COUNT + 1;
+  W^CURRENT.LAST^CHANGE^DATE := TODAY^JULIAN;
+  W^CURRENT.LAST^CHANGED^BY ':=' REQ.REQUESTED^BY FOR 8;
+
+  ! Write or update current record
+  IF W^CURRENT.TRANSACTION^COUNT = 1 THEN
+    CALL FILE_WRITE64_(RSVHCUR^FNUM, W^CURRENT, $LEN(W^CURRENT))
+  ELSE
+    CALL FILE_WRITEUPDATE64_(RSVHCUR^FNUM, W^CURRENT, $LEN(W^CURRENT));
+
+  IF <> THEN
+  BEGIN
+    CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+    RETURN;
+  END;
+
+  ! Write transaction history record
+  W^TRANS.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+  W^TRANS.TRANSACTION^DATE := TODAY^JULIAN;
+  W^TRANS.TRANSACTION^TIME := NOW^TIMESTAMP;
+  W^TRANS.SEQUENCE^NUM := W^CURRENT.TRANSACTION^COUNT;
+  W^TRANS.CATEGORY := REQ.CATEGORY;
+  W^TRANS.REASON^CODE := REQ.REASON^CODE;
+  W^TRANS.PRIOR^RESERVE := PRIOR^AMOUNT;
+  W^TRANS.NEW^RESERVE := REQ.NEW^RESERVE^AMOUNT;
+  W^TRANS.CHANGE^AMOUNT := REQ.NEW^RESERVE^AMOUNT - PRIOR^AMOUNT;
+  W^TRANS.PAID^TO^DATE := W^CURRENT.TOTAL^PAID;
+  W^TRANS.INCURRED^AT^TXN := W^CURRENT.INCURRED;
+  W^TRANS.REQUESTED^BY ':=' REQ.REQUESTED^BY FOR 8;
+  W^TRANS.APPROVED^BY ':=' REQ.APPROVED^BY FOR 8;
+  W^TRANS.REASON^TEXT ':=' REQ.REASON^TEXT FOR 40;
+  W^TRANS.APPROVAL^STATUS := REQ.APPROVAL^STATUS;
+
+  CALL FILE_WRITE64_(RSVHIST^FNUM, W^TRANS, $LEN(W^TRANS));
+  IF <> THEN
+  BEGIN
+    CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+    RETURN;
+  END;
+
+  CALL TMF_ENDTRANSACTION_(TMF^TAG);
+END;
+
+!=====================================================================
+! PROC TAKE^SNAPSHOT
+! Create a point-in-time snapshot of all reserve categories for a claim.
+!=====================================================================
+PROC TAKE^SNAPSHOT(REQ);
+  STRUCT .REQ(SNAPSHOT^REQUEST);
+BEGIN
+  INT     CAT;
+  INT     BYTES^READ;
+
+  FOR CAT := 0 TO MAX^CATEGORIES - 1 DO
+  BEGIN
+    ! Read current for each category
+    W^CURRENT.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+    W^CURRENT.CATEGORY := CAT;
+
+    CALL FILE_READ64_(RSVHCUR^FNUM, W^CURRENT, $LEN(W^CURRENT),
+                       BYTES^READ);
+    IF NOT <> THEN
+    BEGIN
+      ! Write snapshot record
+      W^SNAP.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+      W^SNAP.SNAPSHOT^DATE := TODAY^JULIAN;
+      W^SNAP.CATEGORY := CAT;
+      W^SNAP.RESERVE^AMOUNT := W^CURRENT.CURRENT^RESERVE;
+      W^SNAP.PAID^AMOUNT := W^CURRENT.TOTAL^PAID;
+      W^SNAP.INCURRED^AMOUNT := W^CURRENT.INCURRED;
+      W^SNAP.SNAPSHOT^REASON ':=' REQ.SNAPSHOT^REASON FOR 20;
+
+      CALL FILE_WRITE64_(RSVSNAP^FNUM, W^SNAP, $LEN(W^SNAP));
+    END;
+  END;
+END;
+
+!=====================================================================
+! PROC COLLECT^TRIANGLE^DATA
+! Aggregate reserve development triangle data for actuarial analysis.
+! Groups by accident year and development month.
+!=====================================================================
+PROC COLLECT^TRIANGLE^DATA(REQ, RESP);
+  STRUCT .REQ(TRIANGLE^REQUEST);
+  STRUCT .RESP(GENERAL^RESPONSE);
+BEGIN
+  INT     BYTES^READ;
+  INT     RECORDS^FOUND;
+
+  RECORDS^FOUND := 0;
+
+  ! Read triangle record for requested year + category
+  W^TRI.ACCIDENT^YEAR := REQ.ACCIDENT^YEAR;
+  W^TRI.DEVELOPMENT^MONTH := 0;
+  W^TRI.CATEGORY := REQ.CATEGORY;
+
+  CALL FILE_READ64_(RSVTRI^FNUM, W^TRI, $LEN(W^TRI), BYTES^READ);
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := 10;
+    RESP.MESSAGE ':=' "No triangle data for requested year/category      ";
+    RETURN;
+  END;
+
+  ! Scan through development periods
+  WHILE NOT <> AND
+        W^TRI.ACCIDENT^YEAR = REQ.ACCIDENT^YEAR AND
+        W^TRI.CATEGORY = REQ.CATEGORY DO
+  BEGIN
+    RECORDS^FOUND := RECORDS^FOUND + 1;
+
+    ! Calculate averages
+    IF W^TRI.CLAIM^COUNT > 0 THEN
+    BEGIN
+      W^TRI.AVG^RESERVE^PER^CLAIM := W^TRI.TOTAL^RESERVES /
+                                       $FIXED(W^TRI.CLAIM^COUNT);
+      W^TRI.AVG^INCURRED^PER^CLAIM := W^TRI.TOTAL^INCURRED /
+                                        $FIXED(W^TRI.CLAIM^COUNT);
+    END;
+
+    ! Read next development period
+    CALL FILE_READ64_(RSVTRI^FNUM, W^TRI, $LEN(W^TRI), BYTES^READ);
+  END;
+
+  RESP.STATUS := 0;
+  RESP.RECORDS^PROCESSED := RECORDS^FOUND;
+  RESP.MESSAGE ':=' "Triangle data retrieved successfully                ";
+END;
+
+!=====================================================================
+! PROC CALC^INCURRED
+! Calculate full incurred values across all categories for a claim.
+!=====================================================================
+PROC CALC^INCURRED(CLAIM^NUM, RESP);
+  STRING .CLAIM^NUM[0:11];
+  STRUCT .RESP(INCURRED^RESPONSE);
+BEGIN
+  INT     CAT;
+  INT     BYTES^READ;
+
+  RESP.STATUS := 0;
+  RESP.CLAIM^NUMBER ':=' CLAIM^NUM FOR 12;
+  RESP.TOTAL^PAID := 0.00F;
+  RESP.TOTAL^OUTSTANDING := 0.00F;
+  RESP.TOTAL^RECOVERED := 0.00F;
+  RESP.NET^INCURRED := 0.00F;
+
+  FOR CAT := 0 TO MAX^CATEGORIES - 1 DO
+  BEGIN
+    RESP.RESERVES^BY^CAT[CAT] := 0.00F;
+    RESP.PAID^BY^CAT[CAT] := 0.00F;
+
+    W^CURRENT.CLAIM^NUMBER ':=' CLAIM^NUM FOR 12;
+    W^CURRENT.CATEGORY := CAT;
+
+    CALL FILE_READ64_(RSVHCUR^FNUM, W^CURRENT, $LEN(W^CURRENT),
+                       BYTES^READ);
+    IF NOT <> THEN
+    BEGIN
+      RESP.RESERVES^BY^CAT[CAT] := W^CURRENT.CURRENT^RESERVE;
+      RESP.PAID^BY^CAT[CAT] := W^CURRENT.TOTAL^PAID;
+      RESP.TOTAL^PAID := RESP.TOTAL^PAID + W^CURRENT.TOTAL^PAID;
+      RESP.TOTAL^OUTSTANDING := RESP.TOTAL^OUTSTANDING +
+                                 W^CURRENT.CURRENT^RESERVE;
+      RESP.TOTAL^RECOVERED := RESP.TOTAL^RECOVERED +
+                                W^CURRENT.TOTAL^RECOVERED;
+    END;
+  END;
+
+  RESP.NET^INCURRED := RESP.TOTAL^PAID + RESP.TOTAL^OUTSTANDING -
+                        RESP.TOTAL^RECOVERED;
+END;
+
+!=====================================================================
+! PROC BULK^RESERVE^ADJUSTMENT
+! Apply a factor-based adjustment across multiple claims.
+! Used for actuarial reserve strengthening/weakening.
+!=====================================================================
+PROC BULK^RESERVE^ADJUSTMENT(REQ, RESP);
+  STRUCT .REQ(BULK^ADJUST^REQUEST);
+  STRUCT .RESP(GENERAL^RESPONSE);
+BEGIN
+  INT     BYTES^READ;
+  INT     ADJUSTED^COUNT;
+  DOLLARS OLD^RESERVE;
+  DOLLARS NEW^RESERVE;
+  DOLLARS ADJUSTMENT;
+  STRUCT  ADD^REQ(ADD^TRANS^REQUEST);
+
+  ADJUSTED^COUNT := 0;
+
+  ! Begin TMF for entire bulk operation
+  CALL TMF_BEGINTRANSACTION_(TMF^TAG);
+
+  ! Position to first record in current reserves for this category
+  W^CURRENT.CLAIM^NUMBER ':=' "            ";  ! Start of file
+  W^CURRENT.CATEGORY := REQ.CATEGORY;
+
+  CALL FILE_READ64_(RSVHCUR^FNUM, W^CURRENT, $LEN(W^CURRENT),
+                     BYTES^READ);
+
+  WHILE NOT <> DO
+  BEGIN
+    IF W^CURRENT.CATEGORY = REQ.CATEGORY AND
+       W^CURRENT.CURRENT^RESERVE > 0.00F THEN
+    BEGIN
+      OLD^RESERVE := W^CURRENT.CURRENT^RESERVE;
+      ADJUSTMENT := OLD^RESERVE * (REQ.ADJUSTMENT^FACTOR - 1.0F);
+
+      ! Cap adjustment per claim
+      IF ADJUSTMENT > REQ.MAX^ADJUSTMENT THEN
+        ADJUSTMENT := REQ.MAX^ADJUSTMENT
+      ELSE IF ADJUSTMENT < (0.00F - REQ.MAX^ADJUSTMENT) THEN
+        ADJUSTMENT := 0.00F - REQ.MAX^ADJUSTMENT;
+
+      NEW^RESERVE := OLD^RESERVE + ADJUSTMENT;
+      IF NEW^RESERVE < 0.00F THEN
+        NEW^RESERVE := 0.00F;
+
+      ! Build add-transaction request
+      ADD^REQ.MSG^TYPE := MSG^ADD^TRANS;
+      ADD^REQ.CLAIM^NUMBER ':=' W^CURRENT.CLAIM^NUMBER FOR 12;
+      ADD^REQ.CATEGORY := REQ.CATEGORY;
+      ADD^REQ.REASON^CODE := REASON^BULK^ADJ;
+      ADD^REQ.NEW^RESERVE^AMOUNT := NEW^RESERVE;
+      ADD^REQ.PAYMENT^AMOUNT := 0.00F;
+      ADD^REQ.REQUESTED^BY ':=' REQ.ADJUSTED^BY FOR 8;
+      ADD^REQ.APPROVED^BY ':=' REQ.ADJUSTED^BY FOR 8;
+      ADD^REQ.REASON^TEXT ':=' REQ.REASON^TEXT FOR 40;
+      ADD^REQ.APPROVAL^STATUS := 0;  ! Auto-approved for bulk
+
+      CALL ADD^RESERVE^TRANSACTION(ADD^REQ);
+      ADJUSTED^COUNT := ADJUSTED^COUNT + 1;
+    END;
+
+    ! Read next record
+    CALL FILE_READ64_(RSVHCUR^FNUM, W^CURRENT, $LEN(W^CURRENT),
+                       BYTES^READ);
+  END;
+
+  CALL TMF_ENDTRANSACTION_(TMF^TAG);
+
+  RESP.STATUS := 0;
+  RESP.RECORDS^PROCESSED := ADJUSTED^COUNT;
+  RESP.MESSAGE ':=' "Bulk adjustment completed                            ";
+END;
+
+!=====================================================================
+! PROC OPEN^FILES
+!=====================================================================
+PROC OPEN^FILES;
+BEGIN
+  CALL FILE_OPEN_("$DATA1.WCDATA.RSVHCUR", 22, RSVHCUR^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+
+  CALL FILE_OPEN_("$DATA1.WCDATA.RSVHIST", 22, RSVHIST^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+
+  CALL FILE_OPEN_("$DATA1.WCDATA.RSVSNAP", 22, RSVSNAP^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+
+  CALL FILE_OPEN_("$DATA1.WCDATA.RSVTRI", 22, RSVTRI^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+END;
+
+!=====================================================================
+! MAIN — Pathway server main loop
+!=====================================================================
+PROC RSVRHIST MAIN;
+BEGIN
+  STRING  MSG^BUF[0:511];
+  INT     MSG^LEN;
+  INT     MSG^TYPE;
+  STRUCT  RESP^BUF(GENERAL^RESPONSE);
+  STRUCT  INCR^RESP(INCURRED^RESPONSE);
+
+  CALL INITIALIZER;
+  CALL OPEN^FILES;
+
+  TODAY^JULIAN := JULIANTIMESTAMP / 86400D;
+  NOW^TIMESTAMP := JULIANTIMESTAMP;
+
+  CALL FILE_OPEN_("$RECEIVE", 1, RECV^FNUM);
+
+  WHILE 1 DO
+  BEGIN
+    CALL FILE_READ64_(RECV^FNUM, MSG^BUF, 512, MSG^LEN);
+    IF <> THEN
+    BEGIN
+      CALL FILE_CLOSE_(RSVHCUR^FNUM);
+      CALL FILE_CLOSE_(RSVHIST^FNUM);
+      CALL FILE_CLOSE_(RSVSNAP^FNUM);
+      CALL FILE_CLOSE_(RSVTRI^FNUM);
+      CALL FILE_CLOSE_(RECV^FNUM);
+      RETURN;
+    END;
+
+    MSG^TYPE := MSG^BUF[0] '<' 8 + MSG^BUF[1];
+
+    CASE MSG^TYPE OF
+    BEGIN
+      MSG^ADD^TRANS ->
+        BEGIN
+          CALL ADD^RESERVE^TRANSACTION(MSG^BUF);
+          RESP^BUF.STATUS := 0;
+          RESP^BUF.RECORDS^PROCESSED := 1;
+          RESP^BUF.MESSAGE ':=' "Transaction recorded                                ";
+          CALL SERVERCLASS_SEND_(RESP^BUF, $LEN(RESP^BUF));
+        END;
+
+      MSG^TAKE^SNAPSHOT ->
+        BEGIN
+          CALL TAKE^SNAPSHOT(MSG^BUF);
+          RESP^BUF.STATUS := 0;
+          RESP^BUF.RECORDS^PROCESSED := MAX^CATEGORIES;
+          RESP^BUF.MESSAGE ':=' "Snapshot created                                    ";
+          CALL SERVERCLASS_SEND_(RESP^BUF, $LEN(RESP^BUF));
+        END;
+
+      MSG^TRIANGLE^DATA ->
+        BEGIN
+          CALL COLLECT^TRIANGLE^DATA(MSG^BUF, RESP^BUF);
+          CALL SERVERCLASS_SEND_(RESP^BUF, $LEN(RESP^BUF));
+        END;
+
+      MSG^BULK^ADJUST ->
+        BEGIN
+          CALL BULK^RESERVE^ADJUSTMENT(MSG^BUF, RESP^BUF);
+          CALL SERVERCLASS_SEND_(RESP^BUF, $LEN(RESP^BUF));
+        END;
+
+      MSG^INCURRED^CALC ->
+        BEGIN
+          CALL CALC^INCURRED(MSG^BUF[2], INCR^RESP);
+          CALL SERVERCLASS_SEND_(INCR^RESP, $LEN(INCR^RESP));
+        END;
+
+      OTHERWISE ->
+        BEGIN
+          RESP^BUF.STATUS := 99;
+          RESP^BUF.RECORDS^PROCESSED := 0;
+          RESP^BUF.MESSAGE ':=' "Unknown message type                                ";
+          CALL SERVERCLASS_SEND_(RESP^BUF, $LEN(RESP^BUF));
+        END;
+    END;
+  END;
+END;

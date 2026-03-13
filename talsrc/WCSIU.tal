@@ -1,0 +1,666 @@
+!------------------------------------------------------------------!
+! PROGRAM:    WCSIU                                                !
+! AUTHOR:     MAINFRAMEMOD TPA SYSTEMS                             !
+! DATE:       2024-06-01                                           !
+! PURPOSE:    SIU (SPECIAL INVESTIGATIONS UNIT) FRAUD DETECTION    !
+!             RED FLAG SCORING, PATTERN DETECTION, NICB INDEX,     !
+!             INVESTIGATION CASE MANAGEMENT                        !
+! PLATFORM:   HPE NONSTOP / GUARDIAN                               !
+!------------------------------------------------------------------!
+! CHANGE LOG:                                                      !
+! 2024-06-01  INITIAL DEVELOPMENT                                  !
+! 2024-08-15  ADDED PROVIDER BILLING PATTERN ANALYSIS              !
+! 2024-10-20  ADDED CLAIM RING DETECTION                           !
+! 2024-12-10  ENHANCED SCORING ALGORITHM WITH WEIGHTED FACTORS     !
+!------------------------------------------------------------------!
+
+?SYMBOLS
+?INSPECT
+?NOCODE
+
+!------------------------------------------------------------------!
+! LITERAL AND CONSTANT DECLARATIONS                                !
+!------------------------------------------------------------------!
+LITERAL MAX^CLAIMS       = 5000;
+LITERAL MAX^PROVIDERS    = 2000;
+LITERAL MAX^RED^FLAGS    = 50;
+LITERAL MAX^WATCH^LIST   = 500;
+LITERAL MAX^RING^MEMBERS = 100;
+
+! Red flag category weights (out of 1000 total possible score)
+LITERAL WT^LATE^REPORTING     = 25;
+LITERAL WT^FRIDAY^INJURY      = 15;
+LITERAL WT^MONDAY^REPORT      = 15;
+LITERAL WT^NO^WITNESS         = 20;
+LITERAL WT^PRIOR^CLAIMS       = 30;
+LITERAL WT^ATTY^IMMEDIATE     = 35;
+LITERAL WT^PROVIDER^WATCHLIST = 50;
+LITERAL WT^EXCESSIVE^BILLING  = 40;
+LITERAL WT^UNBUNDLING         = 45;
+LITERAL WT^UPCODING           = 40;
+LITERAL WT^PHANTOM^BILLING    = 60;
+LITERAL WT^CLAIMANT^HISTORY   = 35;
+LITERAL WT^SURVEILLANCE^HIT   = 50;
+LITERAL WT^NICB^HIT           = 55;
+LITERAL WT^RING^DETECTED      = 65;
+
+! SIU referral thresholds
+LITERAL THRESHOLD^LOW         = 150;
+LITERAL THRESHOLD^MEDIUM      = 300;
+LITERAL THRESHOLD^HIGH        = 500;
+LITERAL THRESHOLD^CRITICAL    = 700;
+
+! Investigation status codes
+LITERAL STAT^NEW              = 0;
+LITERAL STAT^SCORING          = 1;
+LITERAL STAT^REFERRED         = 2;
+LITERAL STAT^INVESTIGATING    = 3;
+LITERAL STAT^CONFIRMED        = 4;
+LITERAL STAT^CLEARED          = 5;
+LITERAL STAT^CLOSED           = 6;
+
+!------------------------------------------------------------------!
+! STRUCTURE DEFINITIONS                                            !
+!------------------------------------------------------------------!
+STRUCT CLAIM^REC;
+  BEGIN
+    STRING  CLAIM^NUM[0:19];
+    STRING  CLAIMANT^SSN[0:8];
+    STRING  CLAIMANT^NAME[0:59];
+    STRING  PROVIDER^NPI[0:9];
+    STRING  PROVIDER^NAME[0:59];
+    STRING  EMPLOYER^FEIN[0:8];
+    STRING  INJURY^DATE[0:7];
+    STRING  REPORT^DATE[0:7];
+    STRING  INJURY^DOW;            ! Day of week 1-7 (1=Sun)
+    STRING  REPORT^DOW;
+    INT     WITNESS^COUNT;
+    INT     PRIOR^CLAIM^COUNT;
+    INT     DAYS^TO^REPORT;
+    INT     ATTY^RETAINED^DAYS;    ! Days after injury to attorney
+    FIXED   TOTAL^BILLED;
+    FIXED   TOTAL^PAID;
+    INT     SERVICE^LINE^COUNT;
+    STRING  JURISDICTION[0:1];
+    STRING  HAS^SURVEILLANCE;      ! Y/N
+    INT     SIU^SCORE;
+    INT     SIU^STATUS;
+  END;
+
+STRUCT PROVIDER^PROFILE;
+  BEGIN
+    STRING  NPI[0:9];
+    STRING  NAME[0:59];
+    INT     TOTAL^CLAIMS;
+    FIXED   AVG^BILL^AMT;
+    FIXED   TOTAL^BILLED;
+    INT     UNBUNDLE^COUNT;
+    INT     UPCODE^COUNT;
+    INT     PHANTOM^COUNT;
+    FIXED   DENIAL^RATE;            ! 0.00 to 1.00
+    INT     ON^WATCH^LIST;          ! 0=No, 1=Yes
+    INT     BILLING^ANOMALY^SCORE;
+  END;
+
+STRUCT RED^FLAG^ENTRY;
+  BEGIN
+    STRING  CLAIM^NUM[0:19];
+    INT     FLAG^CODE;
+    INT     FLAG^WEIGHT;
+    STRING  FLAG^DESC[0:79];
+    STRING  FLAG^DATE[0:7];
+  END;
+
+STRUCT WATCH^LIST^ENTRY;
+  BEGIN
+    STRING  ENTITY^ID[0:19];
+    INT     ENTITY^TYPE;            ! 1=Provider, 2=Claimant, 3=Attorney
+    STRING  ENTITY^NAME[0:59];
+    STRING  REASON[0:79];
+    STRING  DATE^ADDED[0:7];
+    INT     ACTIVE;                 ! 0=Inactive, 1=Active
+  END;
+
+STRUCT RING^MEMBER;
+  BEGIN
+    STRING  CLAIM^NUM[0:19];
+    STRING  CLAIMANT^SSN[0:8];
+    STRING  PROVIDER^NPI[0:9];
+    STRING  ACCIDENT^DATE[0:7];
+    STRING  ACCIDENT^LOC[0:59];
+    INT     LINKED^BY;             ! 1=Provider, 2=Location, 3=Date, 4=Combo
+  END;
+
+STRUCT INVESTIGATION^CASE;
+  BEGIN
+    STRING  CASE^NUM[0:11];
+    STRING  CLAIM^NUM[0:19];
+    INT     SCORE;
+    INT     STATUS;
+    STRING  ASSIGNED^TO[0:29];
+    STRING  OPEN^DATE[0:7];
+    STRING  CLOSE^DATE[0:7];
+    INT     RED^FLAG^COUNT;
+    FIXED   POTENTIAL^SAVINGS;
+    STRING  OUTCOME[0:1];          ! CF=Confirmed Fraud, CL=Cleared
+    STRING  REFERRAL^LEVEL[0:1];   ! L=Low, M=Medium, H=High, C=Critical
+  END;
+
+!------------------------------------------------------------------!
+! GLOBAL VARIABLES                                                 !
+!------------------------------------------------------------------!
+INT     G^CLAIM^COUNT;
+INT     G^PROVIDER^COUNT;
+INT     G^FLAG^COUNT;
+INT     G^WATCH^COUNT;
+INT     G^RING^COUNT;
+INT     G^CASES^OPENED;
+INT     G^CASES^REFERRED;
+INT     G^TOTAL^SCORED;
+FIXED   G^TOTAL^SAVINGS;
+
+STRUCT .CLAIMS(CLAIM^REC)[0:MAX^CLAIMS - 1];
+STRUCT .PROVIDERS(PROVIDER^PROFILE)[0:MAX^PROVIDERS - 1];
+STRUCT .RED^FLAGS(RED^FLAG^ENTRY)[0:MAX^RED^FLAGS - 1];
+STRUCT .WATCH^LIST(WATCH^LIST^ENTRY)[0:MAX^WATCH^LIST - 1];
+STRUCT .RING^MEMBERS(RING^MEMBER)[0:MAX^RING^MEMBERS - 1];
+
+STRING  CURRENT^DATE[0:7];
+INT     PROCESS^ERRORS;
+
+!------------------------------------------------------------------!
+! FILE NUMBERS                                                     !
+!------------------------------------------------------------------!
+INT     CLAIM^FILE^NUM;
+INT     PROVIDER^FILE^NUM;
+INT     WATCH^FILE^NUM;
+INT     CASE^FILE^NUM;
+INT     REPORT^FILE^NUM;
+INT     NICB^FILE^NUM;
+
+!------------------------------------------------------------------!
+! FORWARD PROCEDURE DECLARATIONS                                   !
+!------------------------------------------------------------------!
+PROC SCORE^CLAIM(CLAIM^IDX) FORWARD;
+  INT CLAIM^IDX;
+
+PROC CHECK^PROVIDER^PATTERNS(PROV^IDX) FORWARD;
+  INT PROV^IDX;
+
+PROC DETECT^CLAIM^RINGS FORWARD;
+
+PROC CHECK^NICB^INDEX(CLAIM^IDX) FORWARD;
+  INT CLAIM^IDX;
+
+!------------------------------------------------------------------!
+! MAIN PROCEDURE                                                   !
+!------------------------------------------------------------------!
+PROC SIU^MAIN MAIN;
+  BEGIN
+    INT STATUS;
+    INT I;
+
+    CALL INITIALIZE^PROCESSING(STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL FILE^WRITE(REPORT^FILE^NUM,
+          "WCSIU: FATAL - INITIALIZATION FAILED", 37);
+        CALL PROCESS^STOP;
+      END;
+
+    ! Phase 1: Load and score all claims
+    CALL LOAD^CLAIMS(STATUS);
+    IF STATUS = 0 THEN
+      BEGIN
+        FOR I := 0 TO G^CLAIM^COUNT - 1 DO
+          BEGIN
+            CALL SCORE^CLAIM(I);
+            G^TOTAL^SCORED := G^TOTAL^SCORED + 1;
+          END;
+      END;
+
+    ! Phase 2: Analyze provider billing patterns
+    CALL LOAD^PROVIDERS(STATUS);
+    IF STATUS = 0 THEN
+      BEGIN
+        FOR I := 0 TO G^PROVIDER^COUNT - 1 DO
+          CALL CHECK^PROVIDER^PATTERNS(I);
+      END;
+
+    ! Phase 3: Detect claim rings
+    CALL DETECT^CLAIM^RINGS;
+
+    ! Phase 4: Check NICB index for flagged claims
+    FOR I := 0 TO G^CLAIM^COUNT - 1 DO
+      BEGIN
+        IF CLAIMS[I].SIU^SCORE >= THRESHOLD^MEDIUM THEN
+          CALL CHECK^NICB^INDEX(I);
+      END;
+
+    ! Phase 5: Generate referrals for high-score claims
+    FOR I := 0 TO G^CLAIM^COUNT - 1 DO
+      BEGIN
+        IF CLAIMS[I].SIU^SCORE >= THRESHOLD^LOW THEN
+          CALL GENERATE^REFERRAL(I);
+      END;
+
+    CALL GENERATE^SIU^REPORT;
+    CALL FINALIZE^PROCESSING;
+  END;
+
+!------------------------------------------------------------------!
+! INITIALIZE PROCESSING                                            !
+!------------------------------------------------------------------!
+PROC INITIALIZE^PROCESSING(STATUS);
+  INT .STATUS;
+  BEGIN
+    INT ERROR;
+
+    STATUS := 0;
+    G^CLAIM^COUNT := 0;
+    G^PROVIDER^COUNT := 0;
+    G^FLAG^COUNT := 0;
+    G^WATCH^COUNT := 0;
+    G^RING^COUNT := 0;
+    G^CASES^OPENED := 0;
+    G^CASES^REFERRED := 0;
+    G^TOTAL^SCORED := 0;
+    G^TOTAL^SAVINGS := 0F;
+    PROCESS^ERRORS := 0;
+
+    CALL TIMESTAMP^TO^STRING(CURRENT^DATE);
+
+    ! Open claim analysis file
+    CALL FILE^OPEN("$DATA1.WCFILES.CLMANALY",
+                   CLAIM^FILE^NUM, ERROR);
+    IF ERROR <> 0 THEN STATUS := -1;
+
+    ! Open provider profile file
+    CALL FILE^OPEN("$DATA1.WCFILES.PROVPROF",
+                   PROVIDER^FILE^NUM, ERROR);
+    IF ERROR <> 0 THEN STATUS := -2;
+
+    ! Open watch list file
+    CALL FILE^OPEN("$DATA1.WCFILES.WATCHLST",
+                   WATCH^FILE^NUM, ERROR);
+    IF ERROR <> 0 THEN STATUS := -3;
+
+    ! Open case management file
+    CALL FILE^OPEN("$DATA1.WCFILES.SIUCASES",
+                   CASE^FILE^NUM, ERROR);
+    IF ERROR <> 0 THEN STATUS := -4;
+
+    ! Open report output file
+    CALL FILE^OPEN("$DATA1.WCFILES.SIURPT",
+                   REPORT^FILE^NUM, ERROR);
+    IF ERROR <> 0 THEN STATUS := -5;
+
+    ! Load watch list into memory
+    CALL LOAD^WATCH^LIST(ERROR);
+    IF ERROR <> 0 THEN STATUS := -6;
+  END;
+
+!------------------------------------------------------------------!
+! SCORE A SINGLE CLAIM FOR FRAUD INDICATORS                        !
+!------------------------------------------------------------------!
+PROC SCORE^CLAIM(CLAIM^IDX);
+  INT CLAIM^IDX;
+  BEGIN
+    INT SCORE;
+    INT FLAG^START;
+
+    SCORE := 0;
+    FLAG^START := G^FLAG^COUNT;
+
+    ! RF-01: Late reporting (>14 days from injury to report)
+    IF CLAIMS[CLAIM^IDX].DAYS^TO^REPORT > 14 THEN
+      BEGIN
+        SCORE := SCORE + WT^LATE^REPORTING;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 1, WT^LATE^REPORTING,
+          "LATE REPORTING - EXCEEDED 14 DAY THRESHOLD");
+      END;
+
+    ! RF-02: Friday injury (DOW = 6)
+    IF CLAIMS[CLAIM^IDX].INJURY^DOW = "6" THEN
+      BEGIN
+        SCORE := SCORE + WT^FRIDAY^INJURY;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 2, WT^FRIDAY^INJURY,
+          "FRIDAY INJURY - HIGHER FRAUD CORRELATION");
+      END;
+
+    ! RF-03: Monday reporting (DOW = 2)
+    IF CLAIMS[CLAIM^IDX].REPORT^DOW = "2" THEN
+      BEGIN
+        SCORE := SCORE + WT^MONDAY^REPORT;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 3, WT^MONDAY^REPORT,
+          "MONDAY REPORT - WEEKEND INCIDENT PATTERN");
+      END;
+
+    ! RF-04: No witnesses
+    IF CLAIMS[CLAIM^IDX].WITNESS^COUNT = 0 THEN
+      BEGIN
+        SCORE := SCORE + WT^NO^WITNESS;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 4, WT^NO^WITNESS,
+          "NO WITNESSES TO INJURY EVENT");
+      END;
+
+    ! RF-05: Multiple prior claims (>= 3 in 5 years)
+    IF CLAIMS[CLAIM^IDX].PRIOR^CLAIM^COUNT >= 3 THEN
+      BEGIN
+        SCORE := SCORE + WT^PRIOR^CLAIMS;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 5, WT^PRIOR^CLAIMS,
+          "EXCESSIVE PRIOR CLAIMS HISTORY");
+      END;
+
+    ! RF-06: Immediate attorney retention (<7 days)
+    IF CLAIMS[CLAIM^IDX].ATTY^RETAINED^DAYS >= 0
+       AND CLAIMS[CLAIM^IDX].ATTY^RETAINED^DAYS < 7 THEN
+      BEGIN
+        SCORE := SCORE + WT^ATTY^IMMEDIATE;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 6, WT^ATTY^IMMEDIATE,
+          "ATTORNEY RETAINED WITHIN 7 DAYS OF INJURY");
+      END;
+
+    ! RF-07: Provider on watch list
+    IF IS^ON^WATCH^LIST(CLAIMS[CLAIM^IDX].PROVIDER^NPI, 1) THEN
+      BEGIN
+        SCORE := SCORE + WT^PROVIDER^WATCHLIST;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 7, WT^PROVIDER^WATCHLIST,
+          "TREATING PROVIDER ON SIU WATCH LIST");
+      END;
+
+    ! RF-08: Claimant history flag
+    IF IS^ON^WATCH^LIST(CLAIMS[CLAIM^IDX].CLAIMANT^SSN, 2) THEN
+      BEGIN
+        SCORE := SCORE + WT^CLAIMANT^HISTORY;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 8, WT^CLAIMANT^HISTORY,
+          "CLAIMANT ON SIU WATCH LIST");
+      END;
+
+    ! RF-09: Surveillance activity indicator
+    IF CLAIMS[CLAIM^IDX].HAS^SURVEILLANCE = "Y" THEN
+      BEGIN
+        SCORE := SCORE + WT^SURVEILLANCE^HIT;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 9, WT^SURVEILLANCE^HIT,
+          "SURVEILLANCE ACTIVITY ON FILE");
+      END;
+
+    ! RF-10: Excessive billing relative to injury type
+    IF CLAIMS[CLAIM^IDX].TOTAL^BILLED > 0F THEN
+      BEGIN
+        IF CLAIMS[CLAIM^IDX].TOTAL^BILLED >
+           (CLAIMS[CLAIM^IDX].TOTAL^PAID * 3F) THEN
+          BEGIN
+            SCORE := SCORE + WT^EXCESSIVE^BILLING;
+            CALL ADD^RED^FLAG(CLAIM^IDX, 10, WT^EXCESSIVE^BILLING,
+              "BILLED AMOUNT EXCEEDS 3X PAID - EXCESSIVE");
+          END;
+      END;
+
+    CLAIMS[CLAIM^IDX].SIU^SCORE := SCORE;
+  END;
+
+!------------------------------------------------------------------!
+! ANALYZE PROVIDER BILLING PATTERNS                                !
+!------------------------------------------------------------------!
+PROC CHECK^PROVIDER^PATTERNS(PROV^IDX);
+  INT PROV^IDX;
+  BEGIN
+    INT ANOMALY^SCORE;
+    INT I;
+
+    ANOMALY^SCORE := 0;
+
+    ! Check for unbundling patterns
+    ! (Billing separate CPT codes that should be bundled)
+    IF PROVIDERS[PROV^IDX].UNBUNDLE^COUNT > 5 THEN
+      BEGIN
+        ANOMALY^SCORE := ANOMALY^SCORE + WT^UNBUNDLING;
+        ! Flag all claims from this provider
+        FOR I := 0 TO G^CLAIM^COUNT - 1 DO
+          BEGIN
+            IF CLAIMS[I].PROVIDER^NPI = PROVIDERS[PROV^IDX].NPI THEN
+              CALL ADD^RED^FLAG(I, 11, WT^UNBUNDLING,
+                "PROVIDER UNBUNDLING PATTERN DETECTED");
+          END;
+      END;
+
+    ! Check for upcoding (billing higher-level E&M codes)
+    IF PROVIDERS[PROV^IDX].UPCODE^COUNT > 3 THEN
+      BEGIN
+        ANOMALY^SCORE := ANOMALY^SCORE + WT^UPCODING;
+        FOR I := 0 TO G^CLAIM^COUNT - 1 DO
+          BEGIN
+            IF CLAIMS[I].PROVIDER^NPI = PROVIDERS[PROV^IDX].NPI THEN
+              CALL ADD^RED^FLAG(I, 12, WT^UPCODING,
+                "PROVIDER UPCODING PATTERN DETECTED");
+          END;
+      END;
+
+    ! Check for phantom billing
+    IF PROVIDERS[PROV^IDX].PHANTOM^COUNT > 0 THEN
+      BEGIN
+        ANOMALY^SCORE := ANOMALY^SCORE + WT^PHANTOM^BILLING;
+        FOR I := 0 TO G^CLAIM^COUNT - 1 DO
+          BEGIN
+            IF CLAIMS[I].PROVIDER^NPI = PROVIDERS[PROV^IDX].NPI THEN
+              CALL ADD^RED^FLAG(I, 13, WT^PHANTOM^BILLING,
+                "POSSIBLE PHANTOM BILLING - SERVICES NOT RENDERED");
+          END;
+      END;
+
+    ! Check high denial rate (>50% denied = suspicious)
+    IF PROVIDERS[PROV^IDX].DENIAL^RATE > 0.50F THEN
+      BEGIN
+        ANOMALY^SCORE := ANOMALY^SCORE + 20;
+      END;
+
+    PROVIDERS[PROV^IDX].BILLING^ANOMALY^SCORE := ANOMALY^SCORE;
+
+    ! Auto-add to watch list if anomaly score is high
+    IF ANOMALY^SCORE >= 80 AND
+       NOT IS^ON^WATCH^LIST(PROVIDERS[PROV^IDX].NPI, 1) THEN
+      BEGIN
+        CALL ADD^TO^WATCH^LIST(PROVIDERS[PROV^IDX].NPI, 1,
+          PROVIDERS[PROV^IDX].NAME,
+          "AUTO-ADDED: HIGH BILLING ANOMALY SCORE");
+      END;
+  END;
+
+!------------------------------------------------------------------!
+! DETECT CLAIM RINGS (RELATED SUSPICIOUS CLAIMS)                   !
+!------------------------------------------------------------------!
+PROC DETECT^CLAIM^RINGS;
+  BEGIN
+    INT I;
+    INT J;
+    INT MATCH^COUNT;
+
+    G^RING^COUNT := 0;
+
+    FOR I := 0 TO G^CLAIM^COUNT - 2 DO
+      BEGIN
+        FOR J := I + 1 TO G^CLAIM^COUNT - 1 DO
+          BEGIN
+            MATCH^COUNT := 0;
+
+            ! Same provider treating multiple claimants
+            ! from same accident date/location
+            IF CLAIMS[I].PROVIDER^NPI = CLAIMS[J].PROVIDER^NPI THEN
+              MATCH^COUNT := MATCH^COUNT + 1;
+
+            IF CLAIMS[I].INJURY^DATE = CLAIMS[J].INJURY^DATE THEN
+              MATCH^COUNT := MATCH^COUNT + 1;
+
+            IF CLAIMS[I].EMPLOYER^FEIN = CLAIMS[J].EMPLOYER^FEIN THEN
+              MATCH^COUNT := MATCH^COUNT + 1;
+
+            ! If 2+ matching criteria, flag as potential ring
+            IF MATCH^COUNT >= 2 THEN
+              BEGIN
+                IF G^RING^COUNT < MAX^RING^MEMBERS THEN
+                  BEGIN
+                    RING^MEMBERS[G^RING^COUNT].CLAIM^NUM :=
+                      CLAIMS[I].CLAIM^NUM;
+                    RING^MEMBERS[G^RING^COUNT].CLAIMANT^SSN :=
+                      CLAIMS[I].CLAIMANT^SSN;
+                    RING^MEMBERS[G^RING^COUNT].PROVIDER^NPI :=
+                      CLAIMS[I].PROVIDER^NPI;
+                    RING^MEMBERS[G^RING^COUNT].ACCIDENT^DATE :=
+                      CLAIMS[I].INJURY^DATE;
+                    IF MATCH^COUNT >= 3 THEN
+                      RING^MEMBERS[G^RING^COUNT].LINKED^BY := 4
+                    ELSE
+                      RING^MEMBERS[G^RING^COUNT].LINKED^BY := 1;
+                    G^RING^COUNT := G^RING^COUNT + 1;
+
+                    ! Add score to both claims
+                    CLAIMS[I].SIU^SCORE :=
+                      CLAIMS[I].SIU^SCORE + WT^RING^DETECTED;
+                    CLAIMS[J].SIU^SCORE :=
+                      CLAIMS[J].SIU^SCORE + WT^RING^DETECTED;
+
+                    CALL ADD^RED^FLAG(I, 15, WT^RING^DETECTED,
+                      "CLAIM RING DETECTED - LINKED CLAIMS");
+                    CALL ADD^RED^FLAG(J, 15, WT^RING^DETECTED,
+                      "CLAIM RING DETECTED - LINKED CLAIMS");
+                  END;
+              END;
+          END;
+      END;
+  END;
+
+!------------------------------------------------------------------!
+! CHECK NICB (NATIONAL INSURANCE CRIME BUREAU) INDEX               !
+!------------------------------------------------------------------!
+PROC CHECK^NICB^INDEX(CLAIM^IDX);
+  INT CLAIM^IDX;
+  BEGIN
+    INT STATUS;
+    INT NICB^HIT;
+
+    ! PATHSEND to NICB index lookup server
+    CALL PATHSEND^NICB^LOOKUP(
+      CLAIMS[CLAIM^IDX].CLAIMANT^SSN,
+      CLAIMS[CLAIM^IDX].CLAIMANT^NAME,
+      CLAIMS[CLAIM^IDX].INJURY^DATE,
+      NICB^HIT,
+      STATUS);
+
+    IF STATUS = 0 AND NICB^HIT = 1 THEN
+      BEGIN
+        CLAIMS[CLAIM^IDX].SIU^SCORE :=
+          CLAIMS[CLAIM^IDX].SIU^SCORE + WT^NICB^HIT;
+        CALL ADD^RED^FLAG(CLAIM^IDX, 14, WT^NICB^HIT,
+          "NICB INDEX HIT - PRIOR SUSPICIOUS ACTIVITY");
+      END;
+  END;
+
+!------------------------------------------------------------------!
+! GENERATE SIU REFERRAL                                            !
+!------------------------------------------------------------------!
+PROC GENERATE^REFERRAL(CLAIM^IDX);
+  INT CLAIM^IDX;
+  BEGIN
+    STRUCT .NEW^CASE(INVESTIGATION^CASE);
+    INT SCORE;
+
+    SCORE := CLAIMS[CLAIM^IDX].SIU^SCORE;
+    G^CASES^REFERRED := G^CASES^REFERRED + 1;
+
+    NEW^CASE.CLAIM^NUM := CLAIMS[CLAIM^IDX].CLAIM^NUM;
+    NEW^CASE.SCORE := SCORE;
+    NEW^CASE.STATUS := STAT^REFERRED;
+    NEW^CASE.OPEN^DATE ':=' CURRENT^DATE FOR 8 BYTES;
+
+    IF SCORE >= THRESHOLD^CRITICAL THEN
+      NEW^CASE.REFERRAL^LEVEL := "C"
+    ELSE IF SCORE >= THRESHOLD^HIGH THEN
+      NEW^CASE.REFERRAL^LEVEL := "H"
+    ELSE IF SCORE >= THRESHOLD^MEDIUM THEN
+      NEW^CASE.REFERRAL^LEVEL := "M"
+    ELSE
+      NEW^CASE.REFERRAL^LEVEL := "L";
+
+    NEW^CASE.POTENTIAL^SAVINGS := CLAIMS[CLAIM^IDX].TOTAL^BILLED;
+    G^TOTAL^SAVINGS := G^TOTAL^SAVINGS +
+      CLAIMS[CLAIM^IDX].TOTAL^BILLED;
+
+    CALL WRITE^CASE^RECORD(NEW^CASE);
+    G^CASES^OPENED := G^CASES^OPENED + 1;
+  END;
+
+!------------------------------------------------------------------!
+! HELPER: ADD RED FLAG ENTRY                                       !
+!------------------------------------------------------------------!
+PROC ADD^RED^FLAG(CLAIM^IDX, FLAG^CODE, FLAG^WEIGHT, DESC);
+  INT CLAIM^IDX;
+  INT FLAG^CODE;
+  INT FLAG^WEIGHT;
+  STRING .DESC;
+  BEGIN
+    IF G^FLAG^COUNT < MAX^RED^FLAGS THEN
+      BEGIN
+        RED^FLAGS[G^FLAG^COUNT].CLAIM^NUM :=
+          CLAIMS[CLAIM^IDX].CLAIM^NUM;
+        RED^FLAGS[G^FLAG^COUNT].FLAG^CODE := FLAG^CODE;
+        RED^FLAGS[G^FLAG^COUNT].FLAG^WEIGHT := FLAG^WEIGHT;
+        RED^FLAGS[G^FLAG^COUNT].FLAG^DESC ':=' DESC FOR 80 BYTES;
+        RED^FLAGS[G^FLAG^COUNT].FLAG^DATE ':='
+          CURRENT^DATE FOR 8 BYTES;
+        G^FLAG^COUNT := G^FLAG^COUNT + 1;
+      END;
+  END;
+
+!------------------------------------------------------------------!
+! HELPER: CHECK WATCH LIST                                         !
+!------------------------------------------------------------------!
+INT PROC IS^ON^WATCH^LIST(ENTITY^ID, ENTITY^TYPE);
+  STRING .ENTITY^ID;
+  INT ENTITY^TYPE;
+  BEGIN
+    INT I;
+    FOR I := 0 TO G^WATCH^COUNT - 1 DO
+      BEGIN
+        IF WATCH^LIST[I].ACTIVE = 1 AND
+           WATCH^LIST[I].ENTITY^TYPE = ENTITY^TYPE AND
+           WATCH^LIST[I].ENTITY^ID = ENTITY^ID THEN
+          RETURN 1;
+      END;
+    RETURN 0;
+  END;
+
+!------------------------------------------------------------------!
+! GENERATE SIU SUMMARY REPORT                                      !
+!------------------------------------------------------------------!
+PROC GENERATE^SIU^REPORT;
+  BEGIN
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "===== SIU FRAUD DETECTION SUMMARY REPORT =====", 47);
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "RUN DATE: " & CURRENT^DATE, 19);
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "CLAIMS SCORED:     " & G^TOTAL^SCORED, 30);
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "RED FLAGS RAISED:  " & G^FLAG^COUNT, 30);
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "RINGS DETECTED:    " & G^RING^COUNT, 30);
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "CASES REFERRED:    " & G^CASES^REFERRED, 30);
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "POTENTIAL SAVINGS: $" & G^TOTAL^SAVINGS, 30);
+    CALL FILE^WRITE(REPORT^FILE^NUM,
+      "================================================", 48);
+  END;
+
+!------------------------------------------------------------------!
+! FINALIZE PROCESSING                                              !
+!------------------------------------------------------------------!
+PROC FINALIZE^PROCESSING;
+  BEGIN
+    CALL FILE^CLOSE(CLAIM^FILE^NUM);
+    CALL FILE^CLOSE(PROVIDER^FILE^NUM);
+    CALL FILE^CLOSE(WATCH^FILE^NUM);
+    CALL FILE^CLOSE(CASE^FILE^NUM);
+    CALL FILE^CLOSE(REPORT^FILE^NUM);
+  END;

@@ -1,0 +1,702 @@
+?SECTION PMTAPPR
+?PAGE "Payment Approval Server — Workers' Compensation TPA"
+!---------------------------------------------------------------------
+! PMTAPPR — Payment Approval Server
+!
+! Validates and approves claim payments for workers' compensation.
+! Checks payment authority, medical bill review status, duplicate
+! payments, indemnity schedule validation, lien/garnishment holds,
+! Medicare conditional payment coordination, and 1099 tracking.
+!
+! Process: PMTAPPR
+! Pathway Server Class: PMTA-SVR
+! TMF Protected: Yes
+! Enscribe Files:
+!   PMTAUTH  (key-seq) — Payment authority by user
+!   PMTHIST  (key-seq) — Payment history by claim+provider+date
+!   LIENFILE (key-seq) — Liens and garnishments by claim
+!   PMTINDM  (key-seq) — Indemnity payment schedules
+!   PMT1099  (key-seq) — 1099 accumulations by payee TIN
+!   MBRFILE  (key-seq) — Medical bill review status
+!---------------------------------------------------------------------
+
+?NOLIST
+?SOURCE $SYSTEM.SYSTEM.EXTDECS0 (INITIALIZER, SERVERCLASS_SEND_,
+   FILE_OPEN_, FILE_READ64_, FILE_READLOCK64_, FILE_WRITE64_,
+   FILE_WRITEUPDATE64_, FILE_CLOSE_,
+   ABEND, TMF_BEGINTRANSACTION_, TMF_ENDTRANSACTION_,
+   TMF_ABORTTRANSACTION_, JULIANTIMESTAMP)
+?LIST
+
+LITERAL PMT^TYPE^MEDICAL     = 1;
+LITERAL PMT^TYPE^INDEMNITY   = 2;
+LITERAL PMT^TYPE^LEGAL       = 3;
+LITERAL PMT^TYPE^REHAB       = 4;
+LITERAL PMT^TYPE^EXPENSE     = 5;
+LITERAL PMT^TYPE^SETTLEMENT  = 6;
+
+LITERAL APPR^APPROVED        = 0;
+LITERAL APPR^DENIED          = 1;
+LITERAL APPR^PENDING         = 2;
+LITERAL APPR^HOLD^LIEN       = 3;
+LITERAL APPR^HOLD^MEDICARE   = 4;
+LITERAL APPR^HOLD^DUPLICATE  = 5;
+LITERAL APPR^HOLD^MBR        = 6;
+
+LITERAL LIEN^CHILD^SUPPORT   = 1;
+LITERAL LIEN^IRS             = 2;
+LITERAL LIEN^ATTY            = 3;
+LITERAL LIEN^HOSPITAL        = 4;
+LITERAL LIEN^MEDICARE        = 5;
+
+LITERAL MAX^DUPLICATE^DAYS   = 30;     ! Window for duplicate detection
+LITERAL IRS^1099^THRESHOLD   = 60000;  ! $600.00 in cents
+
+DEFINE DOLLARS = FIXED(2);
+
+!---------------------------------------------------------------------
+! Payment approval request
+!---------------------------------------------------------------------
+STRUCT PMT^APPROVAL^REQ;
+  BEGIN
+    INT     MSG^TYPE;
+    STRING  CLAIM^NUMBER[0:11];
+    STRING  PAYEE^TIN[0:8];              ! SSN or EIN (9 digits)
+    STRING  PAYEE^NAME[0:29];
+    STRING  PROVIDER^ID[0:9];
+    INT     PAYMENT^TYPE;                ! PMT^TYPE^ literal
+    DOLLARS PAYMENT^AMOUNT;
+    INT(32) SERVICE^DATE;                ! Date of service/period
+    INT(32) SERVICE^END^DATE;            ! End date for indemnity periods
+    STRING  INVOICE^NUMBER[0:14];
+    STRING  DIAGNOSIS^CODE[0:6];         ! ICD-10
+    STRING  PROCEDURE^CODE[0:4];         ! CPT code
+    STRING  REQUESTED^BY[0:7];
+    INT     RUSH^FLAG;                   ! 1 = expedite
+  END;
+
+!---------------------------------------------------------------------
+! Payment approval response
+!---------------------------------------------------------------------
+STRUCT PMT^APPROVAL^RESP;
+  BEGIN
+    INT     STATUS;                      ! APPR^ literal
+    STRING  CLAIM^NUMBER[0:11];
+    DOLLARS APPROVED^AMOUNT;             ! May differ from requested
+    DOLLARS LIEN^DEDUCTION;              ! Amount withheld for liens
+    DOLLARS NET^PAYMENT;                 ! Amount actually payable
+    STRING  APPROVAL^ID[0:9];            ! Unique approval reference
+    STRING  HOLD^REASON[0:59];
+    INT     REQUIRES^HIGHER^AUTH;        ! 1 = needs escalation
+    STRING  ESCALATE^TO[0:7];            ! User ID for escalation
+    INT     YTD^1099^FLAG;               ! 1 = over threshold, will get 1099
+  END;
+
+!---------------------------------------------------------------------
+! Payment authority record
+!---------------------------------------------------------------------
+STRUCT PMT^AUTH^REC;
+  BEGIN
+    STRING  USER^ID[0:7];                ! Key
+    INT     ROLE^LEVEL;                  ! 1=adj, 2=supv, 3=mgr, 4=vp
+    DOLLARS MEDICAL^LIMIT;
+    DOLLARS INDEMNITY^LIMIT;
+    DOLLARS LEGAL^LIMIT;
+    DOLLARS SETTLEMENT^LIMIT;
+    DOLLARS SINGLE^PMT^LIMIT;            ! Max single payment
+    INT     CAN^OVERRIDE^MBR;            ! 1 = can pay without MBR
+    INT     CAN^OVERRIDE^LIEN;           ! 1 = can release lien holds
+  END;
+
+!---------------------------------------------------------------------
+! Payment history record (for duplicate detection)
+!---------------------------------------------------------------------
+STRUCT PMT^HIST^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];          ! Key part 1
+    STRING  PROVIDER^ID[0:9];            ! Key part 2
+    INT(32) SERVICE^DATE;                ! Key part 3
+    INT(32) PAYMENT^DATE;
+    DOLLARS AMOUNT;
+    STRING  INVOICE^NUMBER[0:14];
+    STRING  PROCEDURE^CODE[0:4];
+    INT     PMT^STATUS;                  ! 0=paid, 1=voided
+  END;
+
+!---------------------------------------------------------------------
+! Lien record
+!---------------------------------------------------------------------
+STRUCT LIEN^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];          ! Key part 1
+    INT     LIEN^TYPE;                   ! Key part 2
+    INT     LIEN^SEQ;                    ! Key part 3
+    STRING  LIENHOLDER^NAME[0:29];
+    DOLLARS LIEN^AMOUNT;
+    DOLLARS SATISFIED^AMOUNT;
+    DOLLARS REMAINING^BALANCE;
+    INT     LIEN^STATUS;                 ! 0=active, 1=satisfied, 2=disputed
+    FIXED   DEDUCTION^PCT;              ! Percentage to withhold
+    INT(32) LIEN^DATE;
+    INT(32) EXPIRY^DATE;
+  END;
+
+!---------------------------------------------------------------------
+! Indemnity schedule record
+!---------------------------------------------------------------------
+STRUCT INDEMNITY^SCHED^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];          ! Key
+    INT     BENEFIT^TYPE;                ! 1=TTD, 2=TPD, 3=PPD, 4=PTD
+    DOLLARS WEEKLY^RATE;
+    DOLLARS COMP^RATE;                   ! Compensation rate (2/3 AWW)
+    INT(32) EFFECTIVE^DATE;
+    INT(32) END^DATE;                    ! 0 = ongoing
+    INT     WAITING^PERIOD^DAYS;         ! Usually 3-7 days
+    INT     RETROACTIVE^AFTER^DAYS;      ! Usually 14-21 days
+    DOLLARS MAX^WEEKLY;                  ! Statutory maximum
+    INT     PAYMENT^FREQUENCY;           ! 1=weekly, 2=biweekly
+  END;
+
+!---------------------------------------------------------------------
+! 1099 accumulation record
+!---------------------------------------------------------------------
+STRUCT TIN^1099^REC;
+  BEGIN
+    STRING  PAYEE^TIN[0:8];             ! Key part 1
+    INT     TAX^YEAR;                    ! Key part 2
+    STRING  PAYEE^NAME[0:29];
+    DOLLARS TOTAL^MEDICAL;
+    DOLLARS TOTAL^LEGAL;
+    DOLLARS TOTAL^RENT;
+    DOLLARS TOTAL^OTHER;
+    DOLLARS GRAND^TOTAL;
+    INT     FORM^TYPE;                   ! 0=none, 1=1099-MISC, 2=1099-NEC
+    INT     REPORTED^FLAG;               ! 1 = already filed with IRS
+  END;
+
+!---------------------------------------------------------------------
+! Medical bill review record
+!---------------------------------------------------------------------
+STRUCT MBR^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];          ! Key part 1
+    STRING  INVOICE^NUMBER[0:14];        ! Key part 2
+    INT     REVIEW^STATUS;               ! 0=pending, 1=approved, 2=reduced, 3=denied
+    DOLLARS BILLED^AMOUNT;
+    DOLLARS ALLOWED^AMOUNT;
+    DOLLARS FEE^SCHEDULE^AMOUNT;
+    STRING  REVIEW^NOTES[0:59];
+  END;
+
+!---------------------------------------------------------------------
+! File numbers
+!---------------------------------------------------------------------
+INT PMTAUTH^FNUM;
+INT PMTHIST^FNUM;
+INT LIEN^FNUM;
+INT PMTINDM^FNUM;
+INT PMT1099^FNUM;
+INT MBR^FNUM;
+INT RECV^FNUM;
+
+!---------------------------------------------------------------------
+! Working storage
+!---------------------------------------------------------------------
+STRUCT W^AUTH(PMT^AUTH^REC);
+STRUCT W^HIST(PMT^HIST^REC);
+STRUCT W^LIEN(LIEN^REC);
+STRUCT W^INDM(INDEMNITY^SCHED^REC);
+STRUCT W^1099(TIN^1099^REC);
+STRUCT W^MBR(MBR^REC);
+INT(32) TODAY^JULIAN;
+INT     TMF^TAG;
+INT     APPROVAL^SEQ;                   ! Running sequence for approval IDs
+
+!=====================================================================
+! PROC CHECK^PAYMENT^AUTHORITY
+! Verify requestor has sufficient authority for this payment.
+!=====================================================================
+INT PROC CHECK^PAYMENT^AUTHORITY(REQ, AUTH^REC);
+  STRUCT .REQ(PMT^APPROVAL^REQ);
+  STRUCT .AUTH^REC(PMT^AUTH^REC);
+BEGIN
+  DOLLARS LIMIT;
+
+  ! Determine applicable limit by payment type
+  CASE REQ.PAYMENT^TYPE OF
+  BEGIN
+    PMT^TYPE^MEDICAL   -> LIMIT := AUTH^REC.MEDICAL^LIMIT;
+    PMT^TYPE^INDEMNITY -> LIMIT := AUTH^REC.INDEMNITY^LIMIT;
+    PMT^TYPE^LEGAL     -> LIMIT := AUTH^REC.LEGAL^LIMIT;
+    PMT^TYPE^SETTLEMENT -> LIMIT := AUTH^REC.SETTLEMENT^LIMIT;
+    OTHERWISE          -> LIMIT := AUTH^REC.SINGLE^PMT^LIMIT;
+  END;
+
+  ! Check both type-specific and single-payment limits
+  IF REQ.PAYMENT^AMOUNT <= LIMIT AND
+     REQ.PAYMENT^AMOUNT <= AUTH^REC.SINGLE^PMT^LIMIT THEN
+    RETURN 1   ! Authorized
+  ELSE
+    RETURN 0;  ! Not authorized
+END;
+
+!=====================================================================
+! PROC CHECK^DUPLICATE^PAYMENT
+! Detect potential duplicate payments within the duplicate window.
+!=====================================================================
+INT PROC CHECK^DUPLICATE^PAYMENT(REQ);
+  STRUCT .REQ(PMT^APPROVAL^REQ);
+BEGIN
+  INT BYTES^READ;
+
+  ! Position to claim + provider + service date
+  W^HIST.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+  W^HIST.PROVIDER^ID ':=' REQ.PROVIDER^ID FOR 10;
+  W^HIST.SERVICE^DATE := REQ.SERVICE^DATE;
+
+  CALL FILE_READ64_(PMTHIST^FNUM, W^HIST, $LEN(W^HIST), BYTES^READ);
+
+  ! Scan for matches within the duplicate window
+  WHILE NOT <> AND
+        W^HIST.CLAIM^NUMBER = REQ.CLAIM^NUMBER AND
+        W^HIST.PROVIDER^ID = REQ.PROVIDER^ID DO
+  BEGIN
+    ! Same service date, same amount, not voided
+    IF W^HIST.SERVICE^DATE = REQ.SERVICE^DATE AND
+       W^HIST.AMOUNT = REQ.PAYMENT^AMOUNT AND
+       W^HIST.PMT^STATUS = 0 THEN
+    BEGIN
+      ! Check if same procedure code
+      IF W^HIST.PROCEDURE^CODE = REQ.PROCEDURE^CODE THEN
+        RETURN 1;  ! Exact duplicate found
+    END;
+
+    ! Also check for same invoice number
+    IF W^HIST.INVOICE^NUMBER = REQ.INVOICE^NUMBER AND
+       W^HIST.PMT^STATUS = 0 THEN
+      RETURN 1;  ! Duplicate invoice
+
+    CALL FILE_READ64_(PMTHIST^FNUM, W^HIST, $LEN(W^HIST), BYTES^READ);
+  END;
+
+  RETURN 0;  ! No duplicate found
+END;
+
+!=====================================================================
+! PROC CHECK^MEDICAL^BILL^REVIEW
+! Verify medical bill has been reviewed before payment.
+!=====================================================================
+INT PROC CHECK^MEDICAL^BILL^REVIEW(REQ, ALLOWED^AMT);
+  STRUCT .REQ(PMT^APPROVAL^REQ);
+  DOLLARS .ALLOWED^AMT;
+BEGIN
+  INT BYTES^READ;
+
+  W^MBR.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+  W^MBR.INVOICE^NUMBER ':=' REQ.INVOICE^NUMBER FOR 15;
+
+  CALL FILE_READ64_(MBR^FNUM, W^MBR, $LEN(W^MBR), BYTES^READ);
+  IF <> THEN
+    RETURN 0;  ! No MBR record — bill not reviewed
+
+  IF W^MBR.REVIEW^STATUS = 1 THEN  ! Approved
+  BEGIN
+    ALLOWED^AMT := W^MBR.ALLOWED^AMOUNT;
+    RETURN 1;
+  END
+  ELSE IF W^MBR.REVIEW^STATUS = 2 THEN  ! Reduced
+  BEGIN
+    ALLOWED^AMT := W^MBR.ALLOWED^AMOUNT;  ! Pay reduced amount
+    RETURN 2;
+  END
+  ELSE IF W^MBR.REVIEW^STATUS = 3 THEN  ! Denied
+    RETURN 3
+  ELSE
+    RETURN 0;  ! Still pending
+END;
+
+!=====================================================================
+! PROC CHECK^INDEMNITY^SCHEDULE
+! Validate indemnity payment against benefit schedule.
+!=====================================================================
+INT PROC CHECK^INDEMNITY^SCHEDULE(REQ);
+  STRUCT .REQ(PMT^APPROVAL^REQ);
+BEGIN
+  INT     BYTES^READ;
+  INT     DAYS^IN^PERIOD;
+  DOLLARS EXPECTED^AMOUNT;
+
+  W^INDM.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+
+  CALL FILE_READ64_(PMTINDM^FNUM, W^INDM, $LEN(W^INDM), BYTES^READ);
+  IF <> THEN
+    RETURN 0;  ! No schedule found
+
+  ! Verify payment is within schedule dates
+  IF REQ.SERVICE^DATE < W^INDM.EFFECTIVE^DATE THEN
+    RETURN 2;  ! Before effective date
+
+  IF W^INDM.END^DATE > 0 AND REQ.SERVICE^END^DATE > W^INDM.END^DATE THEN
+    RETURN 3;  ! After end date
+
+  ! Calculate expected payment for the period
+  DAYS^IN^PERIOD := REQ.SERVICE^END^DATE - REQ.SERVICE^DATE;
+  IF DAYS^IN^PERIOD <= 0 THEN
+    DAYS^IN^PERIOD := 7;  ! Default to weekly
+
+  EXPECTED^AMOUNT := W^INDM.WEEKLY^RATE *
+                     ($FIXED(DAYS^IN^PERIOD) / 7.0F);
+
+  ! Cap at statutory maximum
+  IF EXPECTED^AMOUNT > (W^INDM.MAX^WEEKLY *
+                        ($FIXED(DAYS^IN^PERIOD) / 7.0F)) THEN
+    EXPECTED^AMOUNT := W^INDM.MAX^WEEKLY *
+                       ($FIXED(DAYS^IN^PERIOD) / 7.0F);
+
+  ! Allow 1% tolerance for rounding
+  IF REQ.PAYMENT^AMOUNT > (EXPECTED^AMOUNT * 1.01F) THEN
+    RETURN 4;  ! Over expected amount
+
+  RETURN 1;  ! Valid
+END;
+
+!=====================================================================
+! PROC CHECK^LIENS
+! Check for liens and calculate deductions.
+!=====================================================================
+PROC CHECK^LIENS(CLAIM^NUM, GROSS^AMT, PMT^TYPE, DEDUCTION, HAS^LIEN);
+  STRING .CLAIM^NUM[0:11];
+  DOLLARS GROSS^AMT;
+  INT     PMT^TYPE;
+  DOLLARS .DEDUCTION;
+  INT     .HAS^LIEN;
+BEGIN
+  INT     BYTES^READ;
+  DOLLARS TOTAL^DEDUCT;
+
+  TOTAL^DEDUCT := 0.00F;
+  HAS^LIEN := 0;
+
+  W^LIEN.CLAIM^NUMBER ':=' CLAIM^NUM FOR 12;
+  W^LIEN.LIEN^TYPE := 0;
+  W^LIEN.LIEN^SEQ := 0;
+
+  CALL FILE_READ64_(LIEN^FNUM, W^LIEN, $LEN(W^LIEN), BYTES^READ);
+
+  WHILE NOT <> AND W^LIEN.CLAIM^NUMBER = CLAIM^NUM DO
+  BEGIN
+    IF W^LIEN.LIEN^STATUS = 0 AND      ! Active lien
+       W^LIEN.REMAINING^BALANCE > 0.00F THEN
+    BEGIN
+      HAS^LIEN := 1;
+
+      ! Child support liens apply to indemnity only
+      IF W^LIEN.LIEN^TYPE = LIEN^CHILD^SUPPORT AND
+         PMT^TYPE = PMT^TYPE^INDEMNITY THEN
+      BEGIN
+        TOTAL^DEDUCT := TOTAL^DEDUCT +
+                        (GROSS^AMT * W^LIEN.DEDUCTION^PCT);
+      END;
+
+      ! IRS liens apply to all payment types
+      IF W^LIEN.LIEN^TYPE = LIEN^IRS THEN
+        TOTAL^DEDUCT := TOTAL^DEDUCT +
+                        (GROSS^AMT * W^LIEN.DEDUCTION^PCT);
+
+      ! Attorney liens apply to settlements
+      IF W^LIEN.LIEN^TYPE = LIEN^ATTY AND
+         PMT^TYPE = PMT^TYPE^SETTLEMENT THEN
+        TOTAL^DEDUCT := TOTAL^DEDUCT +
+                        (GROSS^AMT * W^LIEN.DEDUCTION^PCT);
+
+      ! Medicare conditional payment lien
+      IF W^LIEN.LIEN^TYPE = LIEN^MEDICARE THEN
+      BEGIN
+        IF TOTAL^DEDUCT + W^LIEN.REMAINING^BALANCE > GROSS^AMT THEN
+          TOTAL^DEDUCT := GROSS^AMT  ! Cannot exceed payment
+        ELSE
+          TOTAL^DEDUCT := TOTAL^DEDUCT + W^LIEN.REMAINING^BALANCE;
+      END;
+    END;
+
+    CALL FILE_READ64_(LIEN^FNUM, W^LIEN, $LEN(W^LIEN), BYTES^READ);
+  END;
+
+  ! Ensure deduction doesn't exceed gross
+  IF TOTAL^DEDUCT > GROSS^AMT THEN
+    TOTAL^DEDUCT := GROSS^AMT;
+
+  DEDUCTION := TOTAL^DEDUCT;
+END;
+
+!=====================================================================
+! PROC UPDATE^1099^TRACKING
+! Accumulate payment for 1099 reporting and return threshold status.
+!=====================================================================
+INT PROC UPDATE^1099^TRACKING(REQ);
+  STRUCT .REQ(PMT^APPROVAL^REQ);
+BEGIN
+  INT     BYTES^READ;
+  INT     TAX^YEAR;
+
+  TAX^YEAR := TODAY^JULIAN / 365 + 1900;  ! Approximate year
+
+  W^1099.PAYEE^TIN ':=' REQ.PAYEE^TIN FOR 9;
+  W^1099.TAX^YEAR := TAX^YEAR;
+
+  CALL FILE_READLOCK64_(PMT1099^FNUM, W^1099, $LEN(W^1099), BYTES^READ);
+
+  IF <> THEN
+  BEGIN
+    ! New payee — initialize
+    W^1099.PAYEE^NAME ':=' REQ.PAYEE^NAME FOR 30;
+    W^1099.TOTAL^MEDICAL := 0.00F;
+    W^1099.TOTAL^LEGAL := 0.00F;
+    W^1099.TOTAL^RENT := 0.00F;
+    W^1099.TOTAL^OTHER := 0.00F;
+    W^1099.GRAND^TOTAL := 0.00F;
+    W^1099.FORM^TYPE := 0;
+    W^1099.REPORTED^FLAG := 0;
+  END;
+
+  ! Accumulate by payment type
+  CASE REQ.PAYMENT^TYPE OF
+  BEGIN
+    PMT^TYPE^MEDICAL ->
+      W^1099.TOTAL^MEDICAL := W^1099.TOTAL^MEDICAL + REQ.PAYMENT^AMOUNT;
+    PMT^TYPE^LEGAL ->
+      W^1099.TOTAL^LEGAL := W^1099.TOTAL^LEGAL + REQ.PAYMENT^AMOUNT;
+    OTHERWISE ->
+      W^1099.TOTAL^OTHER := W^1099.TOTAL^OTHER + REQ.PAYMENT^AMOUNT;
+  END;
+
+  W^1099.GRAND^TOTAL := W^1099.TOTAL^MEDICAL + W^1099.TOTAL^LEGAL +
+                         W^1099.TOTAL^RENT + W^1099.TOTAL^OTHER;
+
+  ! Determine 1099 form type
+  IF W^1099.TOTAL^LEGAL >= 600.00F THEN
+    W^1099.FORM^TYPE := 2   ! 1099-NEC for attorney fees
+  ELSE IF W^1099.TOTAL^MEDICAL >= 600.00F THEN
+    W^1099.FORM^TYPE := 1;  ! 1099-MISC for medical
+
+  ! Write back
+  IF BYTES^READ > 0 THEN
+    CALL FILE_WRITEUPDATE64_(PMT1099^FNUM, W^1099, $LEN(W^1099))
+  ELSE
+    CALL FILE_WRITE64_(PMT1099^FNUM, W^1099, $LEN(W^1099));
+
+  ! Return 1 if over threshold
+  IF W^1099.GRAND^TOTAL >= 600.00F THEN
+    RETURN 1
+  ELSE
+    RETURN 0;
+END;
+
+!=====================================================================
+! PROC PROCESS^PAYMENT^APPROVAL — Main request handler
+!=====================================================================
+PROC PROCESS^PAYMENT^APPROVAL(REQ, RESP);
+  STRUCT .REQ(PMT^APPROVAL^REQ);
+  STRUCT .RESP(PMT^APPROVAL^RESP);
+BEGIN
+  INT     BYTES^READ;
+  INT     AUTH^OK;
+  INT     DUP^FOUND;
+  INT     MBR^STATUS;
+  INT     SCHED^STATUS;
+  INT     HAS^LIEN;
+  INT     OVER^1099;
+  DOLLARS ALLOWED^AMT;
+  DOLLARS LIEN^DEDUCT;
+  STRING  APPR^SEQ^STR[0:9];
+
+  ! Initialize response
+  RESP.STATUS := APPR^APPROVED;
+  RESP.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+  RESP.APPROVED^AMOUNT := REQ.PAYMENT^AMOUNT;
+  RESP.LIEN^DEDUCTION := 0.00F;
+  RESP.REQUIRES^HIGHER^AUTH := 0;
+  RESP.HOLD^REASON ':='
+    "                                                            ";
+
+  CALL TMF_BEGINTRANSACTION_(TMF^TAG);
+
+  ! Step 1: Check payment authority
+  W^AUTH.USER^ID ':=' REQ.REQUESTED^BY FOR 8;
+  CALL FILE_READ64_(PMTAUTH^FNUM, W^AUTH, $LEN(W^AUTH), BYTES^READ);
+  IF <> THEN
+  BEGIN
+    RESP.STATUS := APPR^DENIED;
+    RESP.HOLD^REASON ':='
+      "User not found in payment authority table                 ";
+    CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+    RETURN;
+  END;
+
+  AUTH^OK := CHECK^PAYMENT^AUTHORITY(REQ, W^AUTH);
+  IF AUTH^OK = 0 THEN
+  BEGIN
+    RESP.STATUS := APPR^PENDING;
+    RESP.REQUIRES^HIGHER^AUTH := 1;
+    RESP.HOLD^REASON ':='
+      "Payment exceeds authority limit — escalation required     ";
+    CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+    RETURN;
+  END;
+
+  ! Step 2: Duplicate detection
+  DUP^FOUND := CHECK^DUPLICATE^PAYMENT(REQ);
+  IF DUP^FOUND = 1 THEN
+  BEGIN
+    RESP.STATUS := APPR^HOLD^DUPLICATE;
+    RESP.HOLD^REASON ':='
+      "Potential duplicate: same provider/date/amount found      ";
+    CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+    RETURN;
+  END;
+
+  ! Step 3: Medical bill review check (medical payments only)
+  IF REQ.PAYMENT^TYPE = PMT^TYPE^MEDICAL THEN
+  BEGIN
+    MBR^STATUS := CHECK^MEDICAL^BILL^REVIEW(REQ, ALLOWED^AMT);
+    IF MBR^STATUS = 0 THEN
+    BEGIN
+      IF W^AUTH.CAN^OVERRIDE^MBR = 0 THEN
+      BEGIN
+        RESP.STATUS := APPR^HOLD^MBR;
+        RESP.HOLD^REASON ':='
+          "Medical bill review pending — payment held             ";
+        CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+        RETURN;
+      END;
+    END
+    ELSE IF MBR^STATUS = 2 THEN
+      ! Reduced — pay allowed amount instead
+      RESP.APPROVED^AMOUNT := ALLOWED^AMT
+    ELSE IF MBR^STATUS = 3 THEN
+    BEGIN
+      RESP.STATUS := APPR^DENIED;
+      RESP.HOLD^REASON ':='
+        "Medical bill denied by bill review                      ";
+      CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+      RETURN;
+    END;
+  END;
+
+  ! Step 4: Indemnity schedule validation
+  IF REQ.PAYMENT^TYPE = PMT^TYPE^INDEMNITY THEN
+  BEGIN
+    SCHED^STATUS := CHECK^INDEMNITY^SCHEDULE(REQ);
+    IF SCHED^STATUS = 0 THEN
+    BEGIN
+      RESP.STATUS := APPR^DENIED;
+      RESP.HOLD^REASON ':='
+        "No indemnity schedule found for this claim              ";
+      CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+      RETURN;
+    END
+    ELSE IF SCHED^STATUS >= 2 THEN
+    BEGIN
+      RESP.STATUS := APPR^DENIED;
+      RESP.HOLD^REASON ':='
+        "Payment outside indemnity schedule dates or amount      ";
+      CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+      RETURN;
+    END;
+  END;
+
+  ! Step 5: Lien/garnishment check
+  CALL CHECK^LIENS(REQ.CLAIM^NUMBER, RESP.APPROVED^AMOUNT,
+                    REQ.PAYMENT^TYPE, LIEN^DEDUCT, HAS^LIEN);
+  RESP.LIEN^DEDUCTION := LIEN^DEDUCT;
+  RESP.NET^PAYMENT := RESP.APPROVED^AMOUNT - LIEN^DEDUCT;
+
+  IF HAS^LIEN = 1 AND W^AUTH.CAN^OVERRIDE^LIEN = 0 AND
+     LIEN^DEDUCT > 0.00F THEN
+  BEGIN
+    RESP.STATUS := APPR^HOLD^LIEN;
+    RESP.HOLD^REASON ':='
+      "Lien deduction applied — review required                  ";
+  END;
+
+  ! Step 6: 1099 tracking
+  OVER^1099 := UPDATE^1099^TRACKING(REQ);
+  RESP.YTD^1099^FLAG := OVER^1099;
+
+  ! Generate approval ID
+  APPROVAL^SEQ := APPROVAL^SEQ + 1;
+  ! Format: APRnnnnnn
+  RESP.APPROVAL^ID ':=' "APR       ";
+  RESP.APPROVAL^ID[3] := $DBL(APPROVAL^SEQ) '<<' 16 '>>' 16;
+
+  ! Record in payment history
+  W^HIST.CLAIM^NUMBER ':=' REQ.CLAIM^NUMBER FOR 12;
+  W^HIST.PROVIDER^ID ':=' REQ.PROVIDER^ID FOR 10;
+  W^HIST.SERVICE^DATE := REQ.SERVICE^DATE;
+  W^HIST.PAYMENT^DATE := TODAY^JULIAN;
+  W^HIST.AMOUNT := RESP.APPROVED^AMOUNT;
+  W^HIST.INVOICE^NUMBER ':=' REQ.INVOICE^NUMBER FOR 15;
+  W^HIST.PROCEDURE^CODE ':=' REQ.PROCEDURE^CODE FOR 5;
+  W^HIST.PMT^STATUS := 0;  ! Paid
+
+  CALL FILE_WRITE64_(PMTHIST^FNUM, W^HIST, $LEN(W^HIST));
+
+  CALL TMF_ENDTRANSACTION_(TMF^TAG);
+END;
+
+!=====================================================================
+! PROC OPEN^FILES
+!=====================================================================
+PROC OPEN^FILES;
+BEGIN
+  CALL FILE_OPEN_("$DATA1.WCDATA.PMTAUTH", 22, PMTAUTH^FNUM,,, 0);
+  IF <> THEN CALL ABEND;
+  CALL FILE_OPEN_("$DATA1.WCDATA.PMTHIST", 22, PMTHIST^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+  CALL FILE_OPEN_("$DATA1.WCDATA.LIENFILE", 22, LIEN^FNUM,,, 0);
+  IF <> THEN CALL ABEND;
+  CALL FILE_OPEN_("$DATA1.WCDATA.PMTINDM", 22, PMTINDM^FNUM,,, 0);
+  IF <> THEN CALL ABEND;
+  CALL FILE_OPEN_("$DATA1.WCDATA.PMT1099", 22, PMT1099^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+  CALL FILE_OPEN_("$DATA1.WCDATA.MBRFILE", 22, MBR^FNUM,,, 0);
+  IF <> THEN CALL ABEND;
+END;
+
+!=====================================================================
+! MAIN
+!=====================================================================
+PROC PMTAPPR MAIN;
+BEGIN
+  STRUCT REQ^BUF(PMT^APPROVAL^REQ);
+  STRUCT RESP^BUF(PMT^APPROVAL^RESP);
+  INT    MSG^LEN;
+
+  CALL INITIALIZER;
+  CALL OPEN^FILES;
+
+  TODAY^JULIAN := JULIANTIMESTAMP / 86400D;
+  APPROVAL^SEQ := 0;
+
+  CALL FILE_OPEN_("$RECEIVE", 1, RECV^FNUM);
+
+  WHILE 1 DO
+  BEGIN
+    CALL FILE_READ64_(RECV^FNUM, REQ^BUF, $LEN(REQ^BUF), MSG^LEN);
+    IF <> THEN
+    BEGIN
+      CALL FILE_CLOSE_(PMTAUTH^FNUM);
+      CALL FILE_CLOSE_(PMTHIST^FNUM);
+      CALL FILE_CLOSE_(LIEN^FNUM);
+      CALL FILE_CLOSE_(PMTINDM^FNUM);
+      CALL FILE_CLOSE_(PMT1099^FNUM);
+      CALL FILE_CLOSE_(MBR^FNUM);
+      CALL FILE_CLOSE_(RECV^FNUM);
+      RETURN;
+    END;
+
+    CALL PROCESS^PAYMENT^APPROVAL(REQ^BUF, RESP^BUF);
+    CALL SERVERCLASS_SEND_(RESP^BUF, $LEN(RESP^BUF));
+  END;
+END;

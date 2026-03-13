@@ -1,0 +1,588 @@
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?LIST
+!*********************************************************************
+!*  CLMSETUP -- Claim Setup/Creation Server
+!*  Workers' Compensation TPA System
+!*  HPE NonStop Guardian Environment
+!*
+!*  Purpose: Creates new WC claim records from validated FNOL data.
+!*           Generates claim numbers, initializes claim type and
+!*           compensability status, links employer/employee records,
+!*           creates activity log entries. All writes under TMF.
+!*
+!*  Process:  Pathway serverclass CLM-SETUP, MAXSERVERS 4
+!*  Files:    CLMFILE (key-seq), CLMSEQ (sequence number),
+!*            EMPLINK (alt-key), EEFILE, ACTLOG
+!*********************************************************************
+
+LITERAL
+  MAX^MSG^LEN         = 4096,
+  MAX^REPLY^LEN       = 2048,
+  !-- Claim type codes
+  CLM^MEDICAL^ONLY    = 1,
+  CLM^LOST^TIME       = 2,
+  CLM^PERMANENT^TOTAL = 3,
+  CLM^PERMANENT^PART  = 4,
+  CLM^FATALITY        = 5,
+  CLM^OCC^DISEASE     = 6,
+  !-- Compensability status
+  COMP^PENDING        = 0,
+  COMP^ACCEPTED       = 1,
+  COMP^DENIED         = 2,
+  COMP^UNDER^INVEST   = 3,
+  !-- Claim status
+  STAT^OPEN           = 1,
+  STAT^PENDING        = 2,
+  STAT^ACTIVE         = 3,
+  STAT^CLOSED         = 4,
+  STAT^REOPENED       = 5,
+  !-- Activity types
+  ACT^CLAIM^CREATED   = 1,
+  ACT^ADJUSTER^ASGN   = 2,
+  ACT^RESERVE^SET     = 3,
+  ACT^STATUS^CHANGE   = 4,
+  ACT^DIARY^CREATED   = 5,
+  ACT^NOTE^ADDED      = 6,
+  !-- Coverage types
+  COV^STATUTORY       = 1,
+  COV^EMPLOYERS^LIAB  = 2,
+  COV^USL^H           = 3,
+  COV^FELA            = 4,
+  !-- Error codes
+  ERR^NONE            = 0,
+  ERR^SEQ^FAIL        = 301,
+  ERR^TMF^ABORT       = 302,
+  ERR^DUP^KEY         = 303,
+  ERR^FILE^WRITE      = 304,
+  ERR^LINK^FAIL       = 305;
+
+!-- State prefix table for claim number generation
+LITERAL
+  NUM^STATES = 52;
+
+!-- Claim master record
+STRUCT CLAIM^MASTER^REC;
+  BEGIN
+    STRING   CLAIM^NUMBER[0:14];       ! Primary key: SS-YYYYNNNNNNN
+    STRING   EMPLOYEE^SSN[0:8];
+    STRING   EMPLOYEE^LAST[0:29];
+    STRING   EMPLOYEE^FIRST[0:19];
+    STRING   EMPLOYEE^DOB[0:7];
+    STRING   EMPLOYER^FEIN[0:8];
+    STRING   EMPLOYER^NAME[0:59];
+    STRING   POLICY^NUMBER[0:14];
+    STRING   DATE^OF^INJURY[0:7];
+    STRING   DATE^REPORTED[0:7];
+    STRING   DATE^CREATED[0:7];
+    STRING   INJURY^STATE[0:1];
+    INT(32)  BODY^PART^CODE;
+    INT(32)  NATURE^CODE;
+    INT(32)  CAUSE^CODE;
+    STRING   INJURY^DESC[0:199];
+    INT(32)  CLAIM^TYPE;
+    INT(32)  CLAIM^STATUS;
+    INT(32)  COMPENSABILITY;
+    INT(32)  COVERAGE^TYPE;
+    STRING   ADJUSTER^ID[0:7];
+    INT(32)  LOST^TIME^DAYS;
+    INT(32)  AVG^WEEKLY^WAGE;
+    INT(32)  MED^RESERVE;              ! in cents
+    INT(32)  IND^RESERVE;              ! in cents
+    INT(32)  EXP^RESERVE;              ! in cents
+    INT(32)  MED^PAID;
+    INT(32)  IND^PAID;
+    INT(32)  EXP^PAID;
+    STRING   TREATING^PHYSICIAN[0:49];
+    INT(32)  LITIGATION^FLAG;
+    STRING   HIRE^DATE[0:7];
+    INT(32)  OCCUPATION^CODE;
+    INT(32)  HOSPITALIZED^FLAG;
+    INT(32)  FATALITY^FLAG;
+    STRING   LAST^ACTIVITY^DATE[0:7];
+    STRING   NEXT^REVIEW^DATE[0:7];
+  END;
+
+!-- Claim setup request (from FNOLPROC)
+STRUCT SETUP^REQUEST;
+  BEGIN
+    INT(32)  MSG^TYPE;
+    STRING   EMPLOYEE^SSN[0:8];
+    STRING   EMPLOYEE^LAST[0:29];
+    STRING   EMPLOYEE^FIRST[0:19];
+    STRING   EMPLOYEE^DOB[0:7];
+    STRING   EMPLOYER^FEIN[0:8];
+    STRING   EMPLOYER^NAME[0:59];
+    STRING   POLICY^NUMBER[0:14];
+    STRING   DATE^OF^INJURY[0:7];
+    STRING   DATE^REPORTED[0:7];
+    STRING   INJURY^STATE[0:1];
+    INT(32)  BODY^PART^CODE;
+    INT(32)  NATURE^CODE;
+    INT(32)  CAUSE^CODE;
+    STRING   INJURY^DESC[0:199];
+    INT(32)  INJ^CLASS;
+    STRING   ADJUSTER^ID[0:7];
+    INT(32)  LOST^TIME^DAYS;
+    INT(32)  AVG^WEEKLY^WAGE;
+    INT(32)  INITIAL^RESERVE;
+    STRING   TREATING^PHYSICIAN[0:49];
+    STRING   HIRE^DATE[0:7];
+    INT(32)  OCCUPATION^CODE;
+    INT(32)  HOSPITALIZED^FLAG;
+    INT(32)  FATALITY^FLAG;
+  END;
+
+!-- Claim setup reply
+STRUCT SETUP^REPLY;
+  BEGIN
+    INT(32)  REPLY^CODE;
+    INT(32)  ERROR^CODE;
+    STRING   CLAIM^NUMBER[0:14];
+    STRING   ERROR^MESSAGE[0:79];
+  END;
+
+!-- Employer-Employee link record
+STRUCT EMP^LINK^REC;
+  BEGIN
+    STRING   EMPLOYER^FEIN[0:8];
+    STRING   EMPLOYEE^SSN[0:8];
+    STRING   CLAIM^NUMBER[0:14];
+    STRING   DATE^OF^INJURY[0:7];
+    INT(32)  CLAIM^STATUS;
+  END;
+
+!-- Activity log record
+STRUCT ACTIVITY^REC;
+  BEGIN
+    STRING   CLAIM^NUMBER[0:14];
+    STRING   ACTIVITY^DATE[0:7];
+    STRING   ACTIVITY^TIME[0:5];
+    INT(32)  ACTIVITY^TYPE;
+    STRING   USER^ID[0:7];
+    STRING   DESCRIPTION[0:119];
+  END;
+
+!-- Sequence number record (single record file)
+STRUCT SEQ^REC;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT(32)  YEAR;
+    INT(32)  NEXT^SEQUENCE;
+  END;
+
+!-- File numbers
+INT  CLM^FNUM,
+     SEQ^FNUM,
+     LINK^FNUM,
+     ACTLOG^FNUM;
+
+!-- TMF transaction tag
+INT(32) TRANS^TAG;
+
+!-- Working area
+STRING  WORK^DATE[0:7];
+STRING  WORK^TIME[0:5];
+
+!*********************************************************************
+!*  OPEN^FILES -- Open all Enscribe files for read-write
+!*********************************************************************
+PROC OPEN^FILES;
+  BEGIN
+    CALL FILE_OPEN_("$CLMFL", 6, CLM^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$CLMSEQ", 6, SEQ^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$EMPLINK", 7, LINK^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+
+    CALL FILE_OPEN_("$ACTLOG", 7, ACTLOG^FNUM, , , 1);
+    IF <> THEN CALL PROCESS_STOP_;
+  END;
+
+!*********************************************************************
+!*  GET^TIMESTAMP -- Get current date and time strings
+!*********************************************************************
+PROC GET^TIMESTAMP(DATE^BUF, TIME^BUF);
+  STRING .DATE^BUF[0:7];
+  STRING .TIME^BUF[0:5];
+  BEGIN
+    INT(32) JTS[0:2];
+    INT     YEAR, MONTH, DAY, HOUR, MINUTE;
+    STRING  NUM^BUF[0:3];
+
+    CALL JULIANTIMESTAMP(JTS);
+    CALL INTERPRETTIMESTAMP(JTS, YEAR, MONTH, DAY, HOUR, MINUTE);
+
+    ! Format YYYYMMDD
+    CALL NUMOUT(YEAR, NUM^BUF, 10, 4);
+    DATE^BUF ':=' NUM^BUF FOR 4;
+    CALL NUMOUT(MONTH, NUM^BUF, 10, 2);
+    DATE^BUF[4] ':=' NUM^BUF FOR 2;
+    CALL NUMOUT(DAY, NUM^BUF, 10, 2);
+    DATE^BUF[6] ':=' NUM^BUF FOR 2;
+
+    ! Format HHMMSS
+    CALL NUMOUT(HOUR, NUM^BUF, 10, 2);
+    TIME^BUF ':=' NUM^BUF FOR 2;
+    CALL NUMOUT(MINUTE, NUM^BUF, 10, 2);
+    TIME^BUF[2] ':=' NUM^BUF FOR 2;
+    TIME^BUF[4] ':=' "00";
+  END;
+
+!*********************************************************************
+!*  GENERATE^CLAIM^NUMBER -- Generate unique claim number
+!*  Format: SS-YYYYNNNNNNN (state prefix, year, 7-digit sequence)
+!*********************************************************************
+INT PROC GENERATE^CLAIM^NUMBER(STATE^CD, CLAIM^NO);
+  STRING .STATE^CD[0:1];
+  STRING .CLAIM^NO[0:14];
+  BEGIN
+    STRUCT .SREC(SEQ^REC);
+    INT    BYTES^READ;
+    INT(32) SEQ^NUM;
+    STRING  NUM^BUF[0:6];
+    INT(32) CURR^YEAR;
+    INT(32) JTS[0:2];
+    INT     YEAR, MONTH, DAY, HOUR, MINUTE;
+
+    CALL JULIANTIMESTAMP(JTS);
+    CALL INTERPRETTIMESTAMP(JTS, YEAR, MONTH, DAY, HOUR, MINUTE);
+    CURR^YEAR := YEAR;
+
+    !-- Position to state sequence record
+    SREC.STATE^CODE ':=' STATE^CD FOR 2;
+    CALL KEYPOSITION(SEQ^FNUM, SREC.STATE^CODE, 2, 0, 0);
+    IF <> THEN RETURN 0;
+
+    CALL READUPDATEX(SEQ^FNUM, SREC, $LEN(SEQ^REC), BYTES^READ);
+    IF <> THEN
+      BEGIN
+        !-- No record for this state; create one
+        SREC.STATE^CODE ':=' STATE^CD FOR 2;
+        SREC.YEAR := CURR^YEAR;
+        SREC.NEXT^SEQUENCE := 2;
+        SEQ^NUM := 1;
+        CALL WRITEX(SEQ^FNUM, SREC, $LEN(SEQ^REC));
+        IF <> THEN RETURN 0;
+      END
+    ELSE
+      BEGIN
+        !-- Reset sequence if new year
+        IF SREC.YEAR <> CURR^YEAR THEN
+          BEGIN
+            SREC.YEAR := CURR^YEAR;
+            SREC.NEXT^SEQUENCE := 1;
+          END;
+
+        SEQ^NUM := SREC.NEXT^SEQUENCE;
+        SREC.NEXT^SEQUENCE := SREC.NEXT^SEQUENCE + 1;
+
+        CALL WRITEUPDATEX(SEQ^FNUM, SREC, $LEN(SEQ^REC));
+        IF <> THEN RETURN 0;
+      END;
+
+    !-- Format: SS-YYYYNNNNNNN
+    CLAIM^NO ':=' STATE^CD FOR 2;
+    CLAIM^NO[2] ':=' "-";
+    CALL NUMOUT(CURR^YEAR, CLAIM^NO[3], 10, 4);
+    CALL NUMOUT(SEQ^NUM, NUM^BUF, 10, 7);
+    CLAIM^NO[7] ':=' NUM^BUF FOR 7;
+    CLAIM^NO[14] := " ";
+
+    RETURN 1;
+  END;
+
+!*********************************************************************
+!*  DETERMINE^CLAIM^TYPE -- Map injury class to claim type
+!*********************************************************************
+INT(32) PROC DETERMINE^CLAIM^TYPE(INJ^CLASS, LOST^DAYS);
+  INT(32) INJ^CLASS;
+  INT(32) LOST^DAYS;
+  BEGIN
+    INT(32) CTYPE;
+
+    CASE INJ^CLASS OF
+      BEGIN
+        1 -> CTYPE := CLM^MEDICAL^ONLY;
+        2 -> IF LOST^DAYS > 180 THEN
+               CTYPE := CLM^PERMANENT^PART
+             ELSE
+               CTYPE := CLM^LOST^TIME;
+        3 -> CTYPE := CLM^PERMANENT^TOTAL;
+        4 -> CTYPE := CLM^FATALITY;
+        5 -> CTYPE := CLM^OCC^DISEASE;
+        OTHERWISE -> CTYPE := CLM^MEDICAL^ONLY;
+      END;
+
+    RETURN CTYPE;
+  END;
+
+!*********************************************************************
+!*  SPLIT^RESERVES -- Split total reserve into med/ind/exp
+!*  Standard split: 60% medical, 30% indemnity, 10% expense
+!*  Fatality: 10% medical, 80% indemnity, 10% expense
+!*********************************************************************
+PROC SPLIT^RESERVES(TOTAL, CLM^TYPE, MED, IND, EXP);
+  INT(32) TOTAL;
+  INT(32) CLM^TYPE;
+  INT(32) .MED;
+  INT(32) .IND;
+  INT(32) .EXP;
+  BEGIN
+    IF CLM^TYPE = CLM^FATALITY THEN
+      BEGIN
+        MED := TOTAL / 10;         ! 10%
+        IND := (TOTAL * 8) / 10;   ! 80%
+        EXP := TOTAL - MED - IND;  ! 10%
+      END
+    ELSE IF CLM^TYPE = CLM^MEDICAL^ONLY THEN
+      BEGIN
+        MED := (TOTAL * 85) / 100; ! 85%
+        IND := 0;                   ! 0%
+        EXP := TOTAL - MED;        ! 15%
+      END
+    ELSE
+      BEGIN
+        MED := (TOTAL * 6) / 10;   ! 60%
+        IND := (TOTAL * 3) / 10;   ! 30%
+        EXP := TOTAL - MED - IND;  ! 10%
+      END;
+  END;
+
+!*********************************************************************
+!*  WRITE^ACTIVITY -- Write activity log entry
+!*********************************************************************
+PROC WRITE^ACTIVITY(CLAIM^NO, ATYPE, DESCR);
+  STRING .CLAIM^NO[0:14];
+  INT(32) ATYPE;
+  STRING .DESCR[0:119];
+  BEGIN
+    STRUCT .AREC(ACTIVITY^REC);
+
+    AREC.CLAIM^NUMBER ':=' CLAIM^NO FOR 15;
+    CALL GET^TIMESTAMP(AREC.ACTIVITY^DATE, AREC.ACTIVITY^TIME);
+    AREC.ACTIVITY^TYPE := ATYPE;
+    AREC.USER^ID ':=' "SYSTEM  ";
+    AREC.DESCRIPTION ':=' DESCR FOR 120;
+
+    CALL WRITEX(ACTLOG^FNUM, AREC, $LEN(ACTIVITY^REC));
+    ! Ignore write errors on activity log
+  END;
+
+!*********************************************************************
+!*  CREATE^EMP^LINK -- Create employer-employee-claim link
+!*********************************************************************
+INT PROC CREATE^EMP^LINK(FEIN, SSN, CLAIM^NO, DOI, STATUS);
+  STRING .FEIN[0:8];
+  STRING .SSN[0:8];
+  STRING .CLAIM^NO[0:14];
+  STRING .DOI[0:7];
+  INT(32) STATUS;
+  BEGIN
+    STRUCT .LREC(EMP^LINK^REC);
+
+    LREC.EMPLOYER^FEIN ':=' FEIN FOR 9;
+    LREC.EMPLOYEE^SSN ':=' SSN FOR 9;
+    LREC.CLAIM^NUMBER ':=' CLAIM^NO FOR 15;
+    LREC.DATE^OF^INJURY ':=' DOI FOR 8;
+    LREC.CLAIM^STATUS := STATUS;
+
+    CALL WRITEX(LINK^FNUM, LREC, $LEN(EMP^LINK^REC));
+    IF <> THEN RETURN 0;
+
+    RETURN 1;
+  END;
+
+!*********************************************************************
+!*  PROCESS^SETUP -- Main claim creation logic under TMF
+!*********************************************************************
+PROC PROCESS^SETUP(REQ^BUF, REQ^LEN, REPLY^BUF, REPLY^LEN);
+  STRING .REQ^BUF(SETUP^REQUEST);
+  INT     REQ^LEN;
+  STRING .REPLY^BUF(SETUP^REPLY);
+  INT    .REPLY^LEN;
+  BEGIN
+    STRUCT .CLMREC(CLAIM^MASTER^REC);
+    STRING  CLAIM^NO[0:14];
+    INT(32) CLM^TYPE;
+    INT(32) MED^RSV, IND^RSV, EXP^RSV;
+    INT     RESULT;
+
+    !-- Initialize reply
+    REPLY^BUF.REPLY^CODE := 0;
+    REPLY^BUF.ERROR^CODE := ERR^NONE;
+    REPLY^BUF.CLAIM^NUMBER ':=' "               ";
+    REPLY^BUF.ERROR^MESSAGE ':=' [40 * ["  "]];
+
+    !-- Begin TMF transaction
+    CALL BEGINTRANSACTION(TRANS^TAG);
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^TMF^ABORT;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "Failed to begin TMF transaction for claim creation              " &
+          "               ";
+        REPLY^LEN := $LEN(SETUP^REPLY);
+        RETURN;
+      END;
+
+    !-- Step 1: Generate claim number
+    RESULT := GENERATE^CLAIM^NUMBER(REQ^BUF.INJURY^STATE, CLAIM^NO);
+    IF NOT RESULT THEN
+      BEGIN
+        CALL ABORTTRANSACTION;
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^SEQ^FAIL;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "Failed to generate claim sequence number                        " &
+          "               ";
+        REPLY^LEN := $LEN(SETUP^REPLY);
+        RETURN;
+      END;
+
+    !-- Step 2: Determine claim type
+    CLM^TYPE := DETERMINE^CLAIM^TYPE(REQ^BUF.INJ^CLASS,
+                REQ^BUF.LOST^TIME^DAYS);
+
+    !-- Step 3: Split reserves
+    CALL SPLIT^RESERVES(REQ^BUF.INITIAL^RESERVE, CLM^TYPE,
+         MED^RSV, IND^RSV, EXP^RSV);
+
+    !-- Step 4: Build claim master record
+    CLMREC.CLAIM^NUMBER ':=' CLAIM^NO FOR 15;
+    CLMREC.EMPLOYEE^SSN ':=' REQ^BUF.EMPLOYEE^SSN FOR 9;
+    CLMREC.EMPLOYEE^LAST ':=' REQ^BUF.EMPLOYEE^LAST FOR 30;
+    CLMREC.EMPLOYEE^FIRST ':=' REQ^BUF.EMPLOYEE^FIRST FOR 20;
+    CLMREC.EMPLOYEE^DOB ':=' REQ^BUF.EMPLOYEE^DOB FOR 8;
+    CLMREC.EMPLOYER^FEIN ':=' REQ^BUF.EMPLOYER^FEIN FOR 9;
+    CLMREC.EMPLOYER^NAME ':=' REQ^BUF.EMPLOYER^NAME FOR 60;
+    CLMREC.POLICY^NUMBER ':=' REQ^BUF.POLICY^NUMBER FOR 15;
+    CLMREC.DATE^OF^INJURY ':=' REQ^BUF.DATE^OF^INJURY FOR 8;
+    CLMREC.DATE^REPORTED ':=' REQ^BUF.DATE^REPORTED FOR 8;
+    CALL GET^TIMESTAMP(CLMREC.DATE^CREATED, WORK^TIME);
+    CLMREC.INJURY^STATE ':=' REQ^BUF.INJURY^STATE FOR 2;
+    CLMREC.BODY^PART^CODE := REQ^BUF.BODY^PART^CODE;
+    CLMREC.NATURE^CODE := REQ^BUF.NATURE^CODE;
+    CLMREC.CAUSE^CODE := REQ^BUF.CAUSE^CODE;
+    CLMREC.INJURY^DESC ':=' REQ^BUF.INJURY^DESC FOR 200;
+    CLMREC.CLAIM^TYPE := CLM^TYPE;
+    CLMREC.CLAIM^STATUS := STAT^OPEN;
+    CLMREC.COMPENSABILITY := COMP^PENDING;
+    CLMREC.COVERAGE^TYPE := COV^STATUTORY;
+    CLMREC.ADJUSTER^ID ':=' REQ^BUF.ADJUSTER^ID FOR 8;
+    CLMREC.LOST^TIME^DAYS := REQ^BUF.LOST^TIME^DAYS;
+    CLMREC.AVG^WEEKLY^WAGE := REQ^BUF.AVG^WEEKLY^WAGE;
+    CLMREC.MED^RESERVE := MED^RSV;
+    CLMREC.IND^RESERVE := IND^RSV;
+    CLMREC.EXP^RESERVE := EXP^RSV;
+    CLMREC.MED^PAID := 0;
+    CLMREC.IND^PAID := 0;
+    CLMREC.EXP^PAID := 0;
+    CLMREC.TREATING^PHYSICIAN ':=' REQ^BUF.TREATING^PHYSICIAN FOR 50;
+    CLMREC.LITIGATION^FLAG := 0;
+    CLMREC.HIRE^DATE ':=' REQ^BUF.HIRE^DATE FOR 8;
+    CLMREC.OCCUPATION^CODE := REQ^BUF.OCCUPATION^CODE;
+    CLMREC.HOSPITALIZED^FLAG := REQ^BUF.HOSPITALIZED^FLAG;
+    CLMREC.FATALITY^FLAG := REQ^BUF.FATALITY^FLAG;
+    CLMREC.LAST^ACTIVITY^DATE ':=' CLMREC.DATE^CREATED FOR 8;
+
+    !-- Step 5: Write claim master record
+    CALL WRITEX(CLM^FNUM, CLMREC, $LEN(CLAIM^MASTER^REC));
+    IF <> THEN
+      BEGIN
+        CALL ABORTTRANSACTION;
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^FILE^WRITE;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "Failed to write claim master record to Enscribe file            " &
+          "               ";
+        REPLY^LEN := $LEN(SETUP^REPLY);
+        RETURN;
+      END;
+
+    !-- Step 6: Create employer-employee link
+    RESULT := CREATE^EMP^LINK(REQ^BUF.EMPLOYER^FEIN,
+              REQ^BUF.EMPLOYEE^SSN, CLAIM^NO,
+              REQ^BUF.DATE^OF^INJURY, STAT^OPEN);
+    IF NOT RESULT THEN
+      BEGIN
+        CALL ABORTTRANSACTION;
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^LINK^FAIL;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "Failed to create employer-employee claim link record            " &
+          "               ";
+        REPLY^LEN := $LEN(SETUP^REPLY);
+        RETURN;
+      END;
+
+    !-- Step 7: Commit TMF transaction
+    CALL ENDTRANSACTION;
+    IF <> THEN
+      BEGIN
+        REPLY^BUF.REPLY^CODE := 1;
+        REPLY^BUF.ERROR^CODE := ERR^TMF^ABORT;
+        REPLY^BUF.ERROR^MESSAGE ':='
+          "TMF transaction commit failed during claim creation             " &
+          "               ";
+        REPLY^LEN := $LEN(SETUP^REPLY);
+        RETURN;
+      END;
+
+    !-- Step 8: Write activity log (outside TMF)
+    CALL WRITE^ACTIVITY(CLAIM^NO, ACT^CLAIM^CREATED,
+         "Claim created - Type: " &
+         "                                                                " &
+         "                              ");
+
+    CALL WRITE^ACTIVITY(CLAIM^NO, ACT^ADJUSTER^ASGN,
+         "Adjuster assigned: " &
+         "                                                                " &
+         "                                 ");
+
+    CALL WRITE^ACTIVITY(CLAIM^NO, ACT^RESERVE^SET,
+         "Initial reserves established - Medical/Indemnity/Expense        " &
+         "                                                    ");
+
+    !-- Success
+    REPLY^BUF.REPLY^CODE := 0;
+    REPLY^BUF.CLAIM^NUMBER ':=' CLAIM^NO FOR 15;
+    REPLY^LEN := $LEN(SETUP^REPLY);
+  END;
+
+!*********************************************************************
+!*  MAIN -- Pathway server main loop
+!*********************************************************************
+PROC MAIN;
+  BEGIN
+    STRING  REQ^BUFFER[0:MAX^MSG^LEN - 1];
+    STRING  REPLY^BUFFER[0:MAX^REPLY^LEN - 1];
+    INT     REQ^LENGTH;
+    INT     REPLY^LENGTH;
+    INT     OPEN^FNUM;
+
+    CALL OPEN^FILES;
+
+    WHILE 1 DO
+      BEGIN
+        CALL SERVERCLASS_SEND_INFO_(, , OPEN^FNUM);
+
+        CALL READUPDATEX(OPEN^FNUM, REQ^BUFFER, MAX^MSG^LEN,
+                         REQ^LENGTH);
+        IF <> THEN
+          BEGIN
+            CALL SERVERCLASS_SEND_INFO_(, , OPEN^FNUM);
+          END
+        ELSE
+          BEGIN
+            REPLY^LENGTH := 0;
+            CALL PROCESS^SETUP(REQ^BUFFER, REQ^LENGTH,
+                               REPLY^BUFFER, REPLY^LENGTH);
+            CALL REPLYX(REPLY^BUFFER, REPLY^LENGTH);
+          END;
+      END;
+  END;

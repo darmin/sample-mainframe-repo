@@ -1,0 +1,714 @@
+?SECTION PPD-RATING-CALCULATOR
+?PAGE "WCPPDRATE - PPD Impairment Rating Calculator"
+!*********************************************************************
+!*  WCPPDRATE -- Permanent Partial Disability Rating Calculator      *
+!*                                                                   *
+!*  Converts medical impairment ratings to disability awards using   *
+!*  jurisdiction-specific rules. Handles AMA Guides editions 4-6,    *
+!*  scheduled member loss (body part tables), unscheduled whole-body *
+!*  ratings, multiple impairment combining, pre-existing deductions, *
+!*  and age/education/experience adjustment factors.                 *
+!*                                                                   *
+!*  PATHWAY SERVER CLASS: WC-PPD-RATE                                *
+!*  ENSCRIBE FILES:                                                  *
+!*    $DATA1.WCFILES.PPDSCHED  -- Scheduled loss tables by state     *
+!*    $DATA1.WCFILES.PPDCOMBI  -- Combined Values Chart (AMA)        *
+!*    $DATA1.WCFILES.PPDDISFG  -- Disfigurement award tables         *
+!*    $DATA1.WCFILES.PPDADJST  -- Age/education adjustment factors   *
+!*    $DATA1.WCFILES.PPDRESLT  -- Rating calculation results         *
+!*                                                                   *
+!*  MODIFICATION LOG:                                                *
+!*  DATE       PROGRAMMER   DESCRIPTION                              *
+!*  ---------- ------------ ---------------------------------------- *
+!*  2024-05-01 R.MITCHELL   INITIAL DEVELOPMENT                      *
+!*  2024-08-15 R.MITCHELL   MULTIPLE IMPAIRMENT COMBINING            *
+!*  2024-11-20 K.PATEL      AGE/EDUCATION ADJUSTMENTS                *
+!*  2025-01-25 R.MITCHELL   DISFIGUREMENT AWARDS                     *
+!*  2025-03-10 S.CHEN       LOSS OF WAGE-EARNING CAPACITY            *
+!*********************************************************************
+
+?NOLIST
+?SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?SOURCE $DATA1.WCFILES.WCCOMMON
+?LIST
+
+LITERAL DEF^VERSION = "WCPPDRATE V3.0.0";
+
+! -------------------------------------------------------------------
+! AMA Guides Edition codes
+! -------------------------------------------------------------------
+LITERAL AMA^EDITION^4 = 4;
+LITERAL AMA^EDITION^5 = 5;
+LITERAL AMA^EDITION^6 = 6;
+
+! Rating types
+LITERAL RATE^SCHEDULED    = 1;   ! Specific body part (scheduled loss)
+LITERAL RATE^UNSCHEDULED  = 2;   ! Whole body / whole person
+LITERAL RATE^DISFIGURE    = 3;   ! Disfigurement award
+LITERAL RATE^LWEC         = 4;   ! Loss of Wage-Earning Capacity
+
+! Body part group codes (NCCI-based categories)
+LITERAL BP^HEAD           = 10;
+LITERAL BP^NECK           = 15;
+LITERAL BP^UPPER^BACK     = 20;
+LITERAL BP^LOWER^BACK     = 21;
+LITERAL BP^SHOULDER       = 30;
+LITERAL BP^UPPER^ARM      = 31;
+LITERAL BP^ELBOW          = 32;
+LITERAL BP^FOREARM        = 33;
+LITERAL BP^WRIST          = 34;
+LITERAL BP^HAND           = 35;
+LITERAL BP^FINGER         = 36;
+LITERAL BP^THUMB          = 37;
+LITERAL BP^HIP            = 40;
+LITERAL BP^UPPER^LEG      = 41;
+LITERAL BP^KNEE           = 42;
+LITERAL BP^LOWER^LEG      = 43;
+LITERAL BP^ANKLE          = 44;
+LITERAL BP^FOOT           = 45;
+LITERAL BP^TOE            = 46;
+LITERAL BP^GREAT^TOE      = 47;
+LITERAL BP^EYE            = 50;
+LITERAL BP^EAR            = 55;
+LITERAL BP^LUNGS          = 60;
+LITERAL BP^HEART          = 61;
+LITERAL BP^WHOLE^BODY     = 99;
+
+! Maximum impairments that can be combined
+LITERAL MAX^IMPAIRMENTS   = 10;
+
+! -------------------------------------------------------------------
+! Structure definitions
+! -------------------------------------------------------------------
+STRUCT PPD^RATE^REQUEST;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    STRING   JURISDICTION[0:1];
+    INT      AMA^EDITION;              ! 4, 5, or 6
+    INT      DOI^YEAR;
+    INT      NUM^IMPAIRMENTS;          ! 1 to MAX^IMPAIRMENTS
+    INT      BODY^PARTS[0:MAX^IMPAIRMENTS - 1];
+    INT      IMPAIRMENT^RATINGS[0:MAX^IMPAIRMENTS - 1];  ! 0-100 each
+    INT      PREEXIST^RATINGS[0:MAX^IMPAIRMENTS - 1];    ! Pre-existing %
+    INT      CLAIMANT^AGE;
+    INT      EDUCATION^YEARS;          ! Years of education
+    INT      EXPERIENCE^YEARS;         ! Years in occupation
+    INT      RATING^TYPE;              ! RATE^SCHEDULED, etc.
+    FIXED(2) PRE^INJURY^AWW;
+    FIXED(2) POST^INJURY^EARNING^CAP;  ! For LWEC calculation
+    INT      DISFIGURE^LOCATION;       ! Body part for disfigurement
+    INT      DISFIGURE^SEVERITY;       ! 1-5 scale
+  END;
+
+STRUCT SCHED^LOSS^TABLE;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      BODY^PART;
+    INT      MAX^WEEKS;                ! Maximum weeks for total loss
+    INT      PCT^OF^AWW;              ! Rate percentage (66, 70, etc.)
+    INT      IS^SCHEDULED;            ! 1=scheduled in this state
+    INT      CONVERSION^TO^WB;         ! Weeks per 1% whole body
+  END;
+
+STRUCT COMBINED^VALUES^ENTRY;
+  BEGIN
+    INT      VALUE^A;                  ! First impairment percentage
+    INT      VALUE^B;                  ! Second impairment percentage
+    INT      COMBINED;                 ! Combined result
+  END;
+
+STRUCT AGE^EDU^ADJUSTMENT;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      AGE^BRACKET;             ! 1=<30, 2=30-39, 3=40-49, 4=50-59, 5=60+
+    INT      EDU^BRACKET;             ! 1=<HS, 2=HS, 3=Some college, 4=College+
+    INT      ADJUSTMENT^PCT;          ! Positive = increase, negative = decrease
+  END;
+
+STRUCT DISFIGURE^AWARD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      LOCATION;                ! Body part code
+    INT      SEVERITY;                ! 1-5
+    INT      AWARD^WEEKS;            ! Weeks of compensation
+    FIXED(2) FLAT^AMOUNT;            ! Some states use flat $ amount
+    INT      AWARD^TYPE;             ! 1=weeks, 2=flat amount, 3=both
+  END;
+
+STRUCT PPD^RATE^RESULT;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT      RATING^TYPE;
+    INT      FINAL^IMPAIRMENT^PCT;     ! After combining and deductions
+    INT      RAW^IMPAIRMENT^PCT;       ! Before adjustments
+    INT      PREEXIST^DEDUCTION^PCT;
+    INT      AGE^EDU^ADJUSTMENT^PCT;
+    INT      TOTAL^WEEKS;
+    FIXED(2) WEEKLY^RATE;
+    FIXED(2) TOTAL^AWARD;
+    FIXED(2) DISFIGURE^AWARD;
+    FIXED(2) LWEC^AWARD;
+    INT      CALC^STATUS;             ! 0=OK
+  END;
+
+! -------------------------------------------------------------------
+! Global working storage
+! -------------------------------------------------------------------
+INT .EXT G^FN^PPDSCHED;
+INT .EXT G^FN^PPDCOMBI;
+INT .EXT G^FN^PPDDISFG;
+INT .EXT G^FN^PPDADJST;
+INT .EXT G^FN^PPDRESLT;
+
+STRUCT .EXT G^REQ    (PPD^RATE^REQUEST);
+STRUCT .EXT G^RESULT (PPD^RATE^RESULT);
+STRUCT .EXT G^SCHED  (SCHED^LOSS^TABLE);
+STRUCT .EXT G^COMB   (COMBINED^VALUES^ENTRY);
+STRUCT .EXT G^ADJ    (AGE^EDU^ADJUSTMENT);
+STRUCT .EXT G^DISF   (DISFIGURE^AWARD);
+
+INT .EXT G^TMF^TAG;
+
+! Working arrays for combining
+INT .EXT G^NET^RATINGS[0:MAX^IMPAIRMENTS - 1];  ! After pre-existing deduction
+INT .EXT G^SORTED^RATINGS[0:MAX^IMPAIRMENTS - 1];
+
+! -------------------------------------------------------------------
+! PROC MAIN
+! -------------------------------------------------------------------
+PROC MAIN MAIN;
+  BEGIN
+    INT STATUS;
+    INT MSGNUM;
+
+    CALL OPEN^PPD^FILES(STATUS);
+    IF STATUS <> 0 THEN
+      CALL PROCESS_STOP_(, , , 1);
+
+    CALL SERVERCLASS_SEND_INFO_("WC-PPD-RATE");
+
+    WHILE 1 DO
+      BEGIN
+        CALL READ^REQUEST(MSGNUM, STATUS);
+        IF STATUS = 0 THEN
+          CASE MSGNUM OF
+            BEGIN
+              1 -> CALL CALCULATE^PPD^RATING;
+              2 -> CALL COMBINE^MULTIPLE^IMPAIRMENTS;
+              3 -> CALL CALCULATE^SCHEDULED^LOSS;
+              4 -> CALL CALCULATE^UNSCHEDULED^LOSS;
+              5 -> CALL CALCULATE^DISFIGUREMENT;
+              6 -> CALL CALCULATE^LWEC;
+              7 -> CALL QUERY^RATING^RESULT;
+              OTHERWISE -> CALL REPLY^ERROR(MSGNUM);
+            END;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^PPD^RATING -- Main orchestrator
+!
+! Steps:
+! 1. Deduct pre-existing impairment from each body part
+! 2. Combine multiple impairments using Combined Values Chart
+! 3. Apply age/education/experience adjustments (if state requires)
+! 4. Look up scheduled weeks per body part (or unscheduled whole body)
+! 5. Calculate total monetary award
+! -------------------------------------------------------------------
+PROC CALCULATE^PPD^RATING;
+  BEGIN
+    INT STATUS;
+    INT I;
+    INT COMBINED^PCT;
+    INT ADJUSTED^PCT;
+
+    ! Validate inputs
+    IF G^REQ.NUM^IMPAIRMENTS < 1 OR
+       G^REQ.NUM^IMPAIRMENTS > MAX^IMPAIRMENTS THEN
+      BEGIN
+        G^RESULT.CALC^STATUS := 1;
+        CALL REPLY^RESULT;
+        RETURN;
+      END;
+
+    ! Step 1: Deduct pre-existing impairment from each rating
+    FOR I := 0 TO G^REQ.NUM^IMPAIRMENTS - 1 DO
+      BEGIN
+        G^NET^RATINGS[I] := G^REQ.IMPAIRMENT^RATINGS[I]
+                           - G^REQ.PREEXIST^RATINGS[I];
+        IF G^NET^RATINGS[I] < 0 THEN
+          G^NET^RATINGS[I] := 0;
+      END;
+
+    ! Step 2: Combine impairments if multiple
+    IF G^REQ.NUM^IMPAIRMENTS = 1 THEN
+      COMBINED^PCT := G^NET^RATINGS[0]
+    ELSE
+      CALL COMBINE^RATINGS(G^REQ.NUM^IMPAIRMENTS, COMBINED^PCT);
+
+    G^RESULT.RAW^IMPAIRMENT^PCT := COMBINED^PCT;
+
+    ! Calculate total pre-existing deduction
+    G^RESULT.PREEXIST^DEDUCTION^PCT := 0;
+    FOR I := 0 TO G^REQ.NUM^IMPAIRMENTS - 1 DO
+      G^RESULT.PREEXIST^DEDUCTION^PCT :=
+        G^RESULT.PREEXIST^DEDUCTION^PCT + G^REQ.PREEXIST^RATINGS[I];
+
+    ! Step 3: Apply age/education/experience adjustment
+    CALL APPLY^AGE^EDU^ADJUSTMENT(COMBINED^PCT, ADJUSTED^PCT);
+    G^RESULT.AGE^EDU^ADJUSTMENT^PCT := ADJUSTED^PCT - COMBINED^PCT;
+    G^RESULT.FINAL^IMPAIRMENT^PCT := ADJUSTED^PCT;
+
+    ! Step 4: Calculate award based on rating type
+    CASE G^REQ.RATING^TYPE OF
+      BEGIN
+        RATE^SCHEDULED   -> CALL CALC^SCHED^AWARD(ADJUSTED^PCT);
+        RATE^UNSCHEDULED -> CALL CALC^UNSCHED^AWARD(ADJUSTED^PCT);
+        RATE^DISFIGURE   -> CALL CALCULATE^DISFIGUREMENT;
+        RATE^LWEC        -> CALL CALCULATE^LWEC;
+        OTHERWISE        -> CALL CALC^SCHED^AWARD(ADJUSTED^PCT);
+      END;
+
+    ! Add disfigurement award if applicable
+    IF G^REQ.DISFIGURE^SEVERITY > 0 THEN
+      BEGIN
+        CALL CALC^DISFIGURE^AMOUNT;
+        G^RESULT.TOTAL^AWARD := G^RESULT.TOTAL^AWARD
+                               + G^RESULT.DISFIGURE^AWARD;
+      END;
+
+    G^RESULT.CLAIM^NUMBER := G^REQ.CLAIM^NUMBER;
+    G^RESULT.RATING^TYPE := G^REQ.RATING^TYPE;
+    G^RESULT.CALC^STATUS := 0;
+
+    CALL WRITE^RATING^RESULT;
+    CALL REPLY^RESULT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC COMBINE^RATINGS -- AMA Combined Values Chart algorithm
+!
+! The Combined Values Chart combines impairments so that the result
+! accounts for the fact that a person already impaired has less
+! remaining "whole person" to lose. Formula:
+!   Combined(A,B) = A + B * (1 - A/100)
+! For multiple impairments, combine largest two first, then combine
+! that result with the next largest, and so on.
+! -------------------------------------------------------------------
+PROC COMBINE^RATINGS(COUNT, RESULT);
+  INT COUNT;
+  INT .RESULT;
+  BEGIN
+    INT I, J, TEMP;
+    INT COMBINED;
+
+    ! Copy to sorted array
+    FOR I := 0 TO COUNT - 1 DO
+      G^SORTED^RATINGS[I] := G^NET^RATINGS[I];
+
+    ! Sort descending (largest impairment first)
+    FOR I := 0 TO COUNT - 2 DO
+      FOR J := I + 1 TO COUNT - 1 DO
+        IF G^SORTED^RATINGS[J] > G^SORTED^RATINGS[I] THEN
+          BEGIN
+            TEMP := G^SORTED^RATINGS[I];
+            G^SORTED^RATINGS[I] := G^SORTED^RATINGS[J];
+            G^SORTED^RATINGS[J] := TEMP;
+          END;
+
+    ! Combine using AMA formula: C(A,B) = A + B*(100-A)/100
+    ! Start with the two largest
+    IF COUNT >= 2 THEN
+      COMBINED := G^SORTED^RATINGS[0]
+                + G^SORTED^RATINGS[1] * (100 - G^SORTED^RATINGS[0]) / 100
+    ELSE
+      BEGIN
+        RESULT := G^SORTED^RATINGS[0];
+        RETURN;
+      END;
+
+    ! Combine remaining impairments sequentially
+    FOR I := 2 TO COUNT - 1 DO
+      BEGIN
+        ! Try exact lookup from Combined Values table first
+        CALL LOOKUP^COMBINED^VALUE(COMBINED, G^SORTED^RATINGS[I], TEMP);
+        IF TEMP >= 0 THEN
+          COMBINED := TEMP
+        ELSE
+          ! Fallback to formula
+          COMBINED := COMBINED
+                    + G^SORTED^RATINGS[I] * (100 - COMBINED) / 100;
+      END;
+
+    ! Cap at 100%
+    IF COMBINED > 100 THEN COMBINED := 100;
+
+    RESULT := COMBINED;
+  END;
+
+! -------------------------------------------------------------------
+! PROC LOOKUP^COMBINED^VALUE -- Exact table lookup
+! The AMA Combined Values Chart is pre-loaded in Enscribe.
+! -------------------------------------------------------------------
+PROC LOOKUP^COMBINED^VALUE(VAL^A, VAL^B, RESULT);
+  INT VAL^A, VAL^B;
+  INT .RESULT;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:3];
+
+    ! Key: value_a(2) + value_b(2)
+    KEY^BUF[0] := VAL^A / 256;
+    KEY^BUF[1] := VAL^A;
+    KEY^BUF[2] := VAL^B / 256;
+    KEY^BUF[3] := VAL^B;
+
+    CALL FILE_SETKEY_(G^FN^PPDCOMBI, KEY^BUF, 4, 0);
+    CALL READ_FILE(G^FN^PPDCOMBI, G^COMB, $LEN(COMBINED^VALUES^ENTRY),
+                   BYTES^READ);
+
+    IF BYTES^READ >= $LEN(COMBINED^VALUES^ENTRY) THEN
+      RESULT := G^COMB.COMBINED
+    ELSE
+      RESULT := -1;  ! not found, use formula
+  END;
+
+! -------------------------------------------------------------------
+! PROC APPLY^AGE^EDU^ADJUSTMENT -- State-specific adjustments
+!
+! Some states increase or decrease the impairment rating based on
+! the claimant's age, education, and work experience. Older workers
+! with less education typically get a higher adjusted rating.
+! -------------------------------------------------------------------
+PROC APPLY^AGE^EDU^ADJUSTMENT(BASE^PCT, ADJUSTED^PCT);
+  INT BASE^PCT;
+  INT .ADJUSTED^PCT;
+  BEGIN
+    INT AGE^BRACKET;
+    INT EDU^BRACKET;
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:5];
+
+    ADJUSTED^PCT := BASE^PCT;  ! default: no adjustment
+
+    ! Determine age bracket
+    IF G^REQ.CLAIMANT^AGE < 30 THEN
+      AGE^BRACKET := 1
+    ELSE IF G^REQ.CLAIMANT^AGE < 40 THEN
+      AGE^BRACKET := 2
+    ELSE IF G^REQ.CLAIMANT^AGE < 50 THEN
+      AGE^BRACKET := 3
+    ELSE IF G^REQ.CLAIMANT^AGE < 60 THEN
+      AGE^BRACKET := 4
+    ELSE
+      AGE^BRACKET := 5;
+
+    ! Determine education bracket
+    IF G^REQ.EDUCATION^YEARS < 12 THEN
+      EDU^BRACKET := 1    ! Less than high school
+    ELSE IF G^REQ.EDUCATION^YEARS = 12 THEN
+      EDU^BRACKET := 2    ! High school diploma/GED
+    ELSE IF G^REQ.EDUCATION^YEARS < 16 THEN
+      EDU^BRACKET := 3    ! Some college
+    ELSE
+      EDU^BRACKET := 4;   ! College degree or higher
+
+    ! Look up adjustment factor for this state/age/education
+    KEY^BUF[0] ':=' G^REQ.JURISDICTION FOR 2;
+    KEY^BUF[2] := AGE^BRACKET / 256;
+    KEY^BUF[3] := AGE^BRACKET;
+    KEY^BUF[4] := EDU^BRACKET / 256;
+    KEY^BUF[5] := EDU^BRACKET;
+
+    CALL FILE_SETKEY_(G^FN^PPDADJST, KEY^BUF, 6, 0);
+    CALL READ_FILE(G^FN^PPDADJST, G^ADJ, $LEN(AGE^EDU^ADJUSTMENT),
+                   BYTES^READ);
+
+    IF BYTES^READ >= $LEN(AGE^EDU^ADJUSTMENT) THEN
+      BEGIN
+        ! Apply adjustment: can be positive (increase) or negative
+        ADJUSTED^PCT := BASE^PCT + G^ADJ.ADJUSTMENT^PCT;
+
+        ! Bounds checking
+        IF ADJUSTED^PCT < 0 THEN ADJUSTED^PCT := 0;
+        IF ADJUSTED^PCT > 100 THEN ADJUSTED^PCT := 100;
+      END;
+    ! If no adjustment entry found, ADJUSTED^PCT remains = BASE^PCT
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALC^SCHED^AWARD -- Scheduled body part award
+!
+! Scheduled losses have a fixed number of weeks per body part.
+! The award = impairment% * max_weeks * weekly_rate.
+! Examples (typical state): hand=244wk, arm=312wk, foot=205wk,
+! leg=288wk, eye=275wk, thumb=75wk, finger=46wk.
+! -------------------------------------------------------------------
+PROC CALC^SCHED^AWARD(IMPAIRMENT^PCT);
+  INT IMPAIRMENT^PCT;
+  BEGIN
+    INT STATUS;
+    INT BYTES^READ;
+    FIXED(2) RATE;
+    STRING .KEY^BUF[0:5];
+
+    ! Look up scheduled loss table for this state + body part
+    KEY^BUF[0] ':=' G^REQ.JURISDICTION FOR 2;
+    KEY^BUF[2] := G^REQ.BODY^PARTS[0] / 256;
+    KEY^BUF[3] := G^REQ.BODY^PARTS[0];
+
+    CALL FILE_SETKEY_(G^FN^PPDSCHED, KEY^BUF, 4, 0);
+    CALL READ_FILE(G^FN^PPDSCHED, G^SCHED, $LEN(SCHED^LOSS^TABLE),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(SCHED^LOSS^TABLE) OR
+       G^SCHED.IS^SCHEDULED = 0 THEN
+      BEGIN
+        ! Body part not scheduled in this state -- use unscheduled
+        CALL CALC^UNSCHED^AWARD(IMPAIRMENT^PCT);
+        RETURN;
+      END;
+
+    ! Calculate weeks: max_weeks * impairment%
+    G^RESULT.TOTAL^WEEKS := G^SCHED.MAX^WEEKS * IMPAIRMENT^PCT / 100;
+
+    ! Calculate weekly rate
+    RATE := G^REQ.PRE^INJURY^AWW * G^SCHED.PCT^OF^AWW / 100F;
+
+    ! Apply state max/min (load from jurisdiction -- use PATHSEND)
+    CALL GET^PPD^RATE^CAPS(G^REQ.JURISDICTION, G^REQ.DOI^YEAR, RATE);
+
+    G^RESULT.WEEKLY^RATE := RATE;
+    G^RESULT.TOTAL^AWARD := RATE * G^RESULT.TOTAL^WEEKS;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALC^UNSCHED^AWARD -- Unscheduled (whole body) award
+!
+! For body parts not on the schedule (back, neck, head, internal
+! organs), or in states that don't use schedules.
+! Typically: impairment% * max_weeks * weekly_rate.
+! Max weeks varies widely: 200-600 weeks depending on state.
+! -------------------------------------------------------------------
+PROC CALC^UNSCHED^AWARD(IMPAIRMENT^PCT);
+  INT IMPAIRMENT^PCT;
+  BEGIN
+    INT MAX^WEEKS;
+    FIXED(2) RATE;
+
+    ! Get unscheduled maximum weeks for this jurisdiction
+    CALL GET^UNSCHED^MAX^WEEKS^INTERNAL(G^REQ.JURISDICTION, MAX^WEEKS);
+
+    G^RESULT.TOTAL^WEEKS := MAX^WEEKS * IMPAIRMENT^PCT / 100;
+
+    ! Unscheduled rate is typically 66 2/3% of AWW
+    RATE := G^REQ.PRE^INJURY^AWW * 6667F / 10000F;
+
+    CALL GET^PPD^RATE^CAPS(G^REQ.JURISDICTION, G^REQ.DOI^YEAR, RATE);
+
+    G^RESULT.WEEKLY^RATE := RATE;
+    G^RESULT.TOTAL^AWARD := RATE * G^RESULT.TOTAL^WEEKS;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^DISFIGUREMENT -- Disfigurement awards
+!
+! Many states provide additional compensation for serious,
+! permanent disfigurement (scars, burns, amputations).
+! Awards vary by body location, visibility, and severity.
+! -------------------------------------------------------------------
+PROC CALCULATE^DISFIGUREMENT;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:5];
+
+    ! Look up disfigurement award table
+    KEY^BUF[0] ':=' G^REQ.JURISDICTION FOR 2;
+    KEY^BUF[2] := G^REQ.DISFIGURE^LOCATION / 256;
+    KEY^BUF[3] := G^REQ.DISFIGURE^LOCATION;
+    KEY^BUF[4] := G^REQ.DISFIGURE^SEVERITY / 256;
+    KEY^BUF[5] := G^REQ.DISFIGURE^SEVERITY;
+
+    CALL FILE_SETKEY_(G^FN^PPDDISFG, KEY^BUF, 6, 0);
+    CALL READ_FILE(G^FN^PPDDISFG, G^DISF, $LEN(DISFIGURE^AWARD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(DISFIGURE^AWARD) THEN
+      BEGIN
+        G^RESULT.DISFIGURE^AWARD := 0F;
+        RETURN;
+      END;
+
+    CASE G^DISF.AWARD^TYPE OF
+      BEGIN
+        1 -> ! Weeks of compensation
+             G^RESULT.DISFIGURE^AWARD :=
+               G^RESULT.WEEKLY^RATE * G^DISF.AWARD^WEEKS;
+
+        2 -> ! Flat dollar amount
+             G^RESULT.DISFIGURE^AWARD := G^DISF.FLAT^AMOUNT;
+
+        3 -> ! Both (weeks + flat)
+             G^RESULT.DISFIGURE^AWARD :=
+               G^RESULT.WEEKLY^RATE * G^DISF.AWARD^WEEKS
+               + G^DISF.FLAT^AMOUNT;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALC^DISFIGURE^AMOUNT -- Called when disfigurement is secondary
+! -------------------------------------------------------------------
+PROC CALC^DISFIGURE^AMOUNT;
+  BEGIN
+    CALL CALCULATE^DISFIGUREMENT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^LWEC -- Loss of Wage-Earning Capacity
+!
+! Some states use LWEC instead of or in addition to impairment
+! ratings. LWEC compares pre-injury earning capacity to post-injury
+! earning capacity and awards benefits based on the percentage loss.
+!   LWEC% = (Pre-injury AWW - Post-injury capacity) / Pre-injury AWW
+! -------------------------------------------------------------------
+PROC CALCULATE^LWEC;
+  BEGIN
+    FIXED(2) CAPACITY^LOSS;
+    INT LWEC^PCT;
+    INT MAX^WEEKS;
+
+    IF G^REQ.PRE^INJURY^AWW <= 0F THEN
+      BEGIN
+        G^RESULT.LWEC^AWARD := 0F;
+        RETURN;
+      END;
+
+    ! Calculate wage-earning capacity loss percentage
+    CAPACITY^LOSS := G^REQ.PRE^INJURY^AWW - G^REQ.POST^INJURY^EARNING^CAP;
+    IF CAPACITY^LOSS < 0F THEN CAPACITY^LOSS := 0F;
+
+    LWEC^PCT := FIXED(CAPACITY^LOSS * 100F / G^REQ.PRE^INJURY^AWW, 0);
+
+    IF LWEC^PCT > 100 THEN LWEC^PCT := 100;
+    IF LWEC^PCT < 0 THEN LWEC^PCT := 0;
+
+    ! LWEC award: uses unscheduled max weeks * LWEC%
+    CALL GET^UNSCHED^MAX^WEEKS^INTERNAL(G^REQ.JURISDICTION, MAX^WEEKS);
+    G^RESULT.TOTAL^WEEKS := MAX^WEEKS * LWEC^PCT / 100;
+
+    FIXED(2) RATE;
+    RATE := G^REQ.PRE^INJURY^AWW * 6667F / 10000F;
+    CALL GET^PPD^RATE^CAPS(G^REQ.JURISDICTION, G^REQ.DOI^YEAR, RATE);
+
+    G^RESULT.LWEC^AWARD := RATE * G^RESULT.TOTAL^WEEKS;
+    G^RESULT.WEEKLY^RATE := RATE;
+    G^RESULT.FINAL^IMPAIRMENT^PCT := LWEC^PCT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^PPD^RATE^CAPS -- Apply jurisdiction max/min rate caps
+! Uses PATHSEND to jurisdiction server for state-specific limits.
+! -------------------------------------------------------------------
+PROC GET^PPD^RATE^CAPS(JURIS, DOI^YEAR, RATE);
+  STRING .JURIS[0:1];
+  INT     DOI^YEAR;
+  FIXED(2) .RATE;
+  BEGIN
+    INT STATUS;
+    FIXED(2) MAX^RATE;
+    FIXED(2) MIN^RATE;
+
+    ! PATHSEND to WC-JURIS-SVR for benefit parameters
+    CALL PATHSEND^JURIS^LOOKUP(JURIS, DOI^YEAR, MAX^RATE, MIN^RATE, STATUS);
+
+    IF STATUS = 0 THEN
+      BEGIN
+        IF RATE > MAX^RATE AND MAX^RATE > 0F THEN
+          RATE := MAX^RATE;
+        IF RATE < MIN^RATE AND MIN^RATE > 0F THEN
+          RATE := MIN^RATE;
+      END;
+    ! If PATHSEND fails, use the rate uncapped (conservative approach)
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^UNSCHED^MAX^WEEKS^INTERNAL -- Whole-body max weeks
+! State-specific maximums for unscheduled PPD.
+! -------------------------------------------------------------------
+PROC GET^UNSCHED^MAX^WEEKS^INTERNAL(JURIS, MAX^WEEKS);
+  STRING .JURIS[0:1];
+  INT    .MAX^WEEKS;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:3];
+
+    ! Look up whole body entry (body part = 99)
+    KEY^BUF[0] ':=' JURIS FOR 2;
+    KEY^BUF[2] := BP^WHOLE^BODY / 256;
+    KEY^BUF[3] := BP^WHOLE^BODY;
+
+    CALL FILE_SETKEY_(G^FN^PPDSCHED, KEY^BUF, 4, 0);
+    CALL READ_FILE(G^FN^PPDSCHED, G^SCHED, $LEN(SCHED^LOSS^TABLE),
+                   BYTES^READ);
+
+    IF BYTES^READ >= $LEN(SCHED^LOSS^TABLE) THEN
+      MAX^WEEKS := G^SCHED.MAX^WEEKS
+    ELSE
+      MAX^WEEKS := 500;  ! Default fallback
+  END;
+
+! -------------------------------------------------------------------
+! PROC WRITE^RATING^RESULT -- Persist under TMF
+! -------------------------------------------------------------------
+PROC WRITE^RATING^RESULT;
+  BEGIN
+    INT STATUS;
+
+    CALL BEGINTRANSACTION(G^TMF^TAG, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    CALL WRITE_FILE(G^FN^PPDRESLT, G^RESULT, $LEN(PPD^RATE^RESULT));
+    IF <> THEN
+      BEGIN
+        CALL ABORTTRANSACTION(G^TMF^TAG);
+        CALL REPLY^ERROR(6);
+        RETURN;
+      END;
+
+    CALL LOG^ACTIVITY("PPDRATE", G^REQ.CLAIM^NUMBER, 0);
+    CALL ENDTRANSACTION(G^TMF^TAG);
+  END;
+
+! -------------------------------------------------------------------
+! PROC OPEN^PPD^FILES
+! -------------------------------------------------------------------
+PROC OPEN^PPD^FILES(STATUS);
+  INT .STATUS;
+  BEGIN
+    STRING .FNAME[0:35];
+    STATUS := 0;
+
+    FNAME ':=' "$DATA1.WCFILES.PPDSCHED" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^PPDSCHED, , 0, 0);
+    IF <> THEN BEGIN STATUS := 1; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.PPDCOMBI" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^PPDCOMBI, , 0, 0);
+    IF <> THEN BEGIN STATUS := 2; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.PPDDISFG" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^PPDDISFG, , 0, 0);
+    IF <> THEN BEGIN STATUS := 3; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.PPDADJST" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^PPDADJST, , 0, 0);
+    IF <> THEN BEGIN STATUS := 4; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.PPDRESLT" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^PPDRESLT, , 0, 1);
+    IF <> THEN BEGIN STATUS := 5; RETURN; END;
+  END;

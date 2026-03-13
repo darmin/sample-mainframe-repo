@@ -1,0 +1,754 @@
+?SECTION COMPENSABILITY-DETERMINATION
+?PAGE "WCCOMP - Workers' Compensation Compensability Determination Engine"
+!*********************************************************************
+!*  WCCOMP -- Compensability Determination Engine                    *
+!*                                                                   *
+!*  Determines whether a claimed injury/illness is compensable       *
+!*  under workers' compensation statutes for the filing              *
+!*  jurisdiction. Evaluates AOE/COE, exclusions, statute of          *
+!*  limitations, and records the compensability decision.            *
+!*                                                                   *
+!*  PATHWAY SERVER CLASS: WC-COMP-SVR                                *
+!*  ENSCRIBE FILES:                                                  *
+!*    $DATA1.WCFILES.COMPDECN  -- Compensability decisions           *
+!*    $DATA1.WCFILES.JURISTBL  -- Jurisdiction rules table           *
+!*    $DATA1.WCFILES.APPEALS   -- Appeal tracking records            *
+!*    $DATA1.WCFILES.CLAIMHDR  -- Claim header records               *
+!*                                                                   *
+!*  MODIFICATION LOG:                                                *
+!*  DATE       PROGRAMMER   DESCRIPTION                              *
+!*  ---------- ------------ ---------------------------------------- *
+!*  2024-01-15 R.MITCHELL   INITIAL DEVELOPMENT                      *
+!*  2024-03-22 R.MITCHELL   ADD INTOXICATION EXCLUSION LOGIC         *
+!*  2024-06-10 S.CHEN       JURISDICTION SOL TABLE EXPANSION         *
+!*  2024-09-05 R.MITCHELL   APPEAL TRACKING ENHANCEMENTS             *
+!*  2025-01-18 K.PATEL      MULTI-STATE AOE/COE RULES               *
+!*********************************************************************
+
+?NOLIST
+?SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?SOURCE $DATA1.WCFILES.WCCOMMON
+?LIST
+
+LITERAL DEF^VERSION = "WCCOMP V3.2.0";
+
+! -------------------------------------------------------------------
+! Compensability reason codes
+! -------------------------------------------------------------------
+LITERAL COMP^APPROVED            = 100;  ! Claim is compensable
+LITERAL COMP^DENIED^NOT^AOE      = 201;  ! Injury did not arise out of employment
+LITERAL COMP^DENIED^NOT^COE      = 202;  ! Injury not in course of employment
+LITERAL COMP^DENIED^PREEXIST     = 203;  ! Entirely pre-existing condition
+LITERAL COMP^DENIED^INTOX        = 204;  ! Intoxication exclusion applies
+LITERAL COMP^DENIED^WILLFUL      = 205;  ! Willful misconduct
+LITERAL COMP^DENIED^HORSEPLAY    = 206;  ! Horseplay/deviation from employment
+LITERAL COMP^DENIED^SOL          = 207;  ! Statute of limitations expired
+LITERAL COMP^DENIED^IDIOPATHIC   = 208;  ! Idiopathic condition, no work nexus
+LITERAL COMP^DENIED^COMING^GOING = 209;  ! Coming and going rule applies
+LITERAL COMP^PENDED^INVEST       = 301;  ! Pended for investigation
+LITERAL COMP^PENDED^MEDICAL      = 302;  ! Pended for medical records
+LITERAL COMP^PARTIAL^PREEXIST    = 401;  ! Compensable with apportionment
+
+! AOE/COE evaluation flags
+LITERAL AOE^YES = 1;
+LITERAL AOE^NO  = 0;
+LITERAL COE^YES = 1;
+LITERAL COE^NO  = 0;
+
+! Appeal status codes
+LITERAL APPEAL^FILED     = 1;
+LITERAL APPEAL^HEARING   = 2;
+LITERAL APPEAL^DECIDED   = 3;
+LITERAL APPEAL^WITHDRAWN = 4;
+
+! Contestation types
+LITERAL CONTEST^NONE         = 0;
+LITERAL CONTEST^COMPENSABLE  = 1;  ! Employer disputes compensability
+LITERAL CONTEST^MEDICAL      = 2;  ! Disputes medical treatment
+LITERAL CONTEST^DISABILITY   = 3;  ! Disputes disability duration
+LITERAL CONTEST^CAUSAL       = 4;  ! Disputes causal relationship
+
+! Maximum field sizes
+LITERAL MAX^REASON^TEXT = 256;
+LITERAL MAX^NCCI^CODE  = 4;
+
+! -------------------------------------------------------------------
+! Structure definitions
+! -------------------------------------------------------------------
+STRUCT COMP^REQUEST;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT(32)  CLAIMANT^SSN;
+    STRING   JURISDICTION[0:1];         ! 2-char state code
+    INT(32)  DATE^OF^INJURY;            ! YYYYMMDD
+    INT(32)  DATE^OF^REPORT;            ! YYYYMMDD
+    INT(32)  DATE^OF^FILING;            ! YYYYMMDD
+    STRING   NCCI^NATURE^INJ[0:1];      ! Nature of injury code
+    STRING   NCCI^CAUSE^INJ[0:2];       ! Cause of injury code
+    STRING   NCCI^BODY^PART[0:1];       ! Body part code
+    INT      INJURY^ON^PREMISES;        ! 1=yes, 0=no
+    INT      DURING^WORK^HOURS;         ! 1=yes, 0=no
+    INT      PERFORMING^WORK^DUTY;      ! 1=yes, 0=no
+    INT      EMPLOYER^DIRECTED;         ! 1=yes, 0=no
+    INT      TRAVELING^FOR^WORK;        ! 1=yes, 0=no
+    INT      INTOX^TEST^POSITIVE;       ! 1=yes, 0=no
+    INT      INTOX^CAUSED^INJURY;       ! 1=yes, 0=no
+    INT      WILLFUL^MISCONDUCT;        ! 1=yes, 0=no
+    INT      HORSEPLAY^INVOLVED;        ! 1=yes, 0=no
+    INT      PREEXISTING^CONDITION;     ! 1=yes, 0=no
+    INT      PREEXIST^PERCENT;          ! 0-100 apportionment
+    INT      EMPLOYER^CONTESTING;       ! contestation type
+    STRING   CONTEST^REASON[0:MAX^REASON^TEXT - 1];
+  END;
+
+STRUCT COMP^DECISION;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT(32)  DECISION^DATE;             ! YYYYMMDD
+    INT      DECISION^CODE;             ! reason code from literals
+    INT      AOE^FLAG;
+    INT      COE^FLAG;
+    INT      APPORTIONMENT^PCT;         ! 0-100
+    INT      APPEAL^STATUS;
+    INT(32)  APPEAL^DEADLINE;           ! YYYYMMDD
+    STRING   DECISION^NARRATIVE[0:MAX^REASON^TEXT - 1];
+    STRING   EXAMINER^ID[0:7];
+    INT      REQUIRES^IME;             ! 1=yes
+    INT      REQUIRES^SIU;             ! 1=yes (Special Investigations)
+  END;
+
+STRUCT JURIS^SOL^ENTRY;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      SOL^INJURY^DAYS;          ! days from DOI to report
+    INT      SOL^FILING^DAYS;          ! days from DOI to file claim
+    INT      SOL^OCCUPATIONAL^DAYS;    ! days from discovery for occ disease
+    INT      INTOX^EXCLUSION^TYPE;     ! 0=none, 1=sole cause, 2=major cause
+    INT      WILLFUL^EXCLUSION^AVAIL;  ! 1=yes
+    INT      HORSEPLAY^STANDARD;       ! 1=strict, 2=deviation, 3=abandoned
+    INT      COMING^GOING^EXCEPT;      ! bitmap of exceptions
+    INT      APPEAL^WINDOW^DAYS;       ! days to file appeal from denial
+  END;
+
+STRUCT APPEAL^RECORD;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT(32)  APPEAL^DATE^FILED;
+    INT(32)  HEARING^DATE;
+    INT      APPEAL^STATUS;
+    INT      ORIGINAL^DECISION;
+    INT      APPEAL^DECISION;
+    STRING   ALJ^NAME[0:31];
+    STRING   DOCKET^NUMBER[0:15];
+  END;
+
+! -------------------------------------------------------------------
+! Global working variables
+! -------------------------------------------------------------------
+INT .EXT G^FILENUM^COMPDECN;
+INT .EXT G^FILENUM^JURISTBL;
+INT .EXT G^FILENUM^APPEALS;
+INT .EXT G^FILENUM^CLAIMHDR;
+
+STRUCT .EXT G^REQUEST (COMP^REQUEST);
+STRUCT .EXT G^DECISION (COMP^DECISION);
+STRUCT .EXT G^JURIS^RULE (JURIS^SOL^ENTRY);
+STRUCT .EXT G^APPEAL (APPEAL^RECORD);
+
+INT .EXT G^ERROR^CODE;
+INT .EXT G^TMF^TAG;
+
+! -------------------------------------------------------------------
+! PROC MAIN -- Server startup and message loop
+! -------------------------------------------------------------------
+PROC MAIN MAIN;
+  BEGIN
+    INT STATUS;
+    INT MSGNUM;
+
+    CALL OPEN^FILES(STATUS);
+    IF STATUS <> 0 THEN
+      CALL PROCESS_STOP_(, , , 1);
+
+    ! Register with Pathway
+    CALL SERVERCLASS_SEND_INFO_("WC-COMP-SVR");
+
+    ! Main message loop
+    WHILE 1 DO
+      BEGIN
+        CALL READ^REQUEST(MSGNUM, STATUS);
+        IF STATUS = 0 THEN
+          BEGIN
+            CASE MSGNUM OF
+              BEGIN
+                1 -> CALL DETERMINE^COMPENSABILITY;
+                2 -> CALL EVALUATE^AOE^COE;
+                3 -> CALL CHECK^EXCLUSIONS;
+                4 -> CALL CHECK^STATUTE^OF^LIMITS;
+                5 -> CALL RECORD^DECISION;
+                6 -> CALL FILE^APPEAL;
+                7 -> CALL QUERY^DECISION;
+                8 -> CALL APPORTION^PREEXISTING;
+                OTHERWISE -> CALL REPLY^ERROR(MSGNUM);
+              END;
+          END;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC OPEN^FILES -- Open all Enscribe files under TMF
+! -------------------------------------------------------------------
+PROC OPEN^FILES(STATUS);
+  INT .STATUS;
+  BEGIN
+    INT FNUM;
+    INT ERR;
+    STRING .FNAME[0:35];
+
+    STATUS := 0;
+
+    FNAME ':=' "$DATA1.WCFILES.COMPDECN" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FILENUM^COMPDECN, , 0, 1);  ! readwrite, exclusive
+    IF <> THEN STATUS := FILE_GETINFO_(G^FILENUM^COMPDECN, ERR);
+
+    FNAME ':=' "$DATA1.WCFILES.JURISTBL" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FILENUM^JURISTBL, , 0, 0);   ! read only
+    IF <> THEN STATUS := FILE_GETINFO_(G^FILENUM^JURISTBL, ERR);
+
+    FNAME ':=' "$DATA1.WCFILES.APPEALS" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FILENUM^APPEALS, , 0, 1);
+    IF <> THEN STATUS := FILE_GETINFO_(G^FILENUM^APPEALS, ERR);
+
+    FNAME ':=' "$DATA1.WCFILES.CLAIMHDR" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FILENUM^CLAIMHDR, , 0, 0);
+    IF <> THEN STATUS := FILE_GETINFO_(G^FILENUM^CLAIMHDR, ERR);
+  END;
+
+! -------------------------------------------------------------------
+! PROC DETERMINE^COMPENSABILITY -- Main compensability evaluation
+! Orchestrates the full analysis sequence and produces a decision.
+! -------------------------------------------------------------------
+PROC DETERMINE^COMPENSABILITY;
+  BEGIN
+    INT STATUS;
+    INT SOL^OK;
+    INT AOE^RESULT;
+    INT COE^RESULT;
+    INT EXCL^CODE;
+    INT FINAL^CODE;
+    INT APPORTION^PCT;
+
+    ! Step 1: Load jurisdiction rules for the filing state
+    CALL LOAD^JURIS^RULES(G^REQUEST.JURISDICTION, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    ! Step 2: Check statute of limitations first (cheapest check)
+    CALL CHECK^SOL^INTERNAL(
+      G^REQUEST.DATE^OF^INJURY,
+      G^REQUEST.DATE^OF^REPORT,
+      G^REQUEST.DATE^OF^FILING,
+      G^REQUEST.JURISDICTION,
+      SOL^OK);
+
+    IF SOL^OK = 0 THEN
+      BEGIN
+        G^DECISION.DECISION^CODE := COMP^DENIED^SOL;
+        G^DECISION.AOE^FLAG := AOE^NO;
+        G^DECISION.COE^FLAG := COE^NO;
+        CALL FORMAT^SOL^NARRATIVE;
+        CALL WRITE^DECISION;
+        CALL REPLY^DECISION;
+        RETURN;
+      END;
+
+    ! Step 3: Evaluate exclusions (intoxication, willful misconduct, horseplay)
+    CALL EVALUATE^EXCLUSIONS(EXCL^CODE);
+    IF EXCL^CODE <> 0 THEN
+      BEGIN
+        G^DECISION.DECISION^CODE := EXCL^CODE;
+        G^DECISION.AOE^FLAG := AOE^NO;
+        G^DECISION.COE^FLAG := COE^NO;
+        CALL FORMAT^EXCLUSION^NARRATIVE(EXCL^CODE);
+        CALL WRITE^DECISION;
+        CALL REPLY^DECISION;
+        RETURN;
+      END;
+
+    ! Step 4: Evaluate AOE (Arising Out of Employment)
+    CALL EVALUATE^AOE(AOE^RESULT);
+
+    ! Step 5: Evaluate COE (Course of Employment)
+    CALL EVALUATE^COE(COE^RESULT);
+
+    ! Step 6: Determine final compensability
+    IF AOE^RESULT = AOE^YES AND COE^RESULT = COE^YES THEN
+      BEGIN
+        ! Both AOE and COE satisfied -- check for apportionment
+        IF G^REQUEST.PREEXISTING^CONDITION = 1 THEN
+          BEGIN
+            CALL CALCULATE^APPORTIONMENT(APPORTION^PCT);
+            IF APPORTION^PCT >= 100 THEN
+              FINAL^CODE := COMP^DENIED^PREEXIST
+            ELSE IF APPORTION^PCT > 0 THEN
+              BEGIN
+                FINAL^CODE := COMP^PARTIAL^PREEXIST;
+                G^DECISION.APPORTIONMENT^PCT := APPORTION^PCT;
+              END
+            ELSE
+              FINAL^CODE := COMP^APPROVED;
+          END
+        ELSE
+          BEGIN
+            FINAL^CODE := COMP^APPROVED;
+            G^DECISION.APPORTIONMENT^PCT := 0;
+          END;
+      END
+    ELSE IF AOE^RESULT = AOE^NO THEN
+      FINAL^CODE := COMP^DENIED^NOT^AOE
+    ELSE
+      FINAL^CODE := COMP^DENIED^NOT^COE;
+
+    ! Step 7: Check if employer is contesting
+    IF G^REQUEST.EMPLOYER^CONTESTING <> CONTEST^NONE AND
+       FINAL^CODE = COMP^APPROVED THEN
+      BEGIN
+        ! Approved but contested -- flag for investigation
+        G^DECISION.REQUIRES^SIU := 1;
+      END;
+
+    ! Step 8: Record the decision
+    G^DECISION.CLAIM^NUMBER := G^REQUEST.CLAIM^NUMBER;
+    CALL TIMESTAMP(G^DECISION.DECISION^DATE);
+    G^DECISION.DECISION^CODE := FINAL^CODE;
+    G^DECISION.AOE^FLAG := AOE^RESULT;
+    G^DECISION.COE^FLAG := COE^RESULT;
+
+    ! Calculate appeal deadline
+    G^DECISION.APPEAL^DEADLINE := ADD^DAYS(
+      G^DECISION.DECISION^DATE,
+      G^JURIS^RULE.APPEAL^WINDOW^DAYS);
+
+    CALL FORMAT^DECISION^NARRATIVE(FINAL^CODE);
+    CALL WRITE^DECISION;
+    CALL REPLY^DECISION;
+  END;
+
+! -------------------------------------------------------------------
+! PROC EVALUATE^AOE -- Arising Out of Employment determination
+! Tests the causal nexus between employment and the injury.
+! -------------------------------------------------------------------
+PROC EVALUATE^AOE(RESULT);
+  INT .RESULT;
+  BEGIN
+    RESULT := AOE^NO;  ! default to denied
+
+    ! Positional risk doctrine: injury on premises during work duty
+    IF G^REQUEST.INJURY^ON^PREMISES = 1 AND
+       G^REQUEST.PERFORMING^WORK^DUTY = 1 THEN
+      BEGIN
+        RESULT := AOE^YES;
+        RETURN;
+      END;
+
+    ! Traveling employee exception
+    IF G^REQUEST.TRAVELING^FOR^WORK = 1 THEN
+      BEGIN
+        RESULT := AOE^YES;
+        RETURN;
+      END;
+
+    ! Employer-directed activity
+    IF G^REQUEST.EMPLOYER^DIRECTED = 1 THEN
+      BEGIN
+        RESULT := AOE^YES;
+        RETURN;
+      END;
+
+    ! Increased risk test: on premises but not strictly performing duty
+    ! (e.g., walking to break room, using restroom) -- still AOE in most states
+    IF G^REQUEST.INJURY^ON^PREMISES = 1 AND
+       G^REQUEST.DURING^WORK^HOURS = 1 THEN
+      BEGIN
+        ! Apply personal comfort doctrine -- activities incidental to
+        ! employment (eating, restroom, stretching) are compensable
+        RESULT := AOE^YES;
+        RETURN;
+      END;
+
+    ! Check NCCI nature of injury for idiopathic conditions
+    ! Nature codes 60-69 are heart/vascular -- require heightened proof
+    IF G^REQUEST.NCCI^NATURE^INJ[0] = "6" THEN
+      BEGIN
+        ! Idiopathic condition -- requires unusual stress showing
+        IF G^REQUEST.PERFORMING^WORK^DUTY = 1 THEN
+          RESULT := AOE^YES
+        ELSE
+          RESULT := AOE^NO;
+        RETURN;
+      END;
+
+    ! Coming and going rule -- generally not compensable
+    IF G^REQUEST.INJURY^ON^PREMISES = 0 AND
+       G^REQUEST.TRAVELING^FOR^WORK = 0 THEN
+      BEGIN
+        ! Check jurisdiction exceptions to coming-and-going
+        IF G^JURIS^RULE.COMING^GOING^EXCEPT <> 0 THEN
+          BEGIN
+            ! Bit 0: parking lot exception
+            ! Bit 1: employer benefit exception
+            ! Bit 2: dual purpose trip exception
+            ! Bit 3: special hazard exception
+            IF G^JURIS^RULE.COMING^GOING^EXCEPT LAND %B0001 <> 0 THEN
+              BEGIN
+                ! Parking lot exception may apply -- pend for review
+                RESULT := AOE^NO;  ! conservative: deny, let adjuster override
+              END;
+          END
+        ELSE
+          RESULT := AOE^NO;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC EVALUATE^COE -- Course of Employment determination
+! Tests whether injury occurred within the time/space bounds of work.
+! -------------------------------------------------------------------
+PROC EVALUATE^COE(RESULT);
+  INT .RESULT;
+  BEGIN
+    RESULT := COE^NO;
+
+    ! Standard test: during work hours at work location
+    IF G^REQUEST.DURING^WORK^HOURS = 1 AND
+       G^REQUEST.INJURY^ON^PREMISES = 1 THEN
+      BEGIN
+        RESULT := COE^YES;
+        RETURN;
+      END;
+
+    ! Employer-directed off-site activity
+    IF G^REQUEST.EMPLOYER^DIRECTED = 1 THEN
+      BEGIN
+        RESULT := COE^YES;
+        RETURN;
+      END;
+
+    ! Traveling employee -- 24-hour coverage doctrine
+    IF G^REQUEST.TRAVELING^FOR^WORK = 1 THEN
+      BEGIN
+        RESULT := COE^YES;
+        RETURN;
+      END;
+
+    ! On premises outside work hours (early arrival, staying late)
+    IF G^REQUEST.INJURY^ON^PREMISES = 1 THEN
+      BEGIN
+        ! Reasonable proximity to work hours -- generally covered
+        RESULT := COE^YES;
+        RETURN;
+      END;
+
+    ! Horseplay deviation analysis
+    IF G^REQUEST.HORSEPLAY^INVOLVED = 1 THEN
+      BEGIN
+        CASE G^JURIS^RULE.HORSEPLAY^STANDARD OF
+          BEGIN
+            1 -> RESULT := COE^NO;   ! Strict: any horseplay breaks COE
+            2 -> BEGIN                ! Deviation: minor horseplay OK
+                   IF G^REQUEST.PERFORMING^WORK^DUTY = 1 THEN
+                     RESULT := COE^YES
+                   ELSE
+                     RESULT := COE^NO;
+                 END;
+            3 -> RESULT := COE^YES;  ! Abandoned: only total abandonment breaks COE
+          END;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC EVALUATE^EXCLUSIONS -- Check statutory exclusions
+! -------------------------------------------------------------------
+PROC EVALUATE^EXCLUSIONS(EXCL^CODE);
+  INT .EXCL^CODE;
+  BEGIN
+    EXCL^CODE := 0;  ! no exclusion
+
+    ! Intoxication exclusion
+    IF G^REQUEST.INTOX^TEST^POSITIVE = 1 THEN
+      BEGIN
+        CASE G^JURIS^RULE.INTOX^EXCLUSION^TYPE OF
+          BEGIN
+            0 -> ;  ! No intoxication exclusion in this state
+            1 -> BEGIN  ! Sole cause standard
+                   IF G^REQUEST.INTOX^CAUSED^INJURY = 1 AND
+                      G^REQUEST.PERFORMING^WORK^DUTY = 0 THEN
+                     EXCL^CODE := COMP^DENIED^INTOX;
+                 END;
+            2 -> BEGIN  ! Major contributing cause standard
+                   IF G^REQUEST.INTOX^CAUSED^INJURY = 1 THEN
+                     EXCL^CODE := COMP^DENIED^INTOX;
+                 END;
+          END;
+      END;
+
+    IF EXCL^CODE <> 0 THEN RETURN;
+
+    ! Willful misconduct exclusion
+    IF G^REQUEST.WILLFUL^MISCONDUCT = 1 THEN
+      BEGIN
+        IF G^JURIS^RULE.WILLFUL^EXCLUSION^AVAIL = 1 THEN
+          EXCL^CODE := COMP^DENIED^WILLFUL;
+      END;
+
+    IF EXCL^CODE <> 0 THEN RETURN;
+
+    ! Horseplay as exclusion (in strict jurisdictions)
+    IF G^REQUEST.HORSEPLAY^INVOLVED = 1 AND
+       G^JURIS^RULE.HORSEPLAY^STANDARD = 1 THEN
+      EXCL^CODE := COMP^DENIED^HORSEPLAY;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CHECK^SOL^INTERNAL -- Statute of Limitations checking
+! Compares elapsed days against jurisdiction-specific SOL periods.
+! -------------------------------------------------------------------
+PROC CHECK^SOL^INTERNAL(DOI, DOR, DOF, JURIS, SOL^OK);
+  INT(32) DOI, DOR, DOF;
+  STRING .JURIS[0:1];
+  INT .SOL^OK;
+  BEGIN
+    INT(32) DAYS^TO^REPORT;
+    INT(32) DAYS^TO^FILE;
+
+    SOL^OK := 1;  ! assume within SOL
+
+    ! Calculate elapsed days from DOI to date of report
+    DAYS^TO^REPORT := JULIAN^DIFF(DOI, DOR);
+
+    ! Calculate elapsed days from DOI to filing date
+    DAYS^TO^FILE := JULIAN^DIFF(DOI, DOF);
+
+    ! Check reporting deadline
+    IF G^JURIS^RULE.SOL^INJURY^DAYS > 0 AND
+       DAYS^TO^REPORT > G^JURIS^RULE.SOL^INJURY^DAYS THEN
+      BEGIN
+        SOL^OK := 0;
+        RETURN;
+      END;
+
+    ! Check filing deadline
+    IF G^JURIS^RULE.SOL^FILING^DAYS > 0 AND
+       DAYS^TO^FILE > G^JURIS^RULE.SOL^FILING^DAYS THEN
+      BEGIN
+        SOL^OK := 0;
+        RETURN;
+      END;
+
+    ! Occupational disease has separate, longer SOL in most states
+    ! Nature codes 70-79 are occupational disease
+    IF G^REQUEST.NCCI^NATURE^INJ[0] = "7" THEN
+      BEGIN
+        ! For occ disease, SOL runs from date of discovery/diagnosis
+        ! not from date of last exposure -- but we use DOI as proxy
+        IF G^JURIS^RULE.SOL^OCCUPATIONAL^DAYS > 0 AND
+           DAYS^TO^FILE > G^JURIS^RULE.SOL^OCCUPATIONAL^DAYS THEN
+          SOL^OK := 0;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^APPORTIONMENT -- Pre-existing condition apportionment
+! -------------------------------------------------------------------
+PROC CALCULATE^APPORTIONMENT(APPORTION^PCT);
+  INT .APPORTION^PCT;
+  BEGIN
+    ! Use the employer-provided pre-existing percentage as baseline
+    APPORTION^PCT := G^REQUEST.PREEXIST^PERCENT;
+
+    ! Validate range
+    IF APPORTION^PCT < 0 THEN APPORTION^PCT := 0;
+    IF APPORTION^PCT > 100 THEN APPORTION^PCT := 100;
+
+    ! Many jurisdictions do not allow apportionment to pre-existing
+    ! asymptomatic conditions. Check jurisdiction rules.
+    ! If the state doesn't allow apportionment, set to 0
+    ! (full compensability despite pre-existing condition)
+    CALL CHECK^APPORTION^RULES(G^REQUEST.JURISDICTION, APPORTION^PCT);
+  END;
+
+! -------------------------------------------------------------------
+! PROC FILE^APPEAL -- Record an appeal of a compensability denial
+! -------------------------------------------------------------------
+PROC FILE^APPEAL;
+  BEGIN
+    INT STATUS;
+    INT(32) TODAY;
+    INT(32) DAYS^ELAPSED;
+
+    CALL TIMESTAMP(TODAY);
+
+    ! Verify appeal is within the appeal window
+    DAYS^ELAPSED := JULIAN^DIFF(G^DECISION.DECISION^DATE, TODAY);
+    IF DAYS^ELAPSED > G^JURIS^RULE.APPEAL^WINDOW^DAYS THEN
+      BEGIN
+        CALL REPLY^ERROR(207);  ! appeal window expired
+        RETURN;
+      END;
+
+    ! Initialize appeal record
+    G^APPEAL.CLAIM^NUMBER := G^REQUEST.CLAIM^NUMBER;
+    G^APPEAL.APPEAL^DATE^FILED := TODAY;
+    G^APPEAL.HEARING^DATE := 0;  ! TBD by court
+    G^APPEAL.APPEAL^STATUS := APPEAL^FILED;
+    G^APPEAL.ORIGINAL^DECISION := G^DECISION.DECISION^CODE;
+    G^APPEAL.APPEAL^DECISION := 0;  ! not yet decided
+
+    ! Write appeal record under TMF
+    CALL BEGINTRANSACTION(G^TMF^TAG, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    CALL WRITE^APPEAL^RECORD(STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL ABORTTRANSACTION(G^TMF^TAG);
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    ! Update decision record with appeal status
+    G^DECISION.APPEAL^STATUS := APPEAL^FILED;
+    CALL UPDATE^DECISION^RECORD(STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL ABORTTRANSACTION(G^TMF^TAG);
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    CALL ENDTRANSACTION(G^TMF^TAG);
+    CALL REPLY^APPEAL;
+  END;
+
+! -------------------------------------------------------------------
+! PROC LOAD^JURIS^RULES -- Read jurisdiction rule entry by state code
+! -------------------------------------------------------------------
+PROC LOAD^JURIS^RULES(STATE, STATUS);
+  STRING .STATE[0:1];
+  INT .STATUS;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' STATE FOR 2;
+
+    CALL FILE_SETKEY_(G^FILENUM^JURISTBL, KEY^BUF, 2, 0);
+    CALL READ_FILE(G^FILENUM^JURISTBL, G^JURIS^RULE, $LEN(JURIS^SOL^ENTRY),
+                   BYTES^READ);
+    IF BYTES^READ < $LEN(JURIS^SOL^ENTRY) THEN
+      STATUS := 11  ! jurisdiction not found
+    ELSE
+      STATUS := 0;
+  END;
+
+! -------------------------------------------------------------------
+! PROC WRITE^DECISION -- Write compensability decision to Enscribe
+! -------------------------------------------------------------------
+PROC WRITE^DECISION;
+  BEGIN
+    INT STATUS;
+
+    CALL BEGINTRANSACTION(G^TMF^TAG, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    CALL WRITE_FILE(G^FILENUM^COMPDECN, G^DECISION, $LEN(COMP^DECISION));
+    IF <> THEN
+      BEGIN
+        CALL ABORTTRANSACTION(G^TMF^TAG);
+        CALL REPLY^ERROR(6);  ! write failed
+        RETURN;
+      END;
+
+    ! Log compensability activity
+    CALL LOG^ACTIVITY("COMP", G^REQUEST.CLAIM^NUMBER,
+                      G^DECISION.DECISION^CODE);
+
+    CALL ENDTRANSACTION(G^TMF^TAG);
+  END;
+
+! -------------------------------------------------------------------
+! PROC JULIAN^DIFF -- Calculate days between two YYYYMMDD dates
+! -------------------------------------------------------------------
+INT(32) PROC JULIAN^DIFF(DATE1, DATE2);
+  INT(32) DATE1, DATE2;
+  BEGIN
+    INT(32) J1, J2;
+    INT Y1, M1, D1, Y2, M2, D2;
+
+    Y1 := DATE1 / 10000D;
+    M1 := (DATE1 - (Y1 * 10000D)) / 100;
+    D1 := DATE1 - (Y1 * 10000D) - (M1 * 100);
+
+    Y2 := DATE2 / 10000D;
+    M2 := (DATE2 - (Y2 * 10000D)) / 100;
+    D2 := DATE2 - (Y2 * 10000D) - (M2 * 100);
+
+    ! Simplified Julian day calculation
+    J1 := 365 * Y1 + Y1/4 - Y1/100 + Y1/400
+         + (153 * (IF M1 > 2 THEN M1 - 3 ELSE M1 + 9) + 2) / 5
+         + D1;
+    J2 := 365 * Y2 + Y2/4 - Y2/100 + Y2/400
+         + (153 * (IF M2 > 2 THEN M2 - 3 ELSE M2 + 9) + 2) / 5
+         + D2;
+
+    RETURN J2 - J1;
+  END;
+
+! -------------------------------------------------------------------
+! PROC ADD^DAYS -- Add days to a YYYYMMDD date, return new YYYYMMDD
+! -------------------------------------------------------------------
+INT(32) PROC ADD^DAYS(BASE^DATE, NUM^DAYS);
+  INT(32) BASE^DATE;
+  INT     NUM^DAYS;
+  BEGIN
+    INT(32) JULIAN^DAY;
+    INT Y, M, D;
+
+    Y := BASE^DATE / 10000D;
+    M := (BASE^DATE - (Y * 10000D)) / 100;
+    D := BASE^DATE - (Y * 10000D) - (M * 100);
+
+    ! Convert to Julian, add days, convert back
+    JULIAN^DAY := 365 * Y + Y/4 - Y/100 + Y/400
+                + (153 * (IF M > 2 THEN M - 3 ELSE M + 9) + 2) / 5
+                + D + NUM^DAYS;
+
+    ! Reverse Julian conversion (simplified)
+    CALL JULIAN^TO^YMD(JULIAN^DAY, Y, M, D);
+    RETURN Y * 10000D + M * 100 + D;
+  END;
+
+! -------------------------------------------------------------------
+! PROC TIMESTAMP -- Get current date as YYYYMMDD INT(32)
+! -------------------------------------------------------------------
+PROC TIMESTAMP(DATEOUT);
+  INT(32) .DATEOUT;
+  BEGIN
+    INT(32) JULTS;
+    INT YR, MO, DA, HR, MI, SE, MS, DOW;
+
+    CALL JULIANTIMESTAMP(JULTS);
+    CALL INTERPRETTIMESTAMP(JULTS, YR, MO, DA, HR, MI, SE, MS, DOW);
+    DATEOUT := YR * 10000D + MO * 100 + DA;
+  END;

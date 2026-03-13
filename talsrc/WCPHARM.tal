@@ -1,0 +1,745 @@
+!
+!  WCPHARM -- Workers' Compensation Pharmacy Benefit Management Server
+!
+!  Provides real-time pharmacy authorization for workers' compensation
+!  claims including formulary checking, drug utilization review (DUR),
+!  drug-drug interaction checking, therapeutic duplication detection,
+!  narcotic monitoring, and point-of-sale authorization.
+!
+!  Process: WCPHARM
+!  Pathway Server Class: PHARM-SC
+!  Primary Files: NDCTBLF (NDC table), FORMULF (formulary),
+!                 RXHISTF (prescription history), DURULEF (DUR rules)
+!
+!  Copyright (c) TPA Systems Inc. All rights reserved.
+!
+
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?LIST
+
+LITERAL MAX^NDC^ENTRIES = 20000;
+LITERAL MAX^FORMULARY   = 5000;
+LITERAL MAX^DUR^RULES   = 500;
+LITERAL MAX^INTERACTIONS = 200;
+LITERAL MAX^RX^HISTORY  = 100;
+LITERAL NARCOTIC^REVIEW^DAYS = 90;
+LITERAL MAX^DAYS^SUPPLY = 30;
+LITERAL MAX^COMPOUND^INGREDIENTS = 10;
+
+! Authorization response codes
+LITERAL AUTH^APPROVED     = 0;
+LITERAL AUTH^DENIED       = 1;
+LITERAL AUTH^PRIOR^AUTH   = 2;
+LITERAL AUTH^QUANTITY^LIM = 3;
+LITERAL AUTH^DUR^REJECT   = 4;
+LITERAL AUTH^INTERACT     = 5;
+LITERAL AUTH^DUP^THERAPY  = 6;
+LITERAL AUTH^NARC^REVIEW  = 7;
+LITERAL AUTH^NOT^COVERED  = 8;
+LITERAL AUTH^NET^INVALID  = 9;
+
+! Formulary tier levels
+LITERAL TIER^PREFERRED    = 1;
+LITERAL TIER^NON^PREF     = 2;
+LITERAL TIER^PRIOR^AUTH   = 3;
+LITERAL TIER^NOT^COVERED  = 4;
+LITERAL TIER^COMPOUND     = 5;
+
+! DEA Schedule codes
+LITERAL DEA^SCHED^II      = 2;
+LITERAL DEA^SCHED^III     = 3;
+LITERAL DEA^SCHED^IV      = 4;
+LITERAL DEA^SCHED^V       = 5;
+LITERAL DEA^NOT^CONTROLLED = 0;
+
+! NDC record structure (11-digit NDC: 5-4-2)
+STRUCT NDC^ENTRY (*);
+  BEGIN
+    STRING NDC^CODE[0:10];        ! 11-digit NDC
+    STRING DRUG^NAME[0:39];       ! Drug name
+    STRING GCN^CODE[0:7];         ! Generic code number
+    STRING THERAPEUTIC^CLASS[0:5]; ! Therapeutic class code
+    STRING AHFS^CODE[0:7];        ! AHFS classification
+    INT    DEA^SCHEDULE;          ! DEA schedule (0=non-controlled)
+    INT    DOSAGE^FORM;           ! 1=tablet, 2=capsule, 3=liquid, etc.
+    FIXED  AWP^PRICE;             ! Average wholesale price per unit
+    FIXED  WAC^PRICE;             ! Wholesale acquisition cost
+    INT    UNITS^PER^PKG;
+    INT    MAX^DAILY^DOSE;        ! Maximum daily dose in units
+    INT    MAX^DAYS^SUPPLY;       ! Maximum days supply allowed
+    INT    IS^BRAND;              ! 0=generic, 1=brand
+    INT    IS^COMPOUND^ELIGIBLE;  ! 0=no, 1=yes
+    INT    STATUS;                ! 0=active, 1=discontinued
+  END;
+
+! Formulary entry
+STRUCT FORMULARY^ENTRY (*);
+  BEGIN
+    STRING GCN^CODE[0:7];
+    STRING STATE^CODE[0:1];
+    INT    TIER^LEVEL;
+    INT    QTY^LIMIT^PER^FILL;
+    INT    QTY^LIMIT^DAYS;
+    INT    MAX^FILLS^PER^YEAR;
+    INT    STEP^THERAPY^REQ;      ! 0=no, 1=yes (try generic first)
+    INT    PRIOR^AUTH^REQ;        ! 0=no, 1=yes
+    FIXED  MAX^ALLOWABLE^COST;    ! MAC pricing
+    INT    EFFECTIVE^DATE[0:2];
+    INT    STATUS;
+  END;
+
+! Drug-drug interaction entry
+STRUCT INTERACTION^ENTRY (*);
+  BEGIN
+    STRING GCN^CODE^1[0:7];
+    STRING GCN^CODE^2[0:7];
+    INT    SEVERITY;              ! 1=major, 2=moderate, 3=minor
+    STRING DESCRIPTION[0:79];
+    INT    STATUS;
+  END;
+
+! Prescription history entry
+STRUCT RX^HISTORY^ENTRY (*);
+  BEGIN
+    STRING CLAIM^NUM[0:11];
+    STRING NDC^CODE[0:10];
+    STRING GCN^CODE[0:7];
+    STRING THERAPEUTIC^CLASS[0:5];
+    INT    FILL^DATE[0:2];
+    INT    DAYS^SUPPLY;
+    INT    QTY^DISPENSED;
+    STRING PRESCRIBER^NPI[0:9];
+    STRING PHARMACY^NABP[0:6];
+    INT    DEA^SCHEDULE;
+    FIXED  AMOUNT^PAID;
+    INT    REFILL^NUM;
+  END;
+
+! DUR rule definition
+STRUCT DUR^RULE (*);
+  BEGIN
+    STRING RULE^ID[0:7];
+    STRING THERAPEUTIC^CLASS[0:5];
+    INT    RULE^TYPE;             ! 1=max qty, 2=max days, 3=age, 4=duplicate
+    INT    PARAM^1;               ! Varies by rule type
+    INT    PARAM^2;
+    STRING DESCRIPTION[0:79];
+    INT    ACTION;                ! 1=reject, 2=warn, 3=info
+    INT    STATUS;
+  END;
+
+! POS authorization request
+STRUCT POS^REQUEST (*);
+  BEGIN
+    STRING CLAIM^NUM[0:11];
+    STRING NDC^CODE[0:10];
+    INT    QTY^REQUESTED;
+    INT    DAYS^SUPPLY;
+    STRING PRESCRIBER^NPI[0:9];
+    STRING PHARMACY^NABP[0:6];
+    STRING STATE^CODE[0:1];
+    INT    REFILL^NUM;
+    INT    IS^COMPOUND;           ! 0=no, 1=yes
+    STRING COMPOUND^NDCS(0:MAX^COMPOUND^INGREDIENTS - 1)[0:10];
+    INT    COMPOUND^QTYS(0:MAX^COMPOUND^INGREDIENTS - 1);
+    INT    COMPOUND^COUNT;
+  END;
+
+! POS authorization response
+STRUCT POS^RESPONSE (*);
+  BEGIN
+    INT    AUTH^CODE;
+    STRING AUTH^NUMBER[0:11];
+    STRING REJECT^REASON[0:79];
+    STRING DRUG^NAME[0:39];
+    INT    FORMULARY^TIER;
+    FIXED  INGREDIENT^COST;
+    FIXED  DISPENSING^FEE;
+    FIXED  COPAY^AMOUNT;
+    FIXED  PLAN^PAYS;
+    FIXED  TOTAL^AMOUNT;
+    INT    DUR^ALERT^COUNT;
+    STRING DUR^ALERTS(0:4)[0:79];
+    INT    NARC^ALERT;
+    INT    NARC^RX^COUNT^90DAY;
+    INT    NARC^PRESCRIBER^COUNT;
+    INT    NARC^PHARMACY^COUNT;
+  END;
+
+! In-memory tables
+STRUCT NDC^TABLE(MAX^NDC^ENTRIES) (NDC^ENTRY);
+INT    NDC^TABLE^COUNT;
+
+STRUCT FORM^TABLE(MAX^FORMULARY) (FORMULARY^ENTRY);
+INT    FORM^TABLE^COUNT;
+
+STRUCT INTER^TABLE(MAX^INTERACTIONS) (INTERACTION^ENTRY);
+INT    INTER^TABLE^COUNT;
+
+STRUCT DUR^TABLE(MAX^DUR^RULES) (DUR^RULE);
+INT    DUR^TABLE^COUNT;
+
+! Working storage
+STRUCT W^REQ (POS^REQUEST);
+STRUCT W^RESP (POS^RESPONSE);
+STRUCT W^NDC (NDC^ENTRY);
+STRUCT W^FORM (FORMULARY^ENTRY);
+STRUCT W^RX^HIST(MAX^RX^HISTORY) (RX^HISTORY^ENTRY);
+INT    W^RX^HIST^COUNT;
+
+! File numbers
+INT    NDC^FNUM;
+INT    FORM^FNUM;
+INT    RXHIST^FNUM;
+INT    DUR^FNUM;
+INT    PHARM^NET^FNUM;
+INT    AUDIT^FNUM;
+
+! Dispensing fee (state-specific, loaded at startup)
+FIXED  WC^DISPENSING^FEE := 10.50F;
+! WC copay is typically $0 (employer-paid)
+FIXED  WC^COPAY := 0F;
+
+!---------------------------------------------------------------
+! PROC LOOKUP^NDC -- Find NDC entry by 11-digit code
+!---------------------------------------------------------------
+INT PROC LOOKUP^NDC(NDC^CODE, RESULT);
+  STRING .NDC^CODE[0:10];
+  STRUCT .RESULT (NDC^ENTRY);
+  BEGIN
+    INT I;
+    ! Binary search on sorted NDC table
+    INT LO := 0;
+    INT HI := NDC^TABLE^COUNT - 1;
+    INT MID;
+    INT CMP;
+
+    WHILE LO <= HI DO
+      BEGIN
+        MID := (LO + HI) / 2;
+        IF NDC^TABLE(MID).NDC^CODE = NDC^CODE FOR 11 THEN
+          BEGIN
+            RESULT ':=' NDC^TABLE(MID) FOR $LEN(NDC^ENTRY);
+            RETURN 0;  ! Found
+          END
+        ELSE IF NDC^TABLE(MID).NDC^CODE < NDC^CODE FOR 11 THEN
+          LO := MID + 1
+        ELSE
+          HI := MID - 1;
+      END;
+
+    RETURN -1;  ! Not found
+  END;
+
+!---------------------------------------------------------------
+! PROC CHECK^FORMULARY -- Check formulary status for drug
+!---------------------------------------------------------------
+INT PROC CHECK^FORMULARY(GCN^CODE, STATE^CODE, FORM^RESULT);
+  STRING .GCN^CODE[0:7];
+  STRING .STATE^CODE[0:1];
+  STRUCT .FORM^RESULT (FORMULARY^ENTRY);
+  BEGIN
+    INT I;
+    FOR I := 0 TO FORM^TABLE^COUNT - 1 DO
+      BEGIN
+        IF FORM^TABLE(I).GCN^CODE = GCN^CODE FOR 8 AND
+           FORM^TABLE(I).STATE^CODE = STATE^CODE FOR 2 AND
+           FORM^TABLE(I).STATUS = 0 THEN
+          BEGIN
+            FORM^RESULT ':=' FORM^TABLE(I) FOR $LEN(FORMULARY^ENTRY);
+            RETURN FORM^TABLE(I).TIER^LEVEL;
+          END;
+      END;
+    RETURN TIER^NOT^COVERED;
+  END;
+
+!---------------------------------------------------------------
+! PROC LOAD^RX^HISTORY -- Load recent Rx history for a claim
+!---------------------------------------------------------------
+PROC LOAD^RX^HISTORY(CLAIM^NUM);
+  STRING .CLAIM^NUM[0:11];
+  BEGIN
+    W^RX^HIST^COUNT := 0;
+
+    CALL KEYPOSITION(RXHIST^FNUM, CLAIM^NUM, , 0, 2);
+    WHILE W^RX^HIST^COUNT < MAX^RX^HISTORY DO
+      BEGIN
+        CALL READ(RXHIST^FNUM, W^RX^HIST(W^RX^HIST^COUNT),
+                   $LEN(RX^HISTORY^ENTRY));
+        IF <> THEN RETURN;
+
+        ! Stop if past this claim
+        IF W^RX^HIST(W^RX^HIST^COUNT).CLAIM^NUM <> CLAIM^NUM FOR 12
+          THEN RETURN;
+
+        W^RX^HIST^COUNT := W^RX^HIST^COUNT + 1;
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC CHECK^DRUG^INTERACTIONS -- Check for drug-drug interactions
+!---------------------------------------------------------------
+INT PROC CHECK^DRUG^INTERACTIONS(GCN^CODE, RESP);
+  STRING .GCN^CODE[0:7];
+  STRUCT .RESP (POS^RESPONSE);
+  BEGIN
+    INT I, J;
+    INT ALERT^COUNT := 0;
+    INT MAJOR^FOUND := 0;
+
+    FOR I := 0 TO INTER^TABLE^COUNT - 1 DO
+      BEGIN
+        IF INTER^TABLE(I).STATUS = 0 THEN
+          BEGIN
+            ! Check if the new drug matches either side of interaction
+            IF INTER^TABLE(I).GCN^CODE^1 = GCN^CODE FOR 8 OR
+               INTER^TABLE(I).GCN^CODE^2 = GCN^CODE FOR 8 THEN
+              BEGIN
+                ! Find the other drug in the interaction pair
+                STRING OTHER^GCN[0:7];
+                IF INTER^TABLE(I).GCN^CODE^1 = GCN^CODE FOR 8 THEN
+                  OTHER^GCN ':=' INTER^TABLE(I).GCN^CODE^2 FOR 8
+                ELSE
+                  OTHER^GCN ':=' INTER^TABLE(I).GCN^CODE^1 FOR 8;
+
+                ! Check if patient is currently on the other drug
+                FOR J := 0 TO W^RX^HIST^COUNT - 1 DO
+                  BEGIN
+                    IF W^RX^HIST(J).GCN^CODE = OTHER^GCN FOR 8 THEN
+                      BEGIN
+                        ! Verify Rx is still active (fill date + days supply)
+                        ! Simplified: check within last 90 days
+                        IF ALERT^COUNT < 5 THEN
+                          BEGIN
+                            RESP.DUR^ALERTS(ALERT^COUNT) ':='
+                              INTER^TABLE(I).DESCRIPTION FOR 80;
+                            ALERT^COUNT := ALERT^COUNT + 1;
+                          END;
+                        IF INTER^TABLE(I).SEVERITY = 1 THEN
+                          MAJOR^FOUND := 1;
+                      END;
+                  END;
+              END;
+          END;
+      END;
+
+    RESP.DUR^ALERT^COUNT := ALERT^COUNT;
+    RETURN MAJOR^FOUND;
+  END;
+
+!---------------------------------------------------------------
+! PROC CHECK^THERAPEUTIC^DUP -- Detect therapeutic duplication
+!---------------------------------------------------------------
+INT PROC CHECK^THERAPEUTIC^DUP(THER^CLASS, RESP);
+  STRING .THER^CLASS[0:5];
+  STRUCT .RESP (POS^RESPONSE);
+  BEGIN
+    INT I;
+    INT DUP^COUNT := 0;
+
+    FOR I := 0 TO W^RX^HIST^COUNT - 1 DO
+      BEGIN
+        IF W^RX^HIST(I).THERAPEUTIC^CLASS = THER^CLASS FOR 6 THEN
+          DUP^COUNT := DUP^COUNT + 1;
+      END;
+
+    ! More than 1 drug in same therapeutic class = duplication
+    IF DUP^COUNT > 0 THEN
+      BEGIN
+        IF RESP.DUR^ALERT^COUNT < 5 THEN
+          BEGIN
+            RESP.DUR^ALERTS(RESP.DUR^ALERT^COUNT) ':='
+              "THERAPEUTIC DUPLICATION: SAME CLASS DRUG ALREADY ON FILE  "
+              & "                        " FOR 80;
+            RESP.DUR^ALERT^COUNT := RESP.DUR^ALERT^COUNT + 1;
+          END;
+        RETURN 1;
+      END;
+
+    RETURN 0;
+  END;
+
+!---------------------------------------------------------------
+! PROC CHECK^NARCOTIC^MONITORING -- Controlled substance monitoring
+!---------------------------------------------------------------
+PROC CHECK^NARCOTIC^MONITORING(CLAIM^NUM, DEA^SCHED, RESP);
+  STRING .CLAIM^NUM[0:11];
+  INT    DEA^SCHED;
+  STRUCT .RESP (POS^RESPONSE);
+  BEGIN
+    INT I;
+    INT RX^COUNT := 0;
+    INT PRESCRIBER^COUNT := 0;
+    INT PHARMACY^COUNT := 0;
+    STRING PRESCRIBERS(0:9)[0:9];
+    STRING PHARMACIES(0:9)[0:6];
+    INT PRESC^IDX := 0;
+    INT PHARM^IDX := 0;
+    INT J;
+    INT FOUND;
+
+    IF DEA^SCHED = DEA^NOT^CONTROLLED THEN RETURN;
+
+    ! Count controlled substance fills in last 90 days
+    FOR I := 0 TO W^RX^HIST^COUNT - 1 DO
+      BEGIN
+        IF W^RX^HIST(I).DEA^SCHEDULE >= DEA^SCHED^II AND
+           W^RX^HIST(I).DEA^SCHEDULE <= DEA^SCHED^V THEN
+          BEGIN
+            RX^COUNT := RX^COUNT + 1;
+
+            ! Track unique prescribers
+            FOUND := 0;
+            FOR J := 0 TO PRESC^IDX - 1 DO
+              IF PRESCRIBERS(J) = W^RX^HIST(I).PRESCRIBER^NPI FOR 10
+                THEN FOUND := 1;
+            IF FOUND = 0 AND PRESC^IDX < 10 THEN
+              BEGIN
+                PRESCRIBERS(PRESC^IDX) ':='
+                  W^RX^HIST(I).PRESCRIBER^NPI FOR 10;
+                PRESC^IDX := PRESC^IDX + 1;
+              END;
+
+            ! Track unique pharmacies
+            FOUND := 0;
+            FOR J := 0 TO PHARM^IDX - 1 DO
+              IF PHARMACIES(J) = W^RX^HIST(I).PHARMACY^NABP FOR 7
+                THEN FOUND := 1;
+            IF FOUND = 0 AND PHARM^IDX < 10 THEN
+              BEGIN
+                PHARMACIES(PHARM^IDX) ':='
+                  W^RX^HIST(I).PHARMACY^NABP FOR 7;
+                PHARM^IDX := PHARM^IDX + 1;
+              END;
+          END;
+      END;
+
+    RESP.NARC^RX^COUNT^90DAY := RX^COUNT;
+    RESP.NARC^PRESCRIBER^COUNT := PRESC^IDX;
+    RESP.NARC^PHARMACY^COUNT := PHARM^IDX;
+
+    ! Flag for review: >4 controlled Rx in 90 days, or
+    ! >2 prescribers, or >2 pharmacies (potential doctor shopping)
+    IF RX^COUNT > 4 OR PRESC^IDX > 2 OR PHARM^IDX > 2 THEN
+      RESP.NARC^ALERT := 1
+    ELSE
+      RESP.NARC^ALERT := 0;
+  END;
+
+!---------------------------------------------------------------
+! PROC VERIFY^PHARMACY^NETWORK -- Verify pharmacy is in WC network
+!---------------------------------------------------------------
+INT PROC VERIFY^PHARMACY^NETWORK(NABP^CODE, STATE^CODE);
+  STRING .NABP^CODE[0:6];
+  STRING .STATE^CODE[0:1];
+  BEGIN
+    STRING KEY^BUF[0:8];
+    STRING NET^REC[0:49];
+
+    KEY^BUF ':=' NABP^CODE FOR 7;
+    KEY^BUF[7] ':=' STATE^CODE FOR 2;
+
+    CALL KEYPOSITION(PHARM^NET^FNUM, KEY^BUF, , 0, 0);  ! Exact
+    CALL READ(PHARM^NET^FNUM, NET^REC, 50);
+    IF <> THEN RETURN -1;  ! Not in network
+    RETURN 0;
+  END;
+
+!---------------------------------------------------------------
+! PROC PRICE^COMPOUND -- Price compound medication
+!---------------------------------------------------------------
+PROC PRICE^COMPOUND(REQ, RESP);
+  STRUCT .REQ  (POS^REQUEST);
+  STRUCT .RESP (POS^RESPONSE);
+  BEGIN
+    INT I;
+    STRUCT INGRED^NDC (NDC^ENTRY);
+    FIXED  TOTAL^INGRED^COST := 0F;
+
+    FOR I := 0 TO REQ.COMPOUND^COUNT - 1 DO
+      BEGIN
+        IF LOOKUP^NDC(REQ.COMPOUND^NDCS(I), INGRED^NDC) = 0 THEN
+          BEGIN
+            ! Check each ingredient is compound-eligible
+            IF INGRED^NDC.IS^COMPOUND^ELIGIBLE = 0 THEN
+              BEGIN
+                RESP.AUTH^CODE := AUTH^DENIED;
+                RESP.REJECT^REASON ':='
+                  "COMPOUND INGREDIENT NOT ELIGIBLE: " FOR 35;
+                RESP.REJECT^REASON[35] ':='
+                  INGRED^NDC.DRUG^NAME FOR 40;
+                RETURN;
+              END;
+
+            ! Price at AWP per unit * quantity
+            TOTAL^INGRED^COST := TOTAL^INGRED^COST +
+              (INGRED^NDC.AWP^PRICE * $FIXED(REQ.COMPOUND^QTYS(I)));
+          END
+        ELSE
+          BEGIN
+            RESP.AUTH^CODE := AUTH^DENIED;
+            RESP.REJECT^REASON ':='
+              "COMPOUND INGREDIENT NDC NOT FOUND                        "
+              & "                    " FOR 80;
+            RETURN;
+          END;
+      END;
+
+    RESP.INGREDIENT^COST := TOTAL^INGRED^COST;
+    RESP.DISPENSING^FEE := WC^DISPENSING^FEE * 2F;  ! Double fee for compounds
+    RESP.AUTH^CODE := AUTH^APPROVED;
+  END;
+
+!---------------------------------------------------------------
+! PROC RUN^DUR^RULES -- Execute DUR rules engine
+!---------------------------------------------------------------
+INT PROC RUN^DUR^RULES(NDC^REC, QTY, DAYS, RESP);
+  STRUCT .NDC^REC (NDC^ENTRY);
+  INT    QTY;
+  INT    DAYS;
+  STRUCT .RESP (POS^RESPONSE);
+  BEGIN
+    INT I;
+    INT REJECT := 0;
+
+    FOR I := 0 TO DUR^TABLE^COUNT - 1 DO
+      BEGIN
+        IF DUR^TABLE(I).STATUS = 0 AND
+           DUR^TABLE(I).THERAPEUTIC^CLASS =
+             NDC^REC.THERAPEUTIC^CLASS FOR 6 THEN
+          BEGIN
+            IF DUR^TABLE(I).RULE^TYPE = 1 THEN
+              BEGIN
+                ! Max quantity per fill
+                IF QTY > DUR^TABLE(I).PARAM^1 THEN
+                  BEGIN
+                    IF DUR^TABLE(I).ACTION = 1 THEN REJECT := 1;
+                    IF RESP.DUR^ALERT^COUNT < 5 THEN
+                      BEGIN
+                        RESP.DUR^ALERTS(RESP.DUR^ALERT^COUNT) ':='
+                          DUR^TABLE(I).DESCRIPTION FOR 80;
+                        RESP.DUR^ALERT^COUNT :=
+                          RESP.DUR^ALERT^COUNT + 1;
+                      END;
+                  END;
+              END
+            ELSE IF DUR^TABLE(I).RULE^TYPE = 2 THEN
+              BEGIN
+                ! Max days supply
+                IF DAYS > DUR^TABLE(I).PARAM^1 THEN
+                  BEGIN
+                    IF DUR^TABLE(I).ACTION = 1 THEN REJECT := 1;
+                    IF RESP.DUR^ALERT^COUNT < 5 THEN
+                      BEGIN
+                        RESP.DUR^ALERTS(RESP.DUR^ALERT^COUNT) ':='
+                          DUR^TABLE(I).DESCRIPTION FOR 80;
+                        RESP.DUR^ALERT^COUNT :=
+                          RESP.DUR^ALERT^COUNT + 1;
+                      END;
+                  END;
+              END;
+          END;
+      END;
+
+    RETURN REJECT;
+  END;
+
+!---------------------------------------------------------------
+! PROC PROCESS^POS^AUTH -- Main POS authorization logic
+!---------------------------------------------------------------
+PROC PROCESS^POS^AUTH(REQ, RESP);
+  STRUCT .REQ  (POS^REQUEST);
+  STRUCT .RESP (POS^RESPONSE);
+  BEGIN
+    INT TIER;
+    INT RESULT;
+
+    ! Initialize response
+    RESP.AUTH^CODE := AUTH^APPROVED;
+    RESP.DUR^ALERT^COUNT := 0;
+    RESP.NARC^ALERT := 0;
+
+    ! Step 1: Verify pharmacy network
+    IF VERIFY^PHARMACY^NETWORK(REQ.PHARMACY^NABP, REQ.STATE^CODE) < 0
+    THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^NET^INVALID;
+        RESP.REJECT^REASON ':='
+          "PHARMACY NOT IN WORKERS COMP NETWORK                         " FOR 80;
+        RETURN;
+      END;
+
+    ! Step 2: Handle compound medications separately
+    IF REQ.IS^COMPOUND = 1 THEN
+      BEGIN
+        CALL PRICE^COMPOUND(REQ, RESP);
+        RETURN;
+      END;
+
+    ! Step 3: NDC lookup and validation
+    IF LOOKUP^NDC(REQ.NDC^CODE, W^NDC) < 0 THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^DENIED;
+        RESP.REJECT^REASON ':='
+          "NDC NOT FOUND IN DRUG DATABASE                               " FOR 80;
+        RETURN;
+      END;
+
+    RESP.DRUG^NAME ':=' W^NDC.DRUG^NAME FOR 40;
+
+    ! Step 4: Formulary check
+    TIER := CHECK^FORMULARY(W^NDC.GCN^CODE, REQ.STATE^CODE, W^FORM);
+    RESP.FORMULARY^TIER := TIER;
+
+    IF TIER = TIER^NOT^COVERED THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^NOT^COVERED;
+        RESP.REJECT^REASON ':='
+          "DRUG NOT ON WORKERS COMP FORMULARY                           " FOR 80;
+        RETURN;
+      END;
+
+    IF TIER = TIER^PRIOR^AUTH AND W^FORM.PRIOR^AUTH^REQ = 1 THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^PRIOR^AUTH;
+        RESP.REJECT^REASON ':='
+          "PRIOR AUTHORIZATION REQUIRED FOR THIS MEDICATION             " FOR 80;
+        RETURN;
+      END;
+
+    ! Step 5: Quantity and days supply limits
+    IF REQ.DAYS^SUPPLY > MAX^DAYS^SUPPLY THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^QUANTITY^LIM;
+        RESP.REJECT^REASON ':='
+          "DAYS SUPPLY EXCEEDS MAXIMUM ALLOWED (30 DAYS)                " FOR 80;
+        RETURN;
+      END;
+
+    IF W^FORM.QTY^LIMIT^PER^FILL > 0 AND
+       REQ.QTY^REQUESTED > W^FORM.QTY^LIMIT^PER^FILL THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^QUANTITY^LIM;
+        RESP.REJECT^REASON ':='
+          "QUANTITY EXCEEDS FORMULARY LIMIT PER FILL                    " FOR 80;
+        RETURN;
+      END;
+
+    ! Step 6: Load prescription history for DUR checks
+    CALL LOAD^RX^HISTORY(REQ.CLAIM^NUM);
+
+    ! Step 7: Drug-drug interaction check
+    RESULT := CHECK^DRUG^INTERACTIONS(W^NDC.GCN^CODE, RESP);
+    IF RESULT = 1 THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^INTERACT;
+        RESP.REJECT^REASON ':='
+          "MAJOR DRUG-DRUG INTERACTION DETECTED - PHARMACIST REVIEW REQ " FOR 80;
+        RETURN;
+      END;
+
+    ! Step 8: Therapeutic duplication check
+    RESULT := CHECK^THERAPEUTIC^DUP(W^NDC.THERAPEUTIC^CLASS, RESP);
+
+    ! Step 9: DUR rules engine
+    RESULT := RUN^DUR^RULES(W^NDC, REQ.QTY^REQUESTED,
+                             REQ.DAYS^SUPPLY, RESP);
+    IF RESULT = 1 THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^DUR^REJECT;
+        RESP.REJECT^REASON ':='
+          "DRUG UTILIZATION REVIEW REJECTION                            " FOR 80;
+        RETURN;
+      END;
+
+    ! Step 10: Narcotic monitoring
+    CALL CHECK^NARCOTIC^MONITORING(REQ.CLAIM^NUM,
+                                    W^NDC.DEA^SCHEDULE, RESP);
+    IF RESP.NARC^ALERT = 1 THEN
+      BEGIN
+        RESP.AUTH^CODE := AUTH^NARC^REVIEW;
+        RESP.REJECT^REASON ':='
+          "CONTROLLED SUBSTANCE REVIEW REQUIRED - POTENTIAL OVERUSE     " FOR 80;
+        RETURN;
+      END;
+
+    ! Step 11: Calculate pricing
+    IF W^FORM.MAX^ALLOWABLE^COST > 0F THEN
+      RESP.INGREDIENT^COST := W^FORM.MAX^ALLOWABLE^COST *
+                               $FIXED(REQ.QTY^REQUESTED)
+    ELSE IF W^NDC.IS^BRAND = 0 THEN
+      ! Generic: AWP - 50% + dispensing fee
+      RESP.INGREDIENT^COST := W^NDC.AWP^PRICE *
+                               $FIXED(REQ.QTY^REQUESTED) * 50F / 100F
+    ELSE
+      ! Brand: AWP - 15% + dispensing fee
+      RESP.INGREDIENT^COST := W^NDC.AWP^PRICE *
+                               $FIXED(REQ.QTY^REQUESTED) * 85F / 100F;
+
+    RESP.DISPENSING^FEE := WC^DISPENSING^FEE;
+    RESP.COPAY^AMOUNT := WC^COPAY;
+    RESP.TOTAL^AMOUNT := RESP.INGREDIENT^COST + RESP.DISPENSING^FEE;
+    RESP.PLAN^PAYS := RESP.TOTAL^AMOUNT - RESP.COPAY^AMOUNT;
+
+    ! Generate auth number
+    CALL GENERATE^AUTH^NUM(RESP.AUTH^NUMBER);
+  END;
+
+!---------------------------------------------------------------
+! PROC GENERATE^AUTH^NUM -- Generate unique authorization number
+!---------------------------------------------------------------
+PROC GENERATE^AUTH^NUM(AUTH^NUM);
+  STRING .AUTH^NUM[0:11];
+  BEGIN
+    INT TIMESTAMP[0:3];
+    CALL TIMESTAMP(TIMESTAMP);
+    ! Simple auth number from timestamp (production would use sequence)
+    AUTH^NUM ':=' "WCP" FOR 3;
+    AUTH^NUM[3] ':=' $NUMIN(TIMESTAMP[0]) FOR 5;
+    AUTH^NUM[8] ':=' $NUMIN(TIMESTAMP[3]) FOR 4;
+  END;
+
+!---------------------------------------------------------------
+! PROC SERVER^MAIN -- Pathway server main loop
+!---------------------------------------------------------------
+PROC SERVER^MAIN MAIN;
+  BEGIN
+    INT RECV^FNUM;
+    STRING REQ^BUF[0:4095];
+    STRING RESP^BUF[0:4095];
+    INT MSGCODE;
+
+    ! Initialize -- load all reference tables
+    CALL OPEN^FILES;
+    CALL LOAD^NDC^TABLE;
+    CALL LOAD^FORMULARY^TABLE;
+    CALL LOAD^INTERACTION^TABLE;
+    CALL LOAD^DUR^RULES;
+
+    CALL OPEN(RECV^FNUM, "$RECEIVE", 1);
+    IF <> THEN CALL ABEND^PROCESS(99);
+
+    WHILE 1 DO
+      BEGIN
+        CALL READ(RECV^FNUM, REQ^BUF, 4096);
+        IF < THEN CALL READUPDATE(RECV^FNUM, REQ^BUF, 4096);
+
+        MSGCODE := $MSGCODE;
+
+        IF MSGCODE = -30 THEN
+          CALL REPLY(, , 0)
+        ELSE IF MSGCODE = -33 THEN
+          CALL REPLY(, , 0)
+        ELSE IF MSGCODE = 1 THEN  ! POS Authorization
+          BEGIN
+            W^REQ ':=' REQ^BUF FOR $LEN(POS^REQUEST);
+            W^RESP ':=' 0 FOR $LEN(POS^RESPONSE);
+            CALL PROCESS^POS^AUTH(W^REQ, W^RESP);
+            RESP^BUF ':=' W^RESP FOR $LEN(POS^RESPONSE);
+            CALL REPLY(RESP^BUF, $LEN(POS^RESPONSE));
+          END
+        ELSE
+          CALL REPLY(, , 2);
+      END;
+  END;

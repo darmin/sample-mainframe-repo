@@ -1,0 +1,583 @@
+?page "RSVSCR - Reserve Entry/Inquiry Screen"
+?section IDENTIFICATION
+*
+*  SCREEN NAME:   RSVSCR
+*  DESCRIPTION:   Workers' Compensation Reserve Entry and Inquiry Screen
+*  SYSTEM:        Claims Management System (CMS)
+*  PATHWAY:       CLMSRV (Claims Server Class)
+*  AUTHOR:        TPA Systems Development
+*  DATE:          2024-06-15
+*  MODIFIED:      2025-01-22 - Added S&S reserve category per NCCI update
+*
+*  This screen provides adjusters with reserve entry, inquiry, and
+*  modification capabilities for all WC reserve categories. Authority
+*  levels are enforced based on user profile and jurisdiction rules.
+*  All reserve changes are logged to the reserve transaction file.
+*
+?section DATA
+*
+SCREEN RSVSCR.
+*
+    01 RSV-SCREEN-RECORD.
+*
+*--- Claim Header Area (Line 1-3)
+*
+       05 RSV-HDR-CLAIM-NBR       PIC X(12)
+           AT 1, 2
+           DISPLAY LENGTH 12
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-CLAIMANT-NAME   PIC X(30)
+           AT 1, 16
+           DISPLAY LENGTH 30
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-DOI             PIC X(10)
+           AT 1, 50
+           DISPLAY LENGTH 10
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-JURISDICTION    PIC X(2)
+           AT 1, 64
+           DISPLAY LENGTH 2
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-CLAIM-STATUS    PIC X(8)
+           AT 1, 70
+           DISPLAY LENGTH 8
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-EMPLOYER-NAME   PIC X(30)
+           AT 2, 16
+           DISPLAY LENGTH 30
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-BODY-PART       PIC X(20)
+           AT 2, 50
+           DISPLAY LENGTH 20
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-CLAIM-TYPE      PIC X(12)
+           AT 3, 16
+           DISPLAY LENGTH 12
+           PROTECTED
+           VALUE SPACES.
+       05 RSV-HDR-COMPENSABILITY  PIC X(12)
+           AT 3, 50
+           DISPLAY LENGTH 12
+           PROTECTED
+           VALUE SPACES.
+*
+*--- Reserve Category Grid Header (Line 5)
+*
+       05 RSV-GRID-HEADER         PIC X(78)
+           AT 5, 1
+           DISPLAY LENGTH 78
+           PROTECTED
+           VALUE "Category         Outstanding    Paid-to-Date"
+           &     "     Incurred       Change".
+*
+*--- Reserve Category Lines (Lines 6-13)
+*    Category 1: Medical
+*
+       05 RSV-CAT1-LABEL          PIC X(16)
+           AT 6, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Medical         ".
+       05 RSV-CAT1-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 6, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT1-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 6, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT1-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 6, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT1-CHANGE         PIC -(6)9.99
+           AT 6, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*    Category 2: Indemnity - TTD (Temporary Total Disability)
+*
+       05 RSV-CAT2-LABEL          PIC X(16)
+           AT 7, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Indemnity-TTD   ".
+       05 RSV-CAT2-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 7, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT2-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 7, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT2-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 7, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT2-CHANGE         PIC -(6)9.99
+           AT 7, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*    Category 3: Indemnity - TPD (Temporary Partial Disability)
+*
+       05 RSV-CAT3-LABEL          PIC X(16)
+           AT 8, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Indemnity-TPD   ".
+       05 RSV-CAT3-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 8, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT3-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 8, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT3-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 8, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT3-CHANGE         PIC -(6)9.99
+           AT 8, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*    Category 4: Indemnity - PPD (Permanent Partial Disability)
+*
+       05 RSV-CAT4-LABEL          PIC X(16)
+           AT 9, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Indemnity-PPD   ".
+       05 RSV-CAT4-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 9, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT4-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 9, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT4-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 9, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT4-CHANGE         PIC -(6)9.99
+           AT 9, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*    Category 5: Indemnity - PTD (Permanent Total Disability)
+*
+       05 RSV-CAT5-LABEL          PIC X(16)
+           AT 10, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Indemnity-PTD   ".
+       05 RSV-CAT5-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 10, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT5-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 10, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT5-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 10, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT5-CHANGE         PIC -(6)9.99
+           AT 10, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*    Category 6: Expense
+*
+       05 RSV-CAT6-LABEL          PIC X(16)
+           AT 11, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Expense         ".
+       05 RSV-CAT6-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 11, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT6-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 11, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT6-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 11, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT6-CHANGE         PIC -(6)9.99
+           AT 11, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*    Category 7: Legal
+*
+       05 RSV-CAT7-LABEL          PIC X(16)
+           AT 12, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Legal           ".
+       05 RSV-CAT7-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 12, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT7-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 12, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT7-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 12, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT7-CHANGE         PIC -(6)9.99
+           AT 12, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*    Category 8: Subrogation & Salvage
+*
+       05 RSV-CAT8-LABEL          PIC X(16)
+           AT 13, 1
+           DISPLAY LENGTH 16
+           PROTECTED
+           VALUE "Subrog/Salvage  ".
+       05 RSV-CAT8-OUTSTANDING    PIC ZZZ,ZZZ,ZZ9.99
+           AT 13, 18
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT8-PAID           PIC ZZZ,ZZZ,ZZ9.99
+           AT 13, 33
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT8-INCURRED       PIC ZZZ,ZZZ,ZZ9.99
+           AT 13, 48
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-CAT8-CHANGE         PIC -(6)9.99
+           AT 13, 64
+           DISPLAY LENGTH 11
+           UPSHIFT.
+*
+*--- Total Line (Line 15)
+*
+       05 RSV-TOTAL-LABEL         PIC X(16)
+           AT 15, 1
+           DISPLAY LENGTH 16
+           PROTECTED BRIGHT
+           VALUE "TOTAL           ".
+       05 RSV-TOTAL-OUTSTANDING   PIC Z,ZZZ,ZZZ,ZZ9.99
+           AT 15, 18
+           DISPLAY LENGTH 15
+           PROTECTED BRIGHT.
+       05 RSV-TOTAL-PAID          PIC Z,ZZZ,ZZZ,ZZ9.99
+           AT 15, 33
+           DISPLAY LENGTH 15
+           PROTECTED BRIGHT.
+       05 RSV-TOTAL-INCURRED      PIC Z,ZZZ,ZZZ,ZZ9.99
+           AT 15, 48
+           DISPLAY LENGTH 15
+           PROTECTED BRIGHT.
+*
+*--- Reserve Change Detail (Lines 17-20)
+*
+       05 RSV-REASON-CODE         PIC X(3)
+           AT 17, 18
+           DISPLAY LENGTH 3
+           UPSHIFT.
+       05 RSV-REASON-DESC         PIC X(40)
+           AT 17, 24
+           DISPLAY LENGTH 40
+           PROTECTED.
+       05 RSV-NARRATIVE-L1        PIC X(60)
+           AT 18, 18
+           DISPLAY LENGTH 60.
+       05 RSV-NARRATIVE-L2        PIC X(60)
+           AT 19, 18
+           DISPLAY LENGTH 60.
+       05 RSV-NARRATIVE-L3        PIC X(60)
+           AT 20, 18
+           DISPLAY LENGTH 60.
+*
+*--- Authority and Review (Line 22)
+*
+       05 RSV-AUTHORITY-LEVEL     PIC X(15)
+           AT 22, 18
+           DISPLAY LENGTH 15
+           PROTECTED.
+       05 RSV-AUTHORITY-LIMIT     PIC $Z,ZZZ,ZZZ.99
+           AT 22, 36
+           DISPLAY LENGTH 14
+           PROTECTED.
+       05 RSV-APPROVAL-REQUIRED   PIC X(3)
+           AT 22, 55
+           DISPLAY LENGTH 3
+           PROTECTED BLINK.
+       05 RSV-LAST-REVIEW-DATE    PIC X(10)
+           AT 22, 66
+           DISPLAY LENGTH 10
+           PROTECTED.
+*
+*--- Message and Function Key Area (Lines 23-24)
+*
+       05 RSV-MESSAGE-AREA        PIC X(78)
+           AT 23, 1
+           DISPLAY LENGTH 78
+           PROTECTED.
+       05 RSV-FKEY-LINE           PIC X(78)
+           AT 24, 1
+           DISPLAY LENGTH 78
+           PROTECTED
+           VALUE "F3=Exit  F5=Save  F7=History  F8=Approve"
+           &     "                                      ".
+*
+*--- Hidden Fields for Server Communication
+*
+       05 RSV-USER-ID             PIC X(8)   HIDDEN.
+       05 RSV-FUNCTION-CODE       PIC X(2)   HIDDEN.
+       05 RSV-CLAIM-KEY           PIC X(12)  HIDDEN.
+       05 RSV-TIMESTAMP           PIC X(26)  HIDDEN.
+       05 RSV-AUTH-EXCEEDED-FLAG  PIC X(1)   HIDDEN.
+       05 RSV-PENDING-APPROVAL    PIC X(1)   HIDDEN.
+*
+?section LOGIC
+*
+*================================================================
+*  MAIN PROCESSING LOGIC
+*================================================================
+*
+PROCEDURE RSVSCR-MAIN.
+*
+    PERFORM RSV-INITIALIZE.
+    PERFORM RSV-PROCESS UNTIL RSV-FUNCTION-CODE = "EX".
+    PERFORM RSV-TERMINATE.
+*
+END PROCEDURE.
+*
+*================================================================
+*  INITIALIZE SCREEN
+*================================================================
+*
+PROCEDURE RSV-INITIALIZE.
+*
+    DISPLAY BASE RSV-SCREEN-RECORD.
+    MOVE SPACES TO RSV-MESSAGE-AREA.
+    MOVE "IN" TO RSV-FUNCTION-CODE.
+*
+*   Send initial inquiry request to CLMSRV
+*
+    SEND RSV-SCREEN-RECORD TO CLMSRV
+        REPLY LENGTH 2048
+        TIMEOUT 30.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE RSV-SCREEN-RECORD FROM CLMSRV
+        DISPLAY OVERLAY RSV-SCREEN-RECORD
+    ELSE
+        MOVE "ERROR: Server communication failure - contact support"
+            TO RSV-MESSAGE-AREA
+        DISPLAY OVERLAY RSV-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  MAIN PROCESS LOOP
+*================================================================
+*
+PROCEDURE RSV-PROCESS.
+*
+    ACCEPT RSV-SCREEN-RECORD UNTIL
+        F3-KEY, F5-KEY, F7-KEY, F8-KEY.
+*
+    EVALUATE TRUE
+        WHEN F3-KEY
+            MOVE "EX" TO RSV-FUNCTION-CODE
+*
+        WHEN F5-KEY
+            PERFORM RSV-VALIDATE-CHANGES
+            IF RSV-MESSAGE-AREA = SPACES
+                PERFORM RSV-SAVE-RESERVES
+            END-IF
+*
+        WHEN F7-KEY
+            MOVE "HI" TO RSV-FUNCTION-CODE
+            PERFORM RSV-REQUEST-HISTORY
+*
+        WHEN F8-KEY
+            IF RSV-PENDING-APPROVAL = "Y"
+                MOVE "AP" TO RSV-FUNCTION-CODE
+                PERFORM RSV-APPROVE-RESERVES
+            ELSE
+                MOVE "No pending reserve changes to approve"
+                    TO RSV-MESSAGE-AREA
+                DISPLAY OVERLAY RSV-MESSAGE-AREA
+            END-IF
+*
+    END-EVALUATE.
+*
+END PROCEDURE.
+*
+*================================================================
+*  VALIDATE RESERVE CHANGES
+*================================================================
+*
+PROCEDURE RSV-VALIDATE-CHANGES.
+*
+    MOVE SPACES TO RSV-MESSAGE-AREA.
+    MOVE "N" TO RSV-AUTH-EXCEEDED-FLAG.
+*
+*   Check that at least one change amount is non-zero
+*
+    IF RSV-CAT1-CHANGE = ZERO AND RSV-CAT2-CHANGE = ZERO
+       AND RSV-CAT3-CHANGE = ZERO AND RSV-CAT4-CHANGE = ZERO
+       AND RSV-CAT5-CHANGE = ZERO AND RSV-CAT6-CHANGE = ZERO
+       AND RSV-CAT7-CHANGE = ZERO AND RSV-CAT8-CHANGE = ZERO
+        MOVE "No reserve changes entered" TO RSV-MESSAGE-AREA
+        DISPLAY OVERLAY RSV-MESSAGE-AREA
+    END-IF.
+*
+*   Require reason code for any change
+*
+    IF RSV-MESSAGE-AREA = SPACES
+        IF RSV-REASON-CODE = SPACES
+            MOVE "Reason code required for reserve changes"
+                TO RSV-MESSAGE-AREA
+            DISPLAY OVERLAY RSV-MESSAGE-AREA
+        END-IF
+    END-IF.
+*
+*   Require narrative for changes exceeding $10,000
+*
+    IF RSV-MESSAGE-AREA = SPACES
+        IF RSV-CAT1-CHANGE > 10000 OR RSV-CAT2-CHANGE > 10000
+           OR RSV-CAT3-CHANGE > 10000 OR RSV-CAT4-CHANGE > 10000
+           OR RSV-CAT5-CHANGE > 10000 OR RSV-CAT6-CHANGE > 10000
+           OR RSV-CAT7-CHANGE > 10000 OR RSV-CAT8-CHANGE > 10000
+            IF RSV-NARRATIVE-L1 = SPACES
+                MOVE "Narrative required for changes > $10,000"
+                    TO RSV-MESSAGE-AREA
+                DISPLAY OVERLAY RSV-MESSAGE-AREA
+            END-IF
+        END-IF
+    END-IF.
+*
+*   Validate reason code exists (server-side validation)
+*
+    IF RSV-MESSAGE-AREA = SPACES
+        MOVE "VL" TO RSV-FUNCTION-CODE
+        SEND RSV-SCREEN-RECORD TO CLMSRV
+            REPLY LENGTH 2048
+            TIMEOUT 15
+        RECEIVE RSV-SCREEN-RECORD FROM CLMSRV
+        IF RSV-AUTH-EXCEEDED-FLAG = "Y"
+            MOVE "YES" TO RSV-APPROVAL-REQUIRED
+            MOVE "Authority exceeded - supervisor approval required"
+                TO RSV-MESSAGE-AREA
+            DISPLAY OVERLAY RSV-APPROVAL-REQUIRED
+            DISPLAY OVERLAY RSV-MESSAGE-AREA
+        END-IF
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  SAVE RESERVE CHANGES
+*================================================================
+*
+PROCEDURE RSV-SAVE-RESERVES.
+*
+    MOVE "SV" TO RSV-FUNCTION-CODE.
+*
+    SEND RSV-SCREEN-RECORD TO CLMSRV
+        REPLY LENGTH 2048
+        TIMEOUT 30.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE RSV-SCREEN-RECORD FROM CLMSRV
+        DISPLAY OVERLAY RSV-SCREEN-RECORD
+        IF RSV-AUTH-EXCEEDED-FLAG = "Y"
+            MOVE "Reserve change saved - PENDING APPROVAL"
+                TO RSV-MESSAGE-AREA
+            MOVE "Y" TO RSV-PENDING-APPROVAL
+        ELSE
+            MOVE "Reserve change saved successfully"
+                TO RSV-MESSAGE-AREA
+        END-IF
+    ELSE
+        MOVE "ERROR: Save failed - reserve record may be locked"
+            TO RSV-MESSAGE-AREA
+    END-IF.
+*
+    DISPLAY OVERLAY RSV-MESSAGE-AREA.
+*
+END PROCEDURE.
+*
+*================================================================
+*  REQUEST RESERVE HISTORY
+*================================================================
+*
+PROCEDURE RSV-REQUEST-HISTORY.
+*
+    SEND RSV-SCREEN-RECORD TO CLMSRV
+        REPLY LENGTH 2048
+        TIMEOUT 15.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE RSV-SCREEN-RECORD FROM CLMSRV
+        ESCAPE TO RSVHIST
+    ELSE
+        MOVE "ERROR: Unable to retrieve reserve history"
+            TO RSV-MESSAGE-AREA
+        DISPLAY OVERLAY RSV-MESSAGE-AREA
+    END-IF.
+*
+END PROCEDURE.
+*
+*================================================================
+*  APPROVE PENDING RESERVE CHANGES
+*================================================================
+*
+PROCEDURE RSV-APPROVE-RESERVES.
+*
+    SEND RSV-SCREEN-RECORD TO CLMSRV
+        REPLY LENGTH 2048
+        TIMEOUT 30.
+*
+    IF TERMINATION-STATUS = 0
+        RECEIVE RSV-SCREEN-RECORD FROM CLMSRV
+        DISPLAY OVERLAY RSV-SCREEN-RECORD
+        MOVE "N" TO RSV-PENDING-APPROVAL
+        MOVE "   " TO RSV-APPROVAL-REQUIRED
+        MOVE "Reserve change approved and applied"
+            TO RSV-MESSAGE-AREA
+    ELSE
+        MOVE "ERROR: Approval failed - insufficient authority"
+            TO RSV-MESSAGE-AREA
+    END-IF.
+*
+    DISPLAY OVERLAY RSV-MESSAGE-AREA.
+    DISPLAY OVERLAY RSV-APPROVAL-REQUIRED.
+*
+END PROCEDURE.
+*
+*================================================================
+*  TERMINATE SCREEN
+*================================================================
+*
+PROCEDURE RSV-TERMINATE.
+*
+    ESCAPE TO CLMMENU.
+*
+END PROCEDURE.

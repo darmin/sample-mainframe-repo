@@ -1,0 +1,584 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. FNOLSCR.
+      ******************************************************************
+      *  FNOLSCR - First Notice of Loss Entry Screen
+      *  Workers' Compensation TPA System
+      *  HPE NonStop SCREEN COBOL
+      *
+      *  Multi-page terminal screen for FNOL data entry.
+      *  Page 1: Employer Information
+      *  Page 2: Employee Information
+      *  Page 3: Injury Details
+      *  Page 4: Witnesses & Additional Info
+      *
+      *  Function Keys:
+      *    F1=Help  F2=Policy Lookup  F3=Exit  F5=Submit
+      *    F6=Clear  F7=Prev Page  F8=Next Page
+      *
+      *  Pathway SCREEN server, communicates with FNOLPROC via
+      *  PATHSEND for submission and POLSRV for policy lookup.
+      ******************************************************************
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. TANDEM.
+       OBJECT-COMPUTER. TANDEM.
+
+       DATA DIVISION.
+
+       WORKING-STORAGE SECTION.
+
+       01  WS-CONTROL-FIELDS.
+           05  WS-CURRENT-PAGE     PIC 9       VALUE 1.
+           05  WS-FUNCTION-KEY     PIC 99.
+           05  WS-EXIT-FLAG        PIC X       VALUE 'N'.
+               88  WS-EXIT-NOW           VALUE 'Y'.
+           05  WS-SUBMITTED-FLAG   PIC X       VALUE 'N'.
+               88  WS-SUBMITTED          VALUE 'Y'.
+           05  WS-ERROR-FLAG       PIC X       VALUE 'N'.
+               88  WS-HAS-ERRORS         VALUE 'Y'.
+               88  WS-NO-ERRORS          VALUE 'N'.
+           05  WS-DUP-FOUND-FLAG   PIC X       VALUE 'N'.
+               88  WS-DUP-FOUND          VALUE 'Y'.
+
+       01  WS-MESSAGE-LINE         PIC X(78)   VALUE SPACES.
+       01  WS-ERROR-DETAIL         PIC X(78)   VALUE SPACES.
+       01  WS-PAGE-TITLE           PIC X(40)   VALUE SPACES.
+
+      * Policy lookup fields
+       01  WS-POLICY-LOOKUP.
+           05  WS-PL-POLICY-NUM    PIC X(15).
+           05  WS-PL-EMPLOYER-NAME PIC X(60).
+           05  WS-PL-FEIN          PIC X(9).
+           05  WS-PL-EFF-DATE      PIC X(8).
+           05  WS-PL-EXP-DATE      PIC X(8).
+           05  WS-PL-STATUS        PIC X.
+               88  WS-PL-ACTIVE         VALUE 'A'.
+               88  WS-PL-CANCELLED      VALUE 'C'.
+               88  WS-PL-EXPIRED        VALUE 'E'.
+           05  WS-PL-FOUND         PIC X       VALUE 'N'.
+               88  WS-POLICY-FOUND       VALUE 'Y'.
+
+      * FNOL data being entered across all pages
+       01  WS-FNOL-DATA.
+           05  WS-EMPLOYER-SECTION.
+               10  WS-FD-FEIN          PIC X(9).
+               10  WS-FD-POLICY-NUM    PIC X(15).
+               10  WS-FD-EMPLOYER-NAME PIC X(60).
+               10  WS-FD-EMP-CONTACT   PIC X(50).
+               10  WS-FD-EMP-PHONE     PIC X(12).
+               10  WS-FD-EMP-ADDRESS   PIC X(60).
+               10  WS-FD-EMP-CITY      PIC X(30).
+               10  WS-FD-EMP-STATE     PIC X(2).
+               10  WS-FD-EMP-ZIP       PIC X(10).
+           05  WS-EMPLOYEE-SECTION.
+               10  WS-FD-EE-SSN       PIC X(9).
+               10  WS-FD-EE-LAST      PIC X(30).
+               10  WS-FD-EE-FIRST     PIC X(20).
+               10  WS-FD-EE-MI        PIC X(1).
+               10  WS-FD-EE-DOB       PIC X(8).
+               10  WS-FD-EE-GENDER    PIC X(1).
+               10  WS-FD-EE-HIRE-DT   PIC X(8).
+               10  WS-FD-EE-OCC-CODE  PIC 9(4).
+               10  WS-FD-EE-OCC-DESC  PIC X(40).
+               10  WS-FD-EE-WAGE      PIC 9(7)V99.
+               10  WS-FD-EE-WAGE-FREQ PIC X(1).
+                   88  WS-WAGE-WEEKLY       VALUE 'W'.
+                   88  WS-WAGE-BIWEEKLY     VALUE 'B'.
+                   88  WS-WAGE-MONTHLY      VALUE 'M'.
+                   88  WS-WAGE-ANNUAL       VALUE 'A'.
+               10  WS-FD-EE-ADDRESS   PIC X(60).
+               10  WS-FD-EE-CITY      PIC X(30).
+               10  WS-FD-EE-STATE     PIC X(2).
+               10  WS-FD-EE-ZIP       PIC X(10).
+               10  WS-FD-EE-PHONE     PIC X(12).
+           05  WS-INJURY-SECTION.
+               10  WS-FD-INJ-DATE     PIC X(8).
+               10  WS-FD-INJ-TIME     PIC X(4).
+               10  WS-FD-RPT-DATE     PIC X(8).
+               10  WS-FD-INJ-STATE    PIC X(2).
+               10  WS-FD-INJ-COUNTY   PIC X(30).
+               10  WS-FD-BODY-PART    PIC 9(2).
+               10  WS-FD-NATURE       PIC 9(2).
+               10  WS-FD-CAUSE        PIC 9(2).
+               10  WS-FD-INJ-DESC     PIC X(200).
+               10  WS-FD-LOST-DAYS    PIC 9(4).
+               10  WS-FD-HOSPITAL     PIC X(1).
+                   88  WS-HOSPITALIZED      VALUE 'Y'.
+               10  WS-FD-FATALITY     PIC X(1).
+                   88  WS-IS-FATALITY       VALUE 'Y'.
+               10  WS-FD-PHYSICIAN    PIC X(50).
+               10  WS-FD-HOSP-NAME   PIC X(50).
+               10  WS-FD-LOCATION     PIC X(60).
+           05  WS-WITNESS-SECTION.
+               10  WS-FD-WIT1-NAME    PIC X(50).
+               10  WS-FD-WIT1-PHONE   PIC X(12).
+               10  WS-FD-WIT1-STMT    PIC X(1).
+                   88  WS-WIT1-HAS-STMT     VALUE 'Y'.
+               10  WS-FD-WIT2-NAME    PIC X(50).
+               10  WS-FD-WIT2-PHONE   PIC X(12).
+               10  WS-FD-WIT2-STMT    PIC X(1).
+                   88  WS-WIT2-HAS-STMT     VALUE 'Y'.
+               10  WS-FD-SUPV-NAME    PIC X(50).
+               10  WS-FD-SUPV-PHONE   PIC X(12).
+               10  WS-FD-ADDL-NOTES   PIC X(200).
+
+      * PATHSEND communication areas
+       01  WS-PS-FIELDS.
+           05  WS-PS-FNOL-SERVER   PIC X(16)
+                                   VALUE "$FNOL           ".
+           05  WS-PS-POL-SERVER    PIC X(16)
+                                   VALUE "$POLSRV         ".
+           05  WS-PS-TIMEOUT       PIC S9(9)  COMP VALUE 3000.
+           05  WS-PS-ERROR         PIC S9(4)  COMP.
+           05  WS-PS-REPLY-LEN     PIC S9(4)  COMP.
+
+      * Reply from FNOL server
+       01  WS-FNOL-REPLY.
+           05  WS-FR-RETURN-CODE   PIC 9(2).
+           05  WS-FR-ERROR-CODE    PIC 9(4).
+           05  WS-FR-CLAIM-NUMBER  PIC X(15).
+           05  WS-FR-ADJUSTER-ID   PIC X(8).
+           05  WS-FR-INJ-CLASS     PIC 9.
+           05  WS-FR-ERROR-MSG     PIC X(80).
+
+       SCREEN SECTION.
+
+      ******************************************************************
+      *  SCREEN: FNOL-HEADER -- Common header for all pages
+      ******************************************************************
+       01  FNOL-HEADER.
+           05  BLANK SCREEN.
+           05  LINE 01 COL 01 VALUE
+               "MAINFRAME-MOD  WORKERS' COMP TPA".
+           05  LINE 01 COL 50 VALUE "FNOL ENTRY".
+           05  LINE 01 COL 68
+               FROM WS-PAGE-TITLE.
+           05  LINE 02 COL 01 VALUE ALL "=".
+           05  LINE 24 COL 01 VALUE
+               "F1=Help F2=Policy F3=Exit F5=Submit F6=Clear"
+               & " F7=Prev F8=Next".
+
+      ******************************************************************
+      *  SCREEN: PAGE1-EMPLOYER -- Employer Information
+      ******************************************************************
+       01  PAGE1-EMPLOYER-SCREEN.
+           05  LINE 03 COL 01 VALUE "EMPLOYER INFORMATION".
+           05  LINE 03 COL 60 VALUE "Page 1 of 4".
+           05  LINE 05 COL 02 VALUE "Policy Number:".
+           05  LINE 05 COL 20
+               USING WS-FD-POLICY-NUM.
+           05  LINE 05 COL 40 VALUE "(F2 to lookup)".
+           05  LINE 07 COL 02 VALUE "Employer FEIN:".
+           05  LINE 07 COL 20
+               USING WS-FD-FEIN.
+           05  LINE 09 COL 02 VALUE "Employer Name:".
+           05  LINE 09 COL 20
+               USING WS-FD-EMPLOYER-NAME.
+           05  LINE 11 COL 02 VALUE "Contact Name:".
+           05  LINE 11 COL 20
+               USING WS-FD-EMP-CONTACT.
+           05  LINE 12 COL 02 VALUE "Contact Phone:".
+           05  LINE 12 COL 20
+               USING WS-FD-EMP-PHONE.
+           05  LINE 14 COL 02 VALUE "Address:".
+           05  LINE 14 COL 20
+               USING WS-FD-EMP-ADDRESS.
+           05  LINE 15 COL 02 VALUE "City:".
+           05  LINE 15 COL 20
+               USING WS-FD-EMP-CITY.
+           05  LINE 15 COL 55 VALUE "State:".
+           05  LINE 15 COL 62
+               USING WS-FD-EMP-STATE.
+           05  LINE 16 COL 02 VALUE "Zip:".
+           05  LINE 16 COL 20
+               USING WS-FD-EMP-ZIP.
+           05  LINE 18 COL 02
+               FROM WS-MESSAGE-LINE.
+           05  LINE 19 COL 02
+               FROM WS-ERROR-DETAIL.
+
+      ******************************************************************
+      *  SCREEN: PAGE2-EMPLOYEE -- Employee Demographics
+      ******************************************************************
+       01  PAGE2-EMPLOYEE-SCREEN.
+           05  LINE 03 COL 01 VALUE "EMPLOYEE INFORMATION".
+           05  LINE 03 COL 60 VALUE "Page 2 of 4".
+           05  LINE 05 COL 02 VALUE "SSN:".
+           05  LINE 05 COL 20
+               USING WS-FD-EE-SSN.
+           05  LINE 05 COL 35 VALUE "(No dashes)".
+           05  LINE 07 COL 02 VALUE "Last Name:".
+           05  LINE 07 COL 20
+               USING WS-FD-EE-LAST.
+           05  LINE 08 COL 02 VALUE "First Name:".
+           05  LINE 08 COL 20
+               USING WS-FD-EE-FIRST.
+           05  LINE 08 COL 45 VALUE "MI:".
+           05  LINE 08 COL 49
+               USING WS-FD-EE-MI.
+           05  LINE 10 COL 02 VALUE "Date of Birth:".
+           05  LINE 10 COL 20
+               USING WS-FD-EE-DOB.
+           05  LINE 10 COL 35 VALUE "(YYYYMMDD)".
+           05  LINE 10 COL 50 VALUE "Gender:".
+           05  LINE 10 COL 58
+               USING WS-FD-EE-GENDER.
+           05  LINE 12 COL 02 VALUE "Hire Date:".
+           05  LINE 12 COL 20
+               USING WS-FD-EE-HIRE-DT.
+           05  LINE 13 COL 02 VALUE "Occupation Code:".
+           05  LINE 13 COL 20
+               USING WS-FD-EE-OCC-CODE.
+           05  LINE 13 COL 30 VALUE "Desc:".
+           05  LINE 13 COL 36
+               USING WS-FD-EE-OCC-DESC.
+           05  LINE 15 COL 02 VALUE "Avg Weekly Wage: $".
+           05  LINE 15 COL 21
+               USING WS-FD-EE-WAGE.
+           05  LINE 15 COL 38 VALUE "Freq:".
+           05  LINE 15 COL 44
+               USING WS-FD-EE-WAGE-FREQ.
+           05  LINE 15 COL 48 VALUE "(W/B/M/A)".
+           05  LINE 17 COL 02 VALUE "Address:".
+           05  LINE 17 COL 20
+               USING WS-FD-EE-ADDRESS.
+           05  LINE 18 COL 02 VALUE "City:".
+           05  LINE 18 COL 20
+               USING WS-FD-EE-CITY.
+           05  LINE 18 COL 55 VALUE "St:".
+           05  LINE 18 COL 59
+               USING WS-FD-EE-STATE.
+           05  LINE 19 COL 02 VALUE "Zip:".
+           05  LINE 19 COL 20
+               USING WS-FD-EE-ZIP.
+           05  LINE 19 COL 38 VALUE "Phone:".
+           05  LINE 19 COL 45
+               USING WS-FD-EE-PHONE.
+           05  LINE 21 COL 02
+               FROM WS-MESSAGE-LINE.
+           05  LINE 22 COL 02
+               FROM WS-ERROR-DETAIL.
+
+      ******************************************************************
+      *  SCREEN: PAGE3-INJURY -- Injury Details
+      ******************************************************************
+       01  PAGE3-INJURY-SCREEN.
+           05  LINE 03 COL 01 VALUE "INJURY DETAILS".
+           05  LINE 03 COL 60 VALUE "Page 3 of 4".
+           05  LINE 05 COL 02 VALUE "Date of Injury:".
+           05  LINE 05 COL 20
+               USING WS-FD-INJ-DATE.
+           05  LINE 05 COL 35 VALUE "(YYYYMMDD)".
+           05  LINE 05 COL 50 VALUE "Time:".
+           05  LINE 05 COL 56
+               USING WS-FD-INJ-TIME.
+           05  LINE 06 COL 02 VALUE "Date Reported:".
+           05  LINE 06 COL 20
+               USING WS-FD-RPT-DATE.
+           05  LINE 08 COL 02 VALUE "State of Injury:".
+           05  LINE 08 COL 20
+               USING WS-FD-INJ-STATE.
+           05  LINE 08 COL 28 VALUE "County:".
+           05  LINE 08 COL 36
+               USING WS-FD-INJ-COUNTY.
+           05  LINE 10 COL 02 VALUE "Body Part (NCCI):".
+           05  LINE 10 COL 20
+               USING WS-FD-BODY-PART.
+           05  LINE 10 COL 28 VALUE "Nature:".
+           05  LINE 10 COL 36
+               USING WS-FD-NATURE.
+           05  LINE 10 COL 44 VALUE "Cause:".
+           05  LINE 10 COL 51
+               USING WS-FD-CAUSE.
+           05  LINE 12 COL 02 VALUE "Injury Description:".
+           05  LINE 13 COL 04
+               USING WS-FD-INJ-DESC.
+           05  LINE 16 COL 02 VALUE "Lost Time Days:".
+           05  LINE 16 COL 20
+               USING WS-FD-LOST-DAYS.
+           05  LINE 16 COL 30 VALUE "Hospitalized?".
+           05  LINE 16 COL 44
+               USING WS-FD-HOSPITAL.
+           05  LINE 16 COL 50 VALUE "Fatality?".
+           05  LINE 16 COL 60
+               USING WS-FD-FATALITY.
+           05  LINE 18 COL 02 VALUE "Treating Physician:".
+           05  LINE 18 COL 22
+               USING WS-FD-PHYSICIAN.
+           05  LINE 19 COL 02 VALUE "Hospital/Clinic:".
+           05  LINE 19 COL 22
+               USING WS-FD-HOSP-NAME.
+           05  LINE 20 COL 02 VALUE "Injury Location:".
+           05  LINE 20 COL 22
+               USING WS-FD-LOCATION.
+           05  LINE 22 COL 02
+               FROM WS-MESSAGE-LINE.
+
+      ******************************************************************
+      *  SCREEN: PAGE4-WITNESS -- Witnesses & Additional
+      ******************************************************************
+       01  PAGE4-WITNESS-SCREEN.
+           05  LINE 03 COL 01 VALUE "WITNESSES & ADDITIONAL INFO".
+           05  LINE 03 COL 60 VALUE "Page 4 of 4".
+           05  LINE 05 COL 02 VALUE "--- Witness 1 ---".
+           05  LINE 06 COL 02 VALUE "Name:".
+           05  LINE 06 COL 12
+               USING WS-FD-WIT1-NAME.
+           05  LINE 07 COL 02 VALUE "Phone:".
+           05  LINE 07 COL 12
+               USING WS-FD-WIT1-PHONE.
+           05  LINE 07 COL 30 VALUE "Statement? (Y/N):".
+           05  LINE 07 COL 49
+               USING WS-FD-WIT1-STMT.
+           05  LINE 09 COL 02 VALUE "--- Witness 2 ---".
+           05  LINE 10 COL 02 VALUE "Name:".
+           05  LINE 10 COL 12
+               USING WS-FD-WIT2-NAME.
+           05  LINE 11 COL 02 VALUE "Phone:".
+           05  LINE 11 COL 12
+               USING WS-FD-WIT2-PHONE.
+           05  LINE 11 COL 30 VALUE "Statement? (Y/N):".
+           05  LINE 11 COL 49
+               USING WS-FD-WIT2-STMT.
+           05  LINE 13 COL 02 VALUE "--- Supervisor ---".
+           05  LINE 14 COL 02 VALUE "Name:".
+           05  LINE 14 COL 12
+               USING WS-FD-SUPV-NAME.
+           05  LINE 15 COL 02 VALUE "Phone:".
+           05  LINE 15 COL 12
+               USING WS-FD-SUPV-PHONE.
+           05  LINE 17 COL 02 VALUE "Additional Notes:".
+           05  LINE 18 COL 04
+               USING WS-FD-ADDL-NOTES.
+           05  LINE 21 COL 02
+               FROM WS-MESSAGE-LINE.
+           05  LINE 22 COL 02
+               FROM WS-ERROR-DETAIL.
+
+      ******************************************************************
+      *  SCREEN: SUBMIT-CONFIRM -- Submission confirmation
+      ******************************************************************
+       01  SUBMIT-CONFIRM-SCREEN.
+           05  LINE 10 COL 15 VALUE
+               "FNOL submitted successfully!".
+           05  LINE 12 COL 15 VALUE "Claim Number: ".
+           05  LINE 12 COL 30
+               FROM WS-FR-CLAIM-NUMBER.
+           05  LINE 13 COL 15 VALUE "Assigned To:  ".
+           05  LINE 13 COL 30
+               FROM WS-FR-ADJUSTER-ID.
+           05  LINE 15 COL 15 VALUE
+               "Press any key to continue...".
+
+       PROCEDURE DIVISION.
+
+       0000-MAIN-CONTROL.
+           PERFORM 1000-INITIALIZE
+           PERFORM 2000-SCREEN-LOOP
+               UNTIL WS-EXIT-NOW OR WS-SUBMITTED
+           PERFORM 9000-TERMINATE
+           STOP RUN.
+
+       1000-INITIALIZE.
+           MOVE SPACES TO WS-FNOL-DATA
+           MOVE SPACES TO WS-MESSAGE-LINE
+           MOVE SPACES TO WS-ERROR-DETAIL
+           MOVE 1 TO WS-CURRENT-PAGE
+           MOVE 'N' TO WS-EXIT-FLAG
+           MOVE 'N' TO WS-SUBMITTED-FLAG.
+
+       2000-SCREEN-LOOP.
+           PERFORM 2100-DISPLAY-CURRENT-PAGE
+           PERFORM 2200-ACCEPT-INPUT
+           PERFORM 2300-PROCESS-FUNCTION-KEY.
+
+       2100-DISPLAY-CURRENT-PAGE.
+           DISPLAY FNOL-HEADER
+           EVALUATE WS-CURRENT-PAGE
+               WHEN 1
+                   MOVE "Employer" TO WS-PAGE-TITLE
+                   DISPLAY PAGE1-EMPLOYER-SCREEN
+               WHEN 2
+                   MOVE "Employee" TO WS-PAGE-TITLE
+                   DISPLAY PAGE2-EMPLOYEE-SCREEN
+               WHEN 3
+                   MOVE "Injury" TO WS-PAGE-TITLE
+                   DISPLAY PAGE3-INJURY-SCREEN
+               WHEN 4
+                   MOVE "Witnesses" TO WS-PAGE-TITLE
+                   DISPLAY PAGE4-WITNESS-SCREEN
+           END-EVALUATE.
+
+       2200-ACCEPT-INPUT.
+           EVALUATE WS-CURRENT-PAGE
+               WHEN 1  ACCEPT PAGE1-EMPLOYER-SCREEN
+               WHEN 2  ACCEPT PAGE2-EMPLOYEE-SCREEN
+               WHEN 3  ACCEPT PAGE3-INJURY-SCREEN
+               WHEN 4  ACCEPT PAGE4-WITNESS-SCREEN
+           END-EVALUATE.
+
+       2300-PROCESS-FUNCTION-KEY.
+           MOVE SPACES TO WS-MESSAGE-LINE
+           MOVE SPACES TO WS-ERROR-DETAIL
+           EVALUATE WS-FUNCTION-KEY
+               WHEN 1
+                   PERFORM 3000-SHOW-HELP
+               WHEN 2
+                   PERFORM 4000-POLICY-LOOKUP
+               WHEN 3
+                   SET WS-EXIT-NOW TO TRUE
+               WHEN 5
+                   PERFORM 5000-VALIDATE-ALL-PAGES
+                   IF WS-NO-ERRORS
+                       PERFORM 6000-CHECK-DUPLICATE
+                       IF NOT WS-DUP-FOUND
+                           PERFORM 7000-SUBMIT-FNOL
+                       END-IF
+                   END-IF
+               WHEN 6
+                   PERFORM 1000-INITIALIZE
+               WHEN 7
+                   IF WS-CURRENT-PAGE > 1
+                       SUBTRACT 1 FROM WS-CURRENT-PAGE
+                   ELSE
+                       MOVE "Already on first page" TO WS-MESSAGE-LINE
+                   END-IF
+               WHEN 8
+                   IF WS-CURRENT-PAGE < 4
+                       ADD 1 TO WS-CURRENT-PAGE
+                   ELSE
+                       MOVE "Already on last page - F5 to submit"
+                           TO WS-MESSAGE-LINE
+                   END-IF
+               WHEN OTHER
+                   MOVE "Invalid function key" TO WS-MESSAGE-LINE
+           END-EVALUATE.
+
+       3000-SHOW-HELP.
+           MOVE "F2=Lookup policy  F5=Submit  F7/F8=Page nav"
+               TO WS-MESSAGE-LINE.
+
+       4000-POLICY-LOOKUP.
+           IF WS-FD-POLICY-NUM = SPACES
+               MOVE "Enter policy number first, then press F2"
+                   TO WS-MESSAGE-LINE
+               EXIT PARAGRAPH
+           END-IF
+           MOVE WS-FD-POLICY-NUM TO WS-PL-POLICY-NUM
+
+           CALL "SERVERCLASS_DIALOG_BEGIN_" USING
+               WS-PS-POL-SERVER
+               WS-PS-ERROR
+           CALL "SERVERCLASS_DIALOG_SEND_" USING
+               WS-PL-POLICY-NUM
+               LENGTH OF WS-PL-POLICY-NUM
+               WS-POLICY-LOOKUP
+               LENGTH OF WS-POLICY-LOOKUP
+               WS-PS-REPLY-LEN
+               WS-PS-TIMEOUT
+               WS-PS-ERROR
+           CALL "SERVERCLASS_DIALOG_END_" USING
+               WS-PS-ERROR
+
+           IF WS-POLICY-FOUND
+               MOVE WS-PL-EMPLOYER-NAME TO WS-FD-EMPLOYER-NAME
+               MOVE WS-PL-FEIN TO WS-FD-FEIN
+               IF WS-PL-ACTIVE
+                   MOVE "Policy found - employer info populated"
+                       TO WS-MESSAGE-LINE
+               ELSE
+                   STRING "WARNING: Policy status is "
+                       WS-PL-STATUS
+                       " - verify coverage" DELIMITED BY SIZE
+                       INTO WS-MESSAGE-LINE
+               END-IF
+           ELSE
+               MOVE "Policy not found - verify number"
+                   TO WS-MESSAGE-LINE
+           END-IF.
+
+       5000-VALIDATE-ALL-PAGES.
+           SET WS-NO-ERRORS TO TRUE
+           IF WS-FD-FEIN = SPACES
+               SET WS-HAS-ERRORS TO TRUE
+               MOVE "Employer FEIN is required (Page 1)"
+                   TO WS-ERROR-DETAIL
+               MOVE 1 TO WS-CURRENT-PAGE
+               EXIT PARAGRAPH
+           END-IF
+           IF WS-FD-POLICY-NUM = SPACES
+               SET WS-HAS-ERRORS TO TRUE
+               MOVE "Policy number is required (Page 1)"
+                   TO WS-ERROR-DETAIL
+               MOVE 1 TO WS-CURRENT-PAGE
+               EXIT PARAGRAPH
+           END-IF
+           IF WS-FD-EE-SSN = SPACES
+               SET WS-HAS-ERRORS TO TRUE
+               MOVE "Employee SSN is required (Page 2)"
+                   TO WS-ERROR-DETAIL
+               MOVE 2 TO WS-CURRENT-PAGE
+               EXIT PARAGRAPH
+           END-IF
+           IF WS-FD-EE-LAST = SPACES
+               SET WS-HAS-ERRORS TO TRUE
+               MOVE "Employee last name is required (Page 2)"
+                   TO WS-ERROR-DETAIL
+               MOVE 2 TO WS-CURRENT-PAGE
+               EXIT PARAGRAPH
+           END-IF
+           IF WS-FD-INJ-DATE = SPACES
+               SET WS-HAS-ERRORS TO TRUE
+               MOVE "Date of injury is required (Page 3)"
+                   TO WS-ERROR-DETAIL
+               MOVE 3 TO WS-CURRENT-PAGE
+               EXIT PARAGRAPH
+           END-IF
+           IF WS-FD-INJ-STATE = SPACES
+               SET WS-HAS-ERRORS TO TRUE
+               MOVE "State of injury is required (Page 3)"
+                   TO WS-ERROR-DETAIL
+               MOVE 3 TO WS-CURRENT-PAGE
+               EXIT PARAGRAPH
+           END-IF
+           MOVE "All fields validated - press F5 to submit"
+               TO WS-MESSAGE-LINE.
+
+       6000-CHECK-DUPLICATE.
+           MOVE 'N' TO WS-DUP-FOUND-FLAG
+           MOVE "Checking for duplicate claims..."
+               TO WS-MESSAGE-LINE.
+      *    Duplicate check done server-side during submission.
+
+       7000-SUBMIT-FNOL.
+           MOVE "Submitting FNOL to processing server..."
+               TO WS-MESSAGE-LINE
+
+           CALL "SERVERCLASS_DIALOG_BEGIN_" USING
+               WS-PS-FNOL-SERVER
+               WS-PS-ERROR
+           CALL "SERVERCLASS_DIALOG_SEND_" USING
+               WS-FNOL-DATA
+               LENGTH OF WS-FNOL-DATA
+               WS-FNOL-REPLY
+               LENGTH OF WS-FNOL-REPLY
+               WS-PS-REPLY-LEN
+               WS-PS-TIMEOUT
+               WS-PS-ERROR
+           CALL "SERVERCLASS_DIALOG_END_" USING
+               WS-PS-ERROR
+
+           IF WS-FR-RETURN-CODE = 0
+               SET WS-SUBMITTED TO TRUE
+               DISPLAY FNOL-HEADER
+               DISPLAY SUBMIT-CONFIRM-SCREEN
+               ACCEPT SUBMIT-CONFIRM-SCREEN
+           ELSE
+               STRING "FNOL rejected: " WS-FR-ERROR-MSG
+                   DELIMITED BY "  " INTO WS-ERROR-DETAIL
+               MOVE "Submission failed - correct errors and retry"
+                   TO WS-MESSAGE-LINE
+           END-IF.
+
+       9000-TERMINATE.
+           CONTINUE.

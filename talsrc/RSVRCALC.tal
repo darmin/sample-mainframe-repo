@@ -1,0 +1,591 @@
+?SECTION RSVRCALC
+?PAGE "Reserve Calculation Engine — Workers' Compensation TPA"
+!---------------------------------------------------------------------
+! RSVRCALC — Reserve Calculation Engine
+!
+! Calculates medical, indemnity, expense, and subrogation reserves
+! for workers' compensation claims. Implements staircase methodology,
+! IBNR factors, statutory limits, and life pension computations.
+!
+! Process: RSVRCALC
+! Pathway Server Class: RSVC-SVR
+! TMF Protected: Yes
+! Enscribe Files: RSVTBL (key-seq), JURISTBL (key-seq), CLMRSV (relative)
+!---------------------------------------------------------------------
+
+?NOLIST
+?SOURCE $SYSTEM.SYSTEM.EXTDECS0 (INITIALIZER, SERVERCLASS_SEND_,
+   FILE_OPEN_, FILE_READ64_, FILE_READLOCK64_, FILE_WRITEUPDATE64_,
+   FILE_CLOSE_, MONITORCPUS, PROCESS_GETINFO_,
+   ABEND, TMF_BEGINTRANSACTION_, TMF_ENDTRANSACTION_,
+   TMF_ABORTTRANSACTION_, TIMESTAMP)
+?LIST
+
+LITERAL MAX^RESERVE^CATEGORIES = 6;
+LITERAL RSV^MEDICAL            = 0;
+LITERAL RSV^TTD                = 1;
+LITERAL RSV^TPD                = 2;
+LITERAL RSV^PPD                = 3;
+LITERAL RSV^PTD                = 4;
+LITERAL RSV^EXPENSE            = 5;
+
+LITERAL INJURY^SOFT^TISSUE     = 1;
+LITERAL INJURY^FRACTURE        = 2;
+LITERAL INJURY^SPINAL          = 3;
+LITERAL INJURY^HEAD            = 4;
+LITERAL INJURY^BURN            = 5;
+LITERAL INJURY^AMPUTATION      = 6;
+LITERAL INJURY^OCCUPATIONAL    = 7;
+
+LITERAL MAX^JURISDICTIONS      = 56;   ! 50 states + DC + territories
+LITERAL MAX^STAIRCASE^STEPS    = 8;
+LITERAL WEEKS^PER^YEAR         = 52;
+LITERAL DAYS^PER^WEEK          = 7;
+
+! Dollar amounts stored as FIXED(2) — cents precision
+DEFINE DOLLARS = FIXED(2);
+
+!---------------------------------------------------------------------
+! Reserve Table Record — keyed by jurisdiction + injury type
+!---------------------------------------------------------------------
+STRUCT RESERVE^TABLE^REC;
+  BEGIN
+    STRING  JURISDICTION^CODE[0:1];      ! 2-char state code
+    INT     INJURY^TYPE;
+    INT     BODY^PART^CODE;
+    DOLLARS BASE^MEDICAL^RESERVE;
+    DOLLARS BASE^INDEMNITY^RESERVE;
+    DOLLARS BASE^EXPENSE^RESERVE;
+    DOLLARS STAT^MAX^MEDICAL;            ! Statutory maximum medical
+    DOLLARS STAT^MAX^WEEKLY^TTD;         ! Max TTD weekly rate
+    DOLLARS STAT^MAX^WEEKLY^PPD;         ! Max PPD weekly rate
+    INT     MAX^TTD^WEEKS;               ! Maximum TTD duration
+    INT     MAX^PPD^WEEKS;               ! Maximum PPD duration
+    INT     MMI^MONTHS^TYPICAL;          ! Typical months to MMI
+    FIXED   IBNR^FACTOR;                 ! Incurred But Not Reported factor
+    FIXED   STAIRCASE^PCTS[0:MAX^STAIRCASE^STEPS - 1]; ! Quarterly %
+    INT     STAIRCASE^QUARTERS;          ! Number of staircase steps
+    DOLLARS LIFE^PENSION^WEEKLY;         ! PTD life pension rate
+    INT     LIFE^EXPECTANCY^YEARS;       ! Actuarial life expectancy
+  END;
+
+!---------------------------------------------------------------------
+! Claim Reserve Record — current reserves for a claim
+!---------------------------------------------------------------------
+STRUCT CLAIM^RESERVE^REC;
+  BEGIN
+    STRING  CLAIM^NUMBER[0:11];          ! 12-char claim number
+    STRING  JURISDICTION[0:1];
+    INT     INJURY^TYPE;
+    INT     BODY^PART;
+    INT     CLAIMANT^AGE;
+    INT(32) INJURY^DATE;                 ! Julian date of injury
+    INT(32) LAST^CALC^DATE;              ! Last reserve calculation
+    DOLLARS MEDICAL^RESERVE;
+    DOLLARS TTD^RESERVE;
+    DOLLARS TPD^RESERVE;
+    DOLLARS PPD^RESERVE;
+    DOLLARS PTD^RESERVE;
+    DOLLARS EXPENSE^LEGAL;
+    DOLLARS EXPENSE^IME;
+    DOLLARS EXPENSE^INVEST;
+    DOLLARS TOTAL^OUTSTANDING;
+    DOLLARS TOTAL^PAID;
+    DOLLARS TOTAL^INCURRED;              ! Paid + Outstanding
+    INT     RESERVE^STATUS;              ! 0=open, 1=reviewed, 2=closed
+    INT     REVIEW^CYCLE^DAYS;           ! Days between mandatory reviews
+    INT(32) NEXT^REVIEW^DATE;
+    STRING  ADJUSTER^ID[0:7];
+    STRING  LAST^CALC^REASON[0:29];
+  END;
+
+!---------------------------------------------------------------------
+! Staircase calculation context
+!---------------------------------------------------------------------
+STRUCT STAIRCASE^CTX;
+  BEGIN
+    INT     QUARTERS^ELAPSED;
+    DOLLARS ORIGINAL^RESERVE;
+    DOLLARS CURRENT^FACTOR^PCT;
+    DOLLARS ADJUSTED^RESERVE;
+  END;
+
+!---------------------------------------------------------------------
+! Reserve calculation request message
+!---------------------------------------------------------------------
+STRUCT CALC^REQUEST^MSG;
+  BEGIN
+    INT     MSG^TYPE;                    ! 1=initial, 2=review, 3=staircase, 4=bulk
+    STRING  CLAIM^NUMBER[0:11];
+    STRING  JURISDICTION[0:1];
+    INT     INJURY^TYPE;
+    INT     BODY^PART;
+    INT     CLAIMANT^AGE;
+    INT(32) INJURY^DATE;
+    DOLLARS AWW;                         ! Average Weekly Wage
+    INT     DISABILITY^PCT;              ! For PPD — percentage of disability
+    INT     FORCE^RECALC;                ! 1 = ignore staircase, recalc from base
+  END;
+
+!---------------------------------------------------------------------
+! Reserve calculation response message
+!---------------------------------------------------------------------
+STRUCT CALC^RESPONSE^MSG;
+  BEGIN
+    INT     STATUS;                      ! 0=success, >0=error code
+    STRING  CLAIM^NUMBER[0:11];
+    DOLLARS MEDICAL^RESERVE;
+    DOLLARS TTD^RESERVE;
+    DOLLARS TPD^RESERVE;
+    DOLLARS PPD^RESERVE;
+    DOLLARS PTD^RESERVE;
+    DOLLARS EXPENSE^TOTAL;
+    DOLLARS TOTAL^OUTSTANDING;
+    DOLLARS TOTAL^INCURRED;
+    DOLLARS IBNR^AMOUNT;
+    INT     ADEQUACY^FLAG;               ! 0=adequate, 1=below minimum, 2=above statutory
+    STRING  ADEQUACY^MSG[0:59];
+    INT(32) NEXT^REVIEW^DATE;
+  END;
+
+!---------------------------------------------------------------------
+! File numbers
+!---------------------------------------------------------------------
+INT     RSVTBL^FNUM;                     ! Reserve table file
+INT     JURIS^FNUM;                      ! Jurisdiction table file
+INT     CLMRSV^FNUM;                     ! Claim reserve file
+
+!---------------------------------------------------------------------
+! Working variables
+!---------------------------------------------------------------------
+STRUCT  WORK^TBL^REC (RESERVE^TABLE^REC);
+STRUCT  WORK^CLM^REC (CLAIM^RESERVE^REC);
+STRUCT  WORK^STAIRCASE (STAIRCASE^CTX);
+INT     TMF^TAG;
+INT     ERROR^CODE;
+INT(32) TODAY^JULIAN;
+
+!=====================================================================
+! PROC CALC^MEDICAL^RESERVE
+! Calculate medical reserve based on injury type, jurisdiction, and
+! time since injury. Applies staircase methodology after initial period.
+!=====================================================================
+PROC CALC^MEDICAL^RESERVE(REQUEST, TBL^REC, RESULT) VARIABLE;
+  STRUCT .REQUEST(CALC^REQUEST^MSG);
+  STRUCT .TBL^REC(RESERVE^TABLE^REC);
+  DOLLARS .RESULT;
+BEGIN
+  DOLLARS BASE^AMT;
+  DOLLARS ADJUSTED;
+  INT     QUARTERS^SINCE^INJURY;
+  INT     I;
+  FIXED   FACTOR;
+
+  BASE^AMT := TBL^REC.BASE^MEDICAL^RESERVE;
+
+  ! Injury severity multipliers
+  CASE REQUEST.INJURY^TYPE OF
+  BEGIN
+    INJURY^SOFT^TISSUE   -> BASE^AMT := BASE^AMT * 0.75F;
+    INJURY^FRACTURE      -> BASE^AMT := BASE^AMT * 1.20F;
+    INJURY^SPINAL        -> BASE^AMT := BASE^AMT * 2.50F;
+    INJURY^HEAD          -> BASE^AMT := BASE^AMT * 3.00F;
+    INJURY^BURN          -> BASE^AMT := BASE^AMT * 1.80F;
+    INJURY^AMPUTATION    -> BASE^AMT := BASE^AMT * 2.00F;
+    INJURY^OCCUPATIONAL  -> BASE^AMT := BASE^AMT * 1.50F;
+    OTHERWISE            -> BASE^AMT := BASE^AMT;
+  END;
+
+  ! Age adjustment — older claimants have higher medical costs
+  IF REQUEST.CLAIMANT^AGE > 55 THEN
+    BASE^AMT := BASE^AMT * 1.25F
+  ELSE IF REQUEST.CLAIMANT^AGE > 45 THEN
+    BASE^AMT := BASE^AMT * 1.10F;
+
+  ! Staircase methodology — reduce reserves quarterly as claim ages
+  QUARTERS^SINCE^INJURY := (TODAY^JULIAN - REQUEST.INJURY^DATE) / 91;
+
+  IF QUARTERS^SINCE^INJURY > 0 AND
+     QUARTERS^SINCE^INJURY <= TBL^REC.STAIRCASE^QUARTERS AND
+     REQUEST.FORCE^RECALC = 0 THEN
+  BEGIN
+    FACTOR := 1.0F;
+    FOR I := 0 TO QUARTERS^SINCE^INJURY - 1 DO
+    BEGIN
+      IF I < TBL^REC.STAIRCASE^QUARTERS THEN
+        FACTOR := FACTOR * TBL^REC.STAIRCASE^PCTS[I];
+    END;
+    BASE^AMT := BASE^AMT * FACTOR;
+  END;
+
+  ! Cap at statutory maximum
+  IF BASE^AMT > TBL^REC.STAT^MAX^MEDICAL THEN
+    BASE^AMT := TBL^REC.STAT^MAX^MEDICAL;
+
+  RESULT := BASE^AMT;
+END;
+
+!=====================================================================
+! PROC CALC^INDEMNITY^RESERVES
+! Calculate TTD, TPD, PPD, and PTD reserves based on AWW, disability
+! percentage, and jurisdiction rules.
+!=====================================================================
+PROC CALC^INDEMNITY^RESERVES(REQUEST, TBL^REC, TTD^OUT, TPD^OUT,
+                              PPD^OUT, PTD^OUT) VARIABLE;
+  STRUCT .REQUEST(CALC^REQUEST^MSG);
+  STRUCT .TBL^REC(RESERVE^TABLE^REC);
+  DOLLARS .TTD^OUT;
+  DOLLARS .TPD^OUT;
+  DOLLARS .PPD^OUT;
+  DOLLARS .PTD^OUT;
+BEGIN
+  DOLLARS WEEKLY^TTD;
+  DOLLARS WEEKLY^PPD;
+  INT     REMAINING^TTD^WEEKS;
+  INT     REMAINING^PPD^WEEKS;
+  INT     WEEKS^SINCE^INJURY;
+  DOLLARS LIFE^PENSION^PV;
+  INT     YEARS^REMAINING;
+
+  ! TTD = 2/3 of AWW, capped at statutory max
+  WEEKLY^TTD := REQUEST.AWW * 0.6667F;
+  IF WEEKLY^TTD > TBL^REC.STAT^MAX^WEEKLY^TTD THEN
+    WEEKLY^TTD := TBL^REC.STAT^MAX^WEEKLY^TTD;
+
+  WEEKS^SINCE^INJURY := (TODAY^JULIAN - REQUEST.INJURY^DATE) / 7;
+
+  ! Remaining TTD weeks = max duration minus elapsed
+  REMAINING^TTD^WEEKS := TBL^REC.MAX^TTD^WEEKS - WEEKS^SINCE^INJURY;
+  IF REMAINING^TTD^WEEKS < 0 THEN
+    REMAINING^TTD^WEEKS := 0;
+
+  TTD^OUT := WEEKLY^TTD * $FIXED(REMAINING^TTD^WEEKS);
+
+  ! TPD = 2/3 of wage loss differential (estimate at 50% of TTD rate)
+  TPD^OUT := 0.00F;  ! Only set if claim has TPD status
+
+  ! PPD = scheduled/unscheduled based on body part and disability %
+  IF REQUEST.DISABILITY^PCT > 0 THEN
+  BEGIN
+    WEEKLY^PPD := REQUEST.AWW * 0.6667F *
+                  ($FIXED(REQUEST.DISABILITY^PCT) / 100.0F);
+    IF WEEKLY^PPD > TBL^REC.STAT^MAX^WEEKLY^PPD THEN
+      WEEKLY^PPD := TBL^REC.STAT^MAX^WEEKLY^PPD;
+
+    REMAINING^PPD^WEEKS := TBL^REC.MAX^PPD^WEEKS;
+    ! Adjust PPD weeks by disability percentage for scheduled injuries
+    IF REQUEST.BODY^PART < 100 THEN  ! Scheduled body part
+      REMAINING^PPD^WEEKS := (REMAINING^PPD^WEEKS *
+                              REQUEST.DISABILITY^PCT) / 100;
+
+    PPD^OUT := WEEKLY^PPD * $FIXED(REMAINING^PPD^WEEKS);
+  END
+  ELSE
+    PPD^OUT := 0.00F;
+
+  ! PTD = life pension calculation
+  IF REQUEST.INJURY^TYPE = INJURY^SPINAL OR
+     REQUEST.INJURY^TYPE = INJURY^HEAD OR
+     (REQUEST.INJURY^TYPE = INJURY^AMPUTATION AND
+      REQUEST.DISABILITY^PCT >= 80) THEN
+  BEGIN
+    ! Life expectancy based on age at injury
+    YEARS^REMAINING := TBL^REC.LIFE^EXPECTANCY^YEARS -
+                       REQUEST.CLAIMANT^AGE;
+    IF YEARS^REMAINING < 5 THEN
+      YEARS^REMAINING := 5;  ! Minimum 5-year pension
+
+    ! Present value of life pension using 3% discount rate
+    LIFE^PENSION^PV := TBL^REC.LIFE^PENSION^WEEKLY *
+                       $FIXED(YEARS^REMAINING * WEEKS^PER^YEAR);
+    ! Discount factor: approximate PV = FV / (1 + r)^n
+    ! Using simplified 3% annual discount
+    LIFE^PENSION^PV := LIFE^PENSION^PV *
+                       (1.0F - (0.03F * $FIXED(YEARS^REMAINING) / 2.0F));
+
+    PTD^OUT := LIFE^PENSION^PV;
+  END
+  ELSE
+    PTD^OUT := 0.00F;
+END;
+
+!=====================================================================
+! PROC CALC^EXPENSE^RESERVES
+! Estimate legal, IME, and investigation expense reserves.
+!=====================================================================
+PROC CALC^EXPENSE^RESERVES(REQUEST, TBL^REC, LEGAL^OUT, IME^OUT,
+                            INVEST^OUT) VARIABLE;
+  STRUCT .REQUEST(CALC^REQUEST^MSG);
+  STRUCT .TBL^REC(RESERVE^TABLE^REC);
+  DOLLARS .LEGAL^OUT;
+  DOLLARS .IME^OUT;
+  DOLLARS .INVEST^OUT;
+BEGIN
+  DOLLARS BASE^EXPENSE;
+
+  BASE^EXPENSE := TBL^REC.BASE^EXPENSE^RESERVE;
+
+  ! Legal expense — higher for litigated claims and severe injuries
+  LEGAL^OUT := BASE^EXPENSE * 0.50F;
+  IF REQUEST.INJURY^TYPE >= INJURY^SPINAL THEN
+    LEGAL^OUT := LEGAL^OUT * 2.00F;
+
+  ! IME expense — 1-2 IMEs depending on complexity
+  IME^OUT := 2500.00F;  ! Base IME cost
+  IF REQUEST.INJURY^TYPE >= INJURY^FRACTURE THEN
+    IME^OUT := IME^OUT * 2.0F;  ! Two IMEs likely
+
+  ! Investigation expense
+  INVEST^OUT := BASE^EXPENSE * 0.20F;
+  IF REQUEST.INJURY^TYPE = INJURY^SOFT^TISSUE THEN
+    INVEST^OUT := INVEST^OUT * 1.50F;  ! Higher investigation for soft tissue
+END;
+
+!=====================================================================
+! PROC APPLY^IBNR^FACTOR
+! Apply Incurred But Not Reported factor to total reserves.
+! IBNR accounts for claims development — reserves typically grow.
+!=====================================================================
+PROC APPLY^IBNR^FACTOR(TOTAL^RESERVES, IBNR^FACTOR, MONTHS^SINCE^INJURY,
+                        IBNR^AMOUNT) VARIABLE;
+  DOLLARS TOTAL^RESERVES;
+  FIXED   IBNR^FACTOR;
+  INT     MONTHS^SINCE^INJURY;
+  DOLLARS .IBNR^AMOUNT;
+BEGIN
+  FIXED   MATURITY^ADJ;
+
+  ! IBNR factor decreases as claim matures
+  IF MONTHS^SINCE^INJURY < 6 THEN
+    MATURITY^ADJ := 1.00F          ! Full IBNR in first 6 months
+  ELSE IF MONTHS^SINCE^INJURY < 12 THEN
+    MATURITY^ADJ := 0.75F
+  ELSE IF MONTHS^SINCE^INJURY < 24 THEN
+    MATURITY^ADJ := 0.50F
+  ELSE IF MONTHS^SINCE^INJURY < 36 THEN
+    MATURITY^ADJ := 0.25F
+  ELSE
+    MATURITY^ADJ := 0.10F;         ! Minimal IBNR after 3 years
+
+  IBNR^AMOUNT := TOTAL^RESERVES * IBNR^FACTOR * MATURITY^ADJ;
+END;
+
+!=====================================================================
+! PROC CHECK^RESERVE^ADEQUACY
+! Validate reserves against statutory limits and reasonableness rules.
+!=====================================================================
+PROC CHECK^RESERVE^ADEQUACY(CLM^REC, TBL^REC, FLAG, MSG^BUF) VARIABLE;
+  STRUCT .CLM^REC(CLAIM^RESERVE^REC);
+  STRUCT .TBL^REC(RESERVE^TABLE^REC);
+  INT    .FLAG;
+  STRING .MSG^BUF[0:59];
+BEGIN
+  DOLLARS MIN^RESERVE;
+
+  FLAG := 0;  ! Assume adequate
+  MSG^BUF ':=' "Reserve adequate                                            ";
+
+  ! Check minimum reserve thresholds
+  MIN^RESERVE := 500.00F;  ! Absolute minimum for open claims
+  IF CLM^REC.RESERVE^STATUS = 0 AND
+     CLM^REC.TOTAL^OUTSTANDING < MIN^RESERVE THEN
+  BEGIN
+    FLAG := 1;
+    MSG^BUF ':=' "BELOW MINIMUM: Outstanding reserve under $500 threshold   ";
+    RETURN;
+  END;
+
+  ! Check statutory maximum for medical
+  IF CLM^REC.MEDICAL^RESERVE > TBL^REC.STAT^MAX^MEDICAL THEN
+  BEGIN
+    FLAG := 2;
+    MSG^BUF ':=' "EXCEEDS STATUTORY: Medical reserve above jurisd. maximum  ";
+    RETURN;
+  END;
+
+  ! Check indemnity against statutory weekly caps * max weeks
+  IF CLM^REC.TTD^RESERVE >
+     (TBL^REC.STAT^MAX^WEEKLY^TTD * $FIXED(TBL^REC.MAX^TTD^WEEKS)) THEN
+  BEGIN
+    FLAG := 2;
+    MSG^BUF ':=' "EXCEEDS STATUTORY: TTD reserve above maximum duration cap ";
+    RETURN;
+  END;
+
+  ! Paid-to-reserve ratio check — flag if paid > 80% of incurred
+  IF CLM^REC.TOTAL^INCURRED > 0.00F AND
+     (CLM^REC.TOTAL^PAID / CLM^REC.TOTAL^INCURRED) > 0.80F THEN
+  BEGIN
+    FLAG := 1;
+    MSG^BUF ':=' "REVIEW: Paid exceeds 80% of incurred — reserves may be low";
+  END;
+END;
+
+!=====================================================================
+! PROC OPEN^FILES — Open all required Enscribe files
+!=====================================================================
+PROC OPEN^FILES;
+BEGIN
+  INT FSTATUS;
+
+  CALL FILE_OPEN_("$DATA1.WCDATA.RSVTBL", 22, RSVTBL^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+
+  CALL FILE_OPEN_("$DATA1.WCDATA.JURISTBL", 23, JURIS^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+
+  CALL FILE_OPEN_("$DATA1.WCDATA.CLMRSV", 22, CLMRSV^FNUM,,, 1);
+  IF <> THEN CALL ABEND;
+END;
+
+!=====================================================================
+! PROC PROCESS^CALC^REQUEST — Main request handler
+!=====================================================================
+PROC PROCESS^CALC^REQUEST(REQUEST, RESPONSE);
+  STRUCT .REQUEST(CALC^REQUEST^MSG);
+  STRUCT .RESPONSE(CALC^RESPONSE^MSG);
+BEGIN
+  STRUCT KEY^BUF(RESERVE^TABLE^REC);
+  INT    BYTES^READ;
+  INT    FSTATUS;
+  INT    MONTHS^ELAPSED;
+  DOLLARS MED^RSV;
+  DOLLARS TTD^RSV;
+  DOLLARS TPD^RSV;
+  DOLLARS PPD^RSV;
+  DOLLARS PTD^RSV;
+  DOLLARS EXP^LEGAL;
+  DOLLARS EXP^IME;
+  DOLLARS EXP^INVEST;
+  DOLLARS IBNR^AMT;
+  INT    ADEQUACY^FLAG;
+  STRING ADEQUACY^MSG[0:59];
+
+  ! Initialize response
+  RESPONSE.STATUS := 0;
+  RESPONSE.CLAIM^NUMBER ':=' REQUEST.CLAIM^NUMBER FOR 12;
+
+  ! Look up reserve table for jurisdiction + injury type
+  KEY^BUF.JURISDICTION^CODE ':=' REQUEST.JURISDICTION FOR 2;
+  KEY^BUF.INJURY^TYPE := REQUEST.INJURY^TYPE;
+  KEY^BUF.BODY^PART^CODE := REQUEST.BODY^PART;
+
+  CALL FILE_READ64_(RSVTBL^FNUM, WORK^TBL^REC, $LEN(WORK^TBL^REC),
+                     BYTES^READ);
+  IF <> THEN
+  BEGIN
+    RESPONSE.STATUS := 10;  ! Table lookup failed
+    RETURN;
+  END;
+
+  ! Begin TMF transaction
+  CALL TMF_BEGINTRANSACTION_(TMF^TAG);
+
+  ! Calculate each reserve category
+  CALL CALC^MEDICAL^RESERVE(REQUEST, WORK^TBL^REC, MED^RSV);
+  CALL CALC^INDEMNITY^RESERVES(REQUEST, WORK^TBL^REC,
+                                TTD^RSV, TPD^RSV, PPD^RSV, PTD^RSV);
+  CALL CALC^EXPENSE^RESERVES(REQUEST, WORK^TBL^REC,
+                              EXP^LEGAL, EXP^IME, EXP^INVEST);
+
+  ! Apply IBNR factor
+  MONTHS^ELAPSED := (TODAY^JULIAN - REQUEST.INJURY^DATE) / 30;
+  CALL APPLY^IBNR^FACTOR(
+    MED^RSV + TTD^RSV + PPD^RSV + PTD^RSV + EXP^LEGAL + EXP^IME + EXP^INVEST,
+    WORK^TBL^REC.IBNR^FACTOR,
+    MONTHS^ELAPSED,
+    IBNR^AMT);
+
+  ! Update claim reserve record
+  WORK^CLM^REC.CLAIM^NUMBER ':=' REQUEST.CLAIM^NUMBER FOR 12;
+  WORK^CLM^REC.JURISDICTION ':=' REQUEST.JURISDICTION FOR 2;
+  WORK^CLM^REC.INJURY^TYPE := REQUEST.INJURY^TYPE;
+  WORK^CLM^REC.BODY^PART := REQUEST.BODY^PART;
+  WORK^CLM^REC.CLAIMANT^AGE := REQUEST.CLAIMANT^AGE;
+  WORK^CLM^REC.INJURY^DATE := REQUEST.INJURY^DATE;
+  WORK^CLM^REC.LAST^CALC^DATE := TODAY^JULIAN;
+  WORK^CLM^REC.MEDICAL^RESERVE := MED^RSV;
+  WORK^CLM^REC.TTD^RESERVE := TTD^RSV;
+  WORK^CLM^REC.TPD^RESERVE := TPD^RSV;
+  WORK^CLM^REC.PPD^RESERVE := PPD^RSV;
+  WORK^CLM^REC.PTD^RESERVE := PTD^RSV;
+  WORK^CLM^REC.EXPENSE^LEGAL := EXP^LEGAL;
+  WORK^CLM^REC.EXPENSE^IME := EXP^IME;
+  WORK^CLM^REC.EXPENSE^INVEST := EXP^INVEST;
+  WORK^CLM^REC.TOTAL^OUTSTANDING := MED^RSV + TTD^RSV + TPD^RSV +
+                                     PPD^RSV + PTD^RSV +
+                                     EXP^LEGAL + EXP^IME + EXP^INVEST;
+  WORK^CLM^REC.TOTAL^INCURRED := WORK^CLM^REC.TOTAL^PAID +
+                                   WORK^CLM^REC.TOTAL^OUTSTANDING;
+  WORK^CLM^REC.NEXT^REVIEW^DATE := TODAY^JULIAN + 90;
+
+  ! Check adequacy
+  CALL CHECK^RESERVE^ADEQUACY(WORK^CLM^REC, WORK^TBL^REC,
+                               ADEQUACY^FLAG, ADEQUACY^MSG);
+
+  ! Write updated reserve record
+  CALL FILE_WRITEUPDATE64_(CLMRSV^FNUM, WORK^CLM^REC,
+                            $LEN(WORK^CLM^REC));
+  IF <> THEN
+  BEGIN
+    CALL TMF_ABORTTRANSACTION_(TMF^TAG);
+    RESPONSE.STATUS := 20;  ! Write failed
+    RETURN;
+  END;
+
+  CALL TMF_ENDTRANSACTION_(TMF^TAG);
+
+  ! Build response
+  RESPONSE.MEDICAL^RESERVE := MED^RSV;
+  RESPONSE.TTD^RESERVE := TTD^RSV;
+  RESPONSE.TPD^RESERVE := TPD^RSV;
+  RESPONSE.PPD^RESERVE := PPD^RSV;
+  RESPONSE.PTD^RESERVE := PTD^RSV;
+  RESPONSE.EXPENSE^TOTAL := EXP^LEGAL + EXP^IME + EXP^INVEST;
+  RESPONSE.TOTAL^OUTSTANDING := WORK^CLM^REC.TOTAL^OUTSTANDING;
+  RESPONSE.TOTAL^INCURRED := WORK^CLM^REC.TOTAL^INCURRED;
+  RESPONSE.IBNR^AMOUNT := IBNR^AMT;
+  RESPONSE.ADEQUACY^FLAG := ADEQUACY^FLAG;
+  RESPONSE.ADEQUACY^MSG ':=' ADEQUACY^MSG FOR 60;
+  RESPONSE.NEXT^REVIEW^DATE := WORK^CLM^REC.NEXT^REVIEW^DATE;
+END;
+
+!=====================================================================
+! MAIN — Pathway server main loop
+!=====================================================================
+PROC RSVRCALC MAIN;
+BEGIN
+  STRUCT REQUEST^BUF(CALC^REQUEST^MSG);
+  STRUCT RESPONSE^BUF(CALC^RESPONSE^MSG);
+  INT    MSG^LEN;
+  INT    COUNT^READS;
+  INT    FNUM;
+
+  CALL INITIALIZER;
+  CALL OPEN^FILES;
+
+  ! Get today's Julian date
+  TODAY^JULIAN := $JULIANTIMESTAMP / 86400D;
+
+  ! Server loop — read requests from Pathway $RECEIVE
+  CALL FILE_OPEN_("$RECEIVE", 1, FNUM);
+
+  WHILE 1 DO
+  BEGIN
+    CALL FILE_READ64_(FNUM, REQUEST^BUF, $LEN(REQUEST^BUF), MSG^LEN);
+    IF <> THEN
+    BEGIN
+      ! EOF or error on $RECEIVE — server stopping
+      CALL FILE_CLOSE_(RSVTBL^FNUM);
+      CALL FILE_CLOSE_(JURIS^FNUM);
+      CALL FILE_CLOSE_(CLMRSV^FNUM);
+      CALL FILE_CLOSE_(FNUM);
+      RETURN;
+    END;
+
+    CALL PROCESS^CALC^REQUEST(REQUEST^BUF, RESPONSE^BUF);
+
+    ! Reply to requester
+    CALL SERVERCLASS_SEND_(RESPONSE^BUF, $LEN(RESPONSE^BUF));
+  END;
+END;

@@ -1,0 +1,684 @@
+?SECTION WAGE-CALCULATION
+?PAGE "WCWAGE - Workers' Compensation Wage Calculation Server"
+!*********************************************************************
+!*  WCWAGE -- Wage Calculation Server                                *
+!*                                                                   *
+!*  Collects and computes Average Weekly Wage (AWW) from employer    *
+!*  wage data for the 52-week period prior to Date of Injury.        *
+!*  Supports multiple calculation methods per jurisdiction:           *
+!*    - Actual earnings method                                       *
+!*    - Similar employee method                                      *
+!*    - Full-time equivalent method                                  *
+!*    - Concurrent employment combining                              *
+!*    - Seasonal worker averaging                                    *
+!*                                                                   *
+!*  PATHWAY SERVER CLASS: WC-WAGE-SVR                                *
+!*  ENSCRIBE FILES:                                                  *
+!*    $DATA1.WCFILES.WAGEDATA  -- Weekly wage records (key-seq)      *
+!*    $DATA1.WCFILES.WAGERECS  -- Wage collection records            *
+!*    $DATA1.WCFILES.WAGESTMT  -- Generated wage statements          *
+!*    $DATA1.WCFILES.FRINGEDB  -- Fringe benefit reference table     *
+!*                                                                   *
+!*  MODIFICATION LOG:                                                *
+!*  DATE       PROGRAMMER   DESCRIPTION                              *
+!*  ---------- ------------ ---------------------------------------- *
+!*  2024-02-15 K.PATEL      INITIAL DEVELOPMENT                      *
+!*  2024-05-20 K.PATEL      CONCURRENT EMPLOYMENT LOGIC              *
+!*  2024-08-10 S.CHEN       SEASONAL WORKER AVERAGING                *
+!*  2024-11-15 K.PATEL      FRINGE BENEFIT CALCULATIONS              *
+!*  2025-02-20 R.MITCHELL   WAGE STATEMENT GENERATION                *
+!*********************************************************************
+
+?NOLIST
+?SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?SOURCE $DATA1.WCFILES.WCCOMMON
+?LIST
+
+LITERAL DEF^VERSION = "WCWAGE V2.1.0";
+
+! AWW calculation methods
+LITERAL AWW^ACTUAL^EARNINGS    = 1;   ! Standard: total wages / weeks worked
+LITERAL AWW^SIMILAR^EMPLOYEE   = 2;   ! Use comparable employee wages
+LITERAL AWW^FULLTIME^EQUIV     = 3;   ! Part-time to full-time conversion
+LITERAL AWW^CONCURRENT         = 4;   ! Combine wages from multiple employers
+LITERAL AWW^SEASONAL           = 5;   ! Annual earnings / 52
+
+! Maximum wage record weeks
+LITERAL MAX^WAGE^WEEKS = 52;
+
+! Wage component types
+LITERAL WAGE^REGULAR    = 1;
+LITERAL WAGE^OVERTIME   = 2;
+LITERAL WAGE^TIPS       = 3;
+LITERAL WAGE^COMMISSION = 4;
+LITERAL WAGE^BONUS      = 5;
+LITERAL WAGE^HOLIDAY    = 6;
+LITERAL WAGE^VACATION   = 7;
+LITERAL WAGE^SICK       = 8;
+
+! -------------------------------------------------------------------
+! Structure definitions
+! -------------------------------------------------------------------
+STRUCT WAGE^RECORD;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT(32)  EMPLOYEE^SSN;
+    INT      WEEK^NUMBER;                ! 1-52, week before DOI
+    INT(32)  WEEK^END^DATE;             ! YYYYMMDD
+    FIXED(2) REGULAR^WAGES;
+    FIXED(2) OVERTIME^WAGES;
+    FIXED(2) TIPS^AMOUNT;
+    FIXED(2) COMMISSION^AMOUNT;
+    FIXED(2) BONUS^AMOUNT;
+    FIXED(2) HOLIDAY^PAY;
+    FIXED(2) VACATION^PAY;
+    FIXED(2) SICK^PAY;
+    FIXED(2) TOTAL^GROSS;
+    INT      HOURS^REGULAR;
+    INT      HOURS^OVERTIME;
+    INT      EMPLOYER^INDEX;            ! 0=primary, 1+=concurrent employers
+  END;
+
+STRUCT AWW^REQUEST;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT(32)  EMPLOYEE^SSN;
+    STRING   JURISDICTION[0:1];
+    INT(32)  DATE^OF^INJURY;
+    INT      CALC^METHOD;               ! AWW^ACTUAL^EARNINGS, etc.
+    INT      INCLUDE^OVERTIME;          ! 1=include OT in AWW
+    INT      INCLUDE^TIPS;              ! 1=include tips
+    INT      INCLUDE^COMMISSION;        ! 1=include commissions
+    INT      INCLUDE^FRINGE;            ! 1=include fringe benefits
+    INT      IS^SEASONAL;               ! 1=seasonal worker
+    INT      NUM^EMPLOYERS;             ! 1=single, 2+=concurrent
+    FIXED(2) SIMILAR^EMP^AWW;           ! If using similar employee method
+    INT      FTE^HOURS^PER^WEEK;        ! Standard full-time hours (40)
+  END;
+
+STRUCT AWW^RESULT;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    FIXED(2) AWW^AMOUNT;                ! Computed Average Weekly Wage
+    FIXED(2) TOTAL^WAGES^52WK;          ! Total wages in 52-week period
+    INT      WEEKS^WORKED;              ! Actual weeks with earnings
+    INT      CALC^METHOD^USED;
+    FIXED(2) REGULAR^COMPONENT;
+    FIXED(2) OVERTIME^COMPONENT;
+    FIXED(2) TIPS^COMPONENT;
+    FIXED(2) COMMISSION^COMPONENT;
+    FIXED(2) FRINGE^COMPONENT;
+    INT      STATUS;                    ! 0=OK, >0=error
+  END;
+
+STRUCT FRINGE^BENEFIT^ENTRY;
+  BEGIN
+    STRING   BENEFIT^TYPE[0:7];         ! "HEALTH", "PENSION", "LIFE", etc.
+    FIXED(2) MONTHLY^VALUE;
+    FIXED(2) ANNUAL^VALUE;
+    FIXED(2) EMPLOYER^CONTRIBUTION;
+    INT      INCLUDE^IN^AWW;            ! 1=yes per jurisdiction
+  END;
+
+STRUCT WAGE^STATEMENT;
+  BEGIN
+    INT(32)  CLAIM^NUMBER;
+    INT(32)  EMPLOYEE^SSN;
+    STRING   EMPLOYEE^NAME[0:39];
+    STRING   EMPLOYER^NAME[0:39];
+    STRING   JURISDICTION[0:1];
+    INT(32)  DATE^OF^INJURY;
+    INT(32)  PERIOD^START;              ! 52 weeks before DOI
+    INT(32)  PERIOD^END;                ! Day before DOI
+    FIXED(2) TOTAL^EARNINGS;
+    FIXED(2) AWW^COMPUTED;
+    INT      WEEKS^EMPLOYED;
+    INT      CALC^METHOD;
+    INT(32)  STATEMENT^DATE;
+    STRING   PREPARED^BY[0:7];
+  END;
+
+! -------------------------------------------------------------------
+! Global working storage
+! -------------------------------------------------------------------
+INT .EXT G^FN^WAGEDATA;
+INT .EXT G^FN^WAGERECS;
+INT .EXT G^FN^WAGESTMT;
+INT .EXT G^FN^FRINGEDB;
+
+STRUCT .EXT G^WAGE^REC    (WAGE^RECORD);
+STRUCT .EXT G^AWW^REQ     (AWW^REQUEST);
+STRUCT .EXT G^AWW^RES     (AWW^RESULT);
+STRUCT .EXT G^FRINGE      (FRINGE^BENEFIT^ENTRY);
+STRUCT .EXT G^STMT        (WAGE^STATEMENT);
+
+! Working arrays for wage accumulation
+FIXED(2) .EXT G^WEEKLY^TOTALS[0:MAX^WAGE^WEEKS - 1];
+INT      .EXT G^WEEKS^WITH^WAGES[0:MAX^WAGE^WEEKS - 1];
+INT .EXT G^TMF^TAG;
+
+! -------------------------------------------------------------------
+! PROC MAIN
+! -------------------------------------------------------------------
+PROC MAIN MAIN;
+  BEGIN
+    INT STATUS;
+    INT MSGNUM;
+
+    CALL OPEN^WAGE^FILES(STATUS);
+    IF STATUS <> 0 THEN
+      CALL PROCESS_STOP_(, , , 1);
+
+    CALL SERVERCLASS_SEND_INFO_("WC-WAGE-SVR");
+
+    WHILE 1 DO
+      BEGIN
+        CALL READ^REQUEST(MSGNUM, STATUS);
+        IF STATUS = 0 THEN
+          CASE MSGNUM OF
+            BEGIN
+              1 -> CALL CALCULATE^AWW;
+              2 -> CALL STORE^WAGE^RECORD;
+              3 -> CALL GENERATE^WAGE^STATEMENT;
+              4 -> CALL COMBINE^CONCURRENT^WAGES;
+              5 -> CALL CALCULATE^FRINGE^VALUE;
+              6 -> CALL QUERY^WAGE^DATA;
+              OTHERWISE -> CALL REPLY^ERROR(MSGNUM);
+            END;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^AWW -- Main AWW computation
+!
+! Collects all wage records for the 52 weeks preceding DOI,
+! then applies the appropriate calculation method.
+! -------------------------------------------------------------------
+PROC CALCULATE^AWW;
+  BEGIN
+    INT STATUS;
+    INT I;
+    INT WEEKS^FOUND;
+    FIXED(2) TOTAL^REG;
+    FIXED(2) TOTAL^OT;
+    FIXED(2) TOTAL^TIPS;
+    FIXED(2) TOTAL^COMM;
+    FIXED(2) TOTAL^ALL;
+    FIXED(2) FRINGE^WEEKLY;
+
+    ! Initialize accumulators
+    TOTAL^REG  := 0F;
+    TOTAL^OT   := 0F;
+    TOTAL^TIPS := 0F;
+    TOTAL^COMM := 0F;
+    TOTAL^ALL  := 0F;
+    WEEKS^FOUND := 0;
+
+    FOR I := 0 TO MAX^WAGE^WEEKS - 1 DO
+      BEGIN
+        G^WEEKLY^TOTALS[I] := 0F;
+        G^WEEKS^WITH^WAGES[I] := 0;
+      END;
+
+    ! Read all wage records for this claim from Enscribe
+    CALL LOAD^WAGE^RECORDS(G^AWW^REQ.CLAIM^NUMBER,
+                            G^AWW^REQ.EMPLOYEE^SSN,
+                            0,  ! primary employer
+                            WEEKS^FOUND, STATUS);
+
+    IF STATUS <> 0 OR WEEKS^FOUND = 0 THEN
+      BEGIN
+        ! No wage data -- try similar employee method if available
+        IF G^AWW^REQ.SIMILAR^EMP^AWW > 0F THEN
+          BEGIN
+            G^AWW^RES.AWW^AMOUNT := G^AWW^REQ.SIMILAR^EMP^AWW;
+            G^AWW^RES.CALC^METHOD^USED := AWW^SIMILAR^EMPLOYEE;
+            G^AWW^RES.STATUS := 0;
+            CALL REPLY^AWW;
+            RETURN;
+          END
+        ELSE
+          BEGIN
+            G^AWW^RES.STATUS := 1;  ! no wage data
+            CALL REPLY^AWW;
+            RETURN;
+          END;
+      END;
+
+    ! Accumulate wage components from loaded records
+    CALL ACCUMULATE^WAGES(WEEKS^FOUND, TOTAL^REG, TOTAL^OT,
+                          TOTAL^TIPS, TOTAL^COMM);
+
+    ! Build total based on jurisdiction inclusion rules
+    TOTAL^ALL := TOTAL^REG;
+
+    IF G^AWW^REQ.INCLUDE^OVERTIME = 1 THEN
+      TOTAL^ALL := TOTAL^ALL + TOTAL^OT;
+
+    IF G^AWW^REQ.INCLUDE^TIPS = 1 THEN
+      TOTAL^ALL := TOTAL^ALL + TOTAL^TIPS;
+
+    IF G^AWW^REQ.INCLUDE^COMMISSION = 1 THEN
+      TOTAL^ALL := TOTAL^ALL + TOTAL^COMM;
+
+    ! Apply calculation method
+    CASE G^AWW^REQ.CALC^METHOD OF
+      BEGIN
+        AWW^ACTUAL^EARNINGS ->
+          BEGIN
+            ! Standard: total wages / weeks with earnings
+            IF WEEKS^FOUND > 0 THEN
+              G^AWW^RES.AWW^AMOUNT := TOTAL^ALL / WEEKS^FOUND
+            ELSE
+              G^AWW^RES.AWW^AMOUNT := 0F;
+          END;
+
+        AWW^SIMILAR^EMPLOYEE ->
+          BEGIN
+            ! Use comparable employee AWW provided in request
+            G^AWW^RES.AWW^AMOUNT := G^AWW^REQ.SIMILAR^EMP^AWW;
+          END;
+
+        AWW^FULLTIME^EQUIV ->
+          BEGIN
+            ! Convert part-time to full-time equivalent
+            CALL CALCULATE^FTE^AWW(TOTAL^ALL, WEEKS^FOUND);
+          END;
+
+        AWW^SEASONAL ->
+          BEGIN
+            ! Seasonal: use annual earnings / 52 regardless of weeks worked
+            IF G^AWW^REQ.IS^SEASONAL = 1 THEN
+              G^AWW^RES.AWW^AMOUNT := TOTAL^ALL / 52F
+            ELSE
+              G^AWW^RES.AWW^AMOUNT := TOTAL^ALL / WEEKS^FOUND;
+          END;
+
+        AWW^CONCURRENT ->
+          BEGIN
+            ! Add wages from concurrent employers
+            CALL COMBINE^CONCURRENT^AWW(TOTAL^ALL, WEEKS^FOUND);
+          END;
+
+        OTHERWISE ->
+          BEGIN
+            ! Default to actual earnings
+            IF WEEKS^FOUND > 0 THEN
+              G^AWW^RES.AWW^AMOUNT := TOTAL^ALL / WEEKS^FOUND
+            ELSE
+              G^AWW^RES.AWW^AMOUNT := 0F;
+          END;
+      END;
+
+    ! Add fringe benefits if applicable
+    IF G^AWW^REQ.INCLUDE^FRINGE = 1 THEN
+      BEGIN
+        CALL CALCULATE^WEEKLY^FRINGE(G^AWW^REQ.CLAIM^NUMBER,
+                                      G^AWW^REQ.JURISDICTION,
+                                      FRINGE^WEEKLY);
+        G^AWW^RES.AWW^AMOUNT := G^AWW^RES.AWW^AMOUNT + FRINGE^WEEKLY;
+        G^AWW^RES.FRINGE^COMPONENT := FRINGE^WEEKLY;
+      END;
+
+    ! Populate result
+    G^AWW^RES.CLAIM^NUMBER := G^AWW^REQ.CLAIM^NUMBER;
+    G^AWW^RES.TOTAL^WAGES^52WK := TOTAL^ALL;
+    G^AWW^RES.WEEKS^WORKED := WEEKS^FOUND;
+    G^AWW^RES.CALC^METHOD^USED := G^AWW^REQ.CALC^METHOD;
+    G^AWW^RES.REGULAR^COMPONENT := TOTAL^REG / WEEKS^FOUND;
+    G^AWW^RES.OVERTIME^COMPONENT := TOTAL^OT / WEEKS^FOUND;
+    G^AWW^RES.TIPS^COMPONENT := TOTAL^TIPS / WEEKS^FOUND;
+    G^AWW^RES.COMMISSION^COMPONENT := TOTAL^COMM / WEEKS^FOUND;
+    G^AWW^RES.STATUS := 0;
+
+    ! Persist the AWW result
+    CALL WRITE^AWW^RESULT;
+    CALL REPLY^AWW;
+  END;
+
+! -------------------------------------------------------------------
+! PROC LOAD^WAGE^RECORDS -- Read 52 weeks of wage data from Enscribe
+! -------------------------------------------------------------------
+PROC LOAD^WAGE^RECORDS(CLAIM^NUM, EMP^SSN, EMP^IDX, WEEKS^OUT, STATUS);
+  INT(32) CLAIM^NUM, EMP^SSN;
+  INT     EMP^IDX;
+  INT     .WEEKS^OUT;
+  INT     .STATUS;
+  BEGIN
+    INT BYTES^READ;
+    INT WEEK^CTR;
+    STRING .KEY^BUF[0:9];
+
+    STATUS := 0;
+    WEEKS^OUT := 0;
+
+    ! Key structure: claim(4) + SSN(4) + employer(2)
+    KEY^BUF[0] ':=' @CLAIM^NUM FOR 4;
+    KEY^BUF[4] ':=' @EMP^SSN FOR 4;
+    KEY^BUF[8] := EMP^IDX / 256;
+    KEY^BUF[9] := EMP^IDX;
+
+    CALL FILE_SETKEY_(G^FN^WAGEDATA, KEY^BUF, 10, 0, 2);  ! approx position
+
+    WEEK^CTR := 0;
+    WHILE WEEK^CTR < MAX^WAGE^WEEKS DO
+      BEGIN
+        CALL READ_FILE(G^FN^WAGEDATA, G^WAGE^REC, $LEN(WAGE^RECORD),
+                       BYTES^READ);
+
+        IF BYTES^READ < $LEN(WAGE^RECORD) THEN
+          BEGIN
+            ! End of records for this claim
+            WEEK^CTR := MAX^WAGE^WEEKS;  ! exit loop
+          END
+        ELSE IF G^WAGE^REC.CLAIM^NUMBER <> CLAIM^NUM OR
+                G^WAGE^REC.EMPLOYEE^SSN <> EMP^SSN THEN
+          BEGIN
+            ! Moved past this claim's records
+            WEEK^CTR := MAX^WAGE^WEEKS;
+          END
+        ELSE IF G^WAGE^REC.EMPLOYER^INDEX = EMP^IDX THEN
+          BEGIN
+            ! Valid wage record -- accumulate
+            G^WEEKLY^TOTALS[WEEK^CTR] := G^WAGE^REC.TOTAL^GROSS;
+            G^WEEKS^WITH^WAGES[WEEK^CTR] := 1;
+            WEEKS^OUT := WEEKS^OUT + 1;
+            WEEK^CTR := WEEK^CTR + 1;
+          END
+        ELSE
+          WEEK^CTR := WEEK^CTR + 1;  ! skip non-matching employer
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC ACCUMULATE^WAGES -- Sum wage components across all weeks
+! -------------------------------------------------------------------
+PROC ACCUMULATE^WAGES(WEEKS^CNT, TOT^REG, TOT^OT, TOT^TIPS, TOT^COMM);
+  INT     WEEKS^CNT;
+  FIXED(2) .TOT^REG, .TOT^OT, .TOT^TIPS, .TOT^COMM;
+  BEGIN
+    INT I;
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:9];
+
+    TOT^REG  := 0F;
+    TOT^OT   := 0F;
+    TOT^TIPS := 0F;
+    TOT^COMM := 0F;
+
+    ! Re-read wage records to accumulate by component
+    KEY^BUF[0] ':=' @G^AWW^REQ.CLAIM^NUMBER FOR 4;
+    KEY^BUF[4] ':=' @G^AWW^REQ.EMPLOYEE^SSN FOR 4;
+    KEY^BUF[8] := 0;
+    KEY^BUF[9] := 0;
+
+    CALL FILE_SETKEY_(G^FN^WAGEDATA, KEY^BUF, 10, 0, 2);
+
+    FOR I := 0 TO WEEKS^CNT - 1 DO
+      BEGIN
+        CALL READ_FILE(G^FN^WAGEDATA, G^WAGE^REC, $LEN(WAGE^RECORD),
+                       BYTES^READ);
+        IF BYTES^READ >= $LEN(WAGE^RECORD) AND
+           G^WAGE^REC.CLAIM^NUMBER = G^AWW^REQ.CLAIM^NUMBER THEN
+          BEGIN
+            TOT^REG  := TOT^REG  + G^WAGE^REC.REGULAR^WAGES;
+            TOT^OT   := TOT^OT   + G^WAGE^REC.OVERTIME^WAGES;
+            TOT^TIPS := TOT^TIPS + G^WAGE^REC.TIPS^AMOUNT;
+            TOT^COMM := TOT^COMM + G^WAGE^REC.COMMISSION^AMOUNT;
+          END;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^FTE^AWW -- Full-Time Equivalent AWW
+!
+! For employees working less than standard hours, project their
+! hourly rate to full-time (typically 40 hrs/week).
+! -------------------------------------------------------------------
+PROC CALCULATE^FTE^AWW(TOTAL^WAGES, WEEKS^WORKED);
+  FIXED(2) TOTAL^WAGES;
+  INT      WEEKS^WORKED;
+  BEGIN
+    FIXED(2) ACTUAL^AWW;
+    FIXED(2) TOTAL^HOURS;
+    FIXED(2) AVG^HOURLY^RATE;
+    INT      STANDARD^HOURS;
+    INT      BYTES^READ;
+    INT      I;
+    INT      HOUR^SUM;
+
+    IF WEEKS^WORKED = 0 THEN
+      BEGIN
+        G^AWW^RES.AWW^AMOUNT := 0F;
+        RETURN;
+      END;
+
+    ACTUAL^AWW := TOTAL^WAGES / WEEKS^WORKED;
+    STANDARD^HOURS := G^AWW^REQ.FTE^HOURS^PER^WEEK;
+    IF STANDARD^HOURS = 0 THEN STANDARD^HOURS := 40;
+
+    ! Sum total hours worked across all weeks
+    HOUR^SUM := 0;
+    ! Re-read to get hours
+    CALL REPOSITION^WAGE^FILE;
+    FOR I := 0 TO WEEKS^WORKED - 1 DO
+      BEGIN
+        CALL READ_FILE(G^FN^WAGEDATA, G^WAGE^REC, $LEN(WAGE^RECORD),
+                       BYTES^READ);
+        IF BYTES^READ >= $LEN(WAGE^RECORD) THEN
+          HOUR^SUM := HOUR^SUM + G^WAGE^REC.HOURS^REGULAR;
+      END;
+
+    IF HOUR^SUM = 0 THEN
+      BEGIN
+        ! No hours data -- can't compute FTE, use actual
+        G^AWW^RES.AWW^AMOUNT := ACTUAL^AWW;
+        RETURN;
+      END;
+
+    ! Average hourly rate
+    AVG^HOURLY^RATE := TOTAL^WAGES / HOUR^SUM;
+
+    ! FTE AWW = hourly rate * standard weekly hours
+    G^AWW^RES.AWW^AMOUNT := AVG^HOURLY^RATE * STANDARD^HOURS;
+  END;
+
+! -------------------------------------------------------------------
+! PROC COMBINE^CONCURRENT^AWW -- Combine wages from multiple employers
+! -------------------------------------------------------------------
+PROC COMBINE^CONCURRENT^AWW(PRIMARY^WAGES, PRIMARY^WEEKS);
+  FIXED(2) PRIMARY^WAGES;
+  INT      PRIMARY^WEEKS;
+  BEGIN
+    INT      EMP^IDX;
+    INT      STATUS;
+    INT      SEC^WEEKS;
+    FIXED(2) COMBINED^TOTAL;
+    INT      MAX^WEEKS;
+
+    ! Start with primary employer wages
+    COMBINED^TOTAL := PRIMARY^WAGES;
+    MAX^WEEKS := PRIMARY^WEEKS;
+
+    ! Load concurrent employer wages (indices 1, 2, ...)
+    FOR EMP^IDX := 1 TO G^AWW^REQ.NUM^EMPLOYERS - 1 DO
+      BEGIN
+        CALL LOAD^WAGE^RECORDS(G^AWW^REQ.CLAIM^NUMBER,
+                                G^AWW^REQ.EMPLOYEE^SSN,
+                                EMP^IDX,
+                                SEC^WEEKS, STATUS);
+        IF STATUS = 0 AND SEC^WEEKS > 0 THEN
+          BEGIN
+            ! Accumulate concurrent wages
+            INT I;
+            FOR I := 0 TO SEC^WEEKS - 1 DO
+              COMBINED^TOTAL := COMBINED^TOTAL + G^WEEKLY^TOTALS[I];
+            IF SEC^WEEKS > MAX^WEEKS THEN
+              MAX^WEEKS := SEC^WEEKS;
+          END;
+      END;
+
+    ! AWW from combined sources
+    IF MAX^WEEKS > 0 THEN
+      G^AWW^RES.AWW^AMOUNT := COMBINED^TOTAL / MAX^WEEKS
+    ELSE
+      G^AWW^RES.AWW^AMOUNT := 0F;
+
+    G^AWW^RES.CALC^METHOD^USED := AWW^CONCURRENT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^WEEKLY^FRINGE -- Compute weekly fringe benefit value
+!
+! Fringe benefits that may be included in AWW (per jurisdiction):
+! - Employer-paid health insurance premiums
+! - Pension/401k employer contributions
+! - Life insurance premiums
+! - Other employer-paid benefits
+! -------------------------------------------------------------------
+PROC CALCULATE^WEEKLY^FRINGE(CLAIM^NUM, JURIS, WEEKLY^FRINGE);
+  INT(32)  CLAIM^NUM;
+  STRING   .JURIS[0:1];
+  FIXED(2) .WEEKLY^FRINGE;
+  BEGIN
+    INT      BYTES^READ;
+    FIXED(2) ANNUAL^FRINGE;
+    STRING   .KEY^BUF[0:5];
+
+    WEEKLY^FRINGE := 0F;
+    ANNUAL^FRINGE := 0F;
+
+    ! Key: claim number(4) + "HE" for health, "PE" for pension, etc.
+    KEY^BUF[0] ':=' @CLAIM^NUM FOR 4;
+    KEY^BUF[4] ':=' "HE";
+
+    CALL FILE_SETKEY_(G^FN^FRINGEDB, KEY^BUF, 6, 0, 2);
+
+    ! Read all fringe records for this claim
+    WHILE 1 DO
+      BEGIN
+        CALL READ_FILE(G^FN^FRINGEDB, G^FRINGE, $LEN(FRINGE^BENEFIT^ENTRY),
+                       BYTES^READ);
+        IF BYTES^READ < $LEN(FRINGE^BENEFIT^ENTRY) THEN
+          RETURN;  ! end of records
+
+        IF G^FRINGE.INCLUDE^IN^AWW = 1 THEN
+          ANNUAL^FRINGE := ANNUAL^FRINGE + G^FRINGE.ANNUAL^VALUE;
+      END;
+
+    ! Convert annual to weekly
+    IF ANNUAL^FRINGE > 0F THEN
+      WEEKLY^FRINGE := ANNUAL^FRINGE / 52F;
+  END;
+
+! -------------------------------------------------------------------
+! PROC GENERATE^WAGE^STATEMENT -- Create wage statement for filing
+! -------------------------------------------------------------------
+PROC GENERATE^WAGE^STATEMENT;
+  BEGIN
+    INT STATUS;
+
+    G^STMT.CLAIM^NUMBER := G^AWW^REQ.CLAIM^NUMBER;
+    G^STMT.EMPLOYEE^SSN := G^AWW^REQ.EMPLOYEE^SSN;
+    G^STMT.JURISDICTION ':=' G^AWW^REQ.JURISDICTION FOR 2;
+    G^STMT.DATE^OF^INJURY := G^AWW^REQ.DATE^OF^INJURY;
+
+    ! Calculate 52-week period
+    G^STMT.PERIOD^END := G^AWW^REQ.DATE^OF^INJURY - 1;  ! Day before DOI
+    G^STMT.PERIOD^START := SUBTRACT^WEEKS(G^STMT.PERIOD^END, 52);
+
+    G^STMT.TOTAL^EARNINGS := G^AWW^RES.TOTAL^WAGES^52WK;
+    G^STMT.AWW^COMPUTED := G^AWW^RES.AWW^AMOUNT;
+    G^STMT.WEEKS^EMPLOYED := G^AWW^RES.WEEKS^WORKED;
+    G^STMT.CALC^METHOD := G^AWW^RES.CALC^METHOD^USED;
+
+    CALL TIMESTAMP(G^STMT.STATEMENT^DATE);
+
+    ! Write wage statement under TMF
+    CALL BEGINTRANSACTION(G^TMF^TAG, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    CALL WRITE_FILE(G^FN^WAGESTMT, G^STMT, $LEN(WAGE^STATEMENT));
+    IF <> THEN
+      BEGIN
+        CALL ABORTTRANSACTION(G^TMF^TAG);
+        CALL REPLY^ERROR(6);
+        RETURN;
+      END;
+
+    CALL LOG^ACTIVITY("WAGE", G^AWW^REQ.CLAIM^NUMBER, 0);
+    CALL ENDTRANSACTION(G^TMF^TAG);
+    CALL REPLY^STMT;
+  END;
+
+! -------------------------------------------------------------------
+! PROC STORE^WAGE^RECORD -- Store individual weekly wage record
+! -------------------------------------------------------------------
+PROC STORE^WAGE^RECORD;
+  BEGIN
+    INT STATUS;
+
+    ! Validate the wage record
+    IF G^WAGE^REC.WEEK^NUMBER < 1 OR
+       G^WAGE^REC.WEEK^NUMBER > MAX^WAGE^WEEKS THEN
+      BEGIN
+        CALL REPLY^ERROR(10);  ! invalid week number
+        RETURN;
+      END;
+
+    ! Compute total gross for the week
+    G^WAGE^REC.TOTAL^GROSS :=
+      G^WAGE^REC.REGULAR^WAGES +
+      G^WAGE^REC.OVERTIME^WAGES +
+      G^WAGE^REC.TIPS^AMOUNT +
+      G^WAGE^REC.COMMISSION^AMOUNT +
+      G^WAGE^REC.BONUS^AMOUNT +
+      G^WAGE^REC.HOLIDAY^PAY +
+      G^WAGE^REC.VACATION^PAY +
+      G^WAGE^REC.SICK^PAY;
+
+    CALL BEGINTRANSACTION(G^TMF^TAG, STATUS);
+    IF STATUS <> 0 THEN
+      BEGIN
+        CALL REPLY^ERROR(STATUS);
+        RETURN;
+      END;
+
+    CALL WRITE_FILE(G^FN^WAGEDATA, G^WAGE^REC, $LEN(WAGE^RECORD));
+    IF <> THEN
+      BEGIN
+        CALL ABORTTRANSACTION(G^TMF^TAG);
+        CALL REPLY^ERROR(6);
+        RETURN;
+      END;
+
+    CALL ENDTRANSACTION(G^TMF^TAG);
+    CALL REPLY^OK;
+  END;
+
+! -------------------------------------------------------------------
+! Utility procs
+! -------------------------------------------------------------------
+PROC TIMESTAMP(DATEOUT);
+  INT(32) .DATEOUT;
+  BEGIN
+    INT(32) JULTS;
+    INT YR, MO, DA, HR, MI, SE, MS, DOW;
+    CALL JULIANTIMESTAMP(JULTS);
+    CALL INTERPRETTIMESTAMP(JULTS, YR, MO, DA, HR, MI, SE, MS, DOW);
+    DATEOUT := YR * 10000D + MO * 100 + DA;
+  END;
+
+INT(32) PROC SUBTRACT^WEEKS(BASE^DATE, NUM^WEEKS);
+  INT(32) BASE^DATE;
+  INT     NUM^WEEKS;
+  BEGIN
+    ! Subtract NUM^WEEKS * 7 days from BASE^DATE
+    INT(32) DAYS^TO^SUB;
+    DAYS^TO^SUB := NUM^WEEKS * 7;
+    RETURN ADD^DAYS(BASE^DATE, 0 - DAYS^TO^SUB);
+  END;

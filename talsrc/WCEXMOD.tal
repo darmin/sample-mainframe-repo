@@ -1,0 +1,616 @@
+!
+!  WCEXMOD -- Workers' Compensation Experience Modification Factor Calculator
+!
+!  Calculates NCCI experience modification factors for workers'
+!  compensation policies using the standard formula:
+!
+!    Mod = (Ap + We + B) / (Ep + Ee + B)
+!
+!  Where: Ap = Actual Primary Losses
+!         We = Weighted Expected Excess (w * Ee)
+!         B  = Ballast Value
+!         Ep = Expected Primary Losses
+!         Ee = Expected Excess Losses
+!
+!  Uses 3-year experience window (excluding most recent policy year).
+!  Handles state-specific rules, class code expected loss rates,
+!  primary/excess split calculations, and merit rating.
+!
+!  Process: WCEXMOD
+!  Pathway Server Class: EXMOD-SC
+!  Primary Files: EXPRTF (expected loss rate tables),
+!                 CLMHSTF (claim history), EXPOSRF (exposure data),
+!                 SPLTTBF (primary/excess split tables)
+!
+!  Copyright (c) TPA Systems Inc. All rights reserved.
+!
+
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?LIST
+
+LITERAL MAX^CLASS^CODES  = 50;    ! Max class codes per employer
+LITERAL MAX^CLAIMS       = 500;   ! Max claims in experience period
+LITERAL EXP^YEARS        = 3;     ! 3-year experience window
+LITERAL SPLIT^TABLE^SIZE = 200;   ! Primary/excess split table
+LITERAL RATE^TABLE^SIZE  = 2000;  ! Expected loss rate table
+
+! Primary loss cap per claim (varies by state, this is NCCI standard)
+LITERAL PRIMARY^LOSS^CAP = 18500;   ! Updated annually by NCCI
+
+! Minimum/maximum mod factor bounds
+FIXED  MIN^MOD^FACTOR := 0.50F;   ! Floor (state-specific)
+FIXED  MAX^MOD^FACTOR := 2.50F;   ! Ceiling (state-specific)
+
+! Expected Loss Rate table entry
+STRUCT ELR^ENTRY (*);
+  BEGIN
+    STRING CLASS^CODE[0:3];       ! 4-digit NCCI class code
+    STRING STATE^CODE[0:1];       ! 2-char state
+    INT    EFFECTIVE^YEAR;
+    FIXED  EXPECTED^LOSS^RATE;    ! Per $100 of payroll
+    FIXED  D^RATIO;               ! Disease ratio (proportion disease vs injury)
+    FIXED  ELR^MEDICAL;           ! Expected medical component
+    FIXED  ELR^INDEMNITY;         ! Expected indemnity component
+    INT    STATUS;
+  END;
+
+! Primary/Excess split point table
+STRUCT SPLIT^ENTRY (*);
+  BEGIN
+    STRING STATE^CODE[0:1];
+    INT    EFFECTIVE^YEAR;
+    INT    EXPECTED^LOSS^RANGE^LO;  ! Expected loss range lower bound
+    INT    EXPECTED^LOSS^RANGE^HI;
+    FIXED  D^VALUE;                 ! Primary weight (D ratio)
+    FIXED  W^VALUE;                 ! Excess credibility weight
+    INT    STATUS;
+  END;
+
+! Class code exposure entry (per employer)
+STRUCT CLASS^EXPOSURE (*);
+  BEGIN
+    STRING CLASS^CODE[0:3];
+    STRING STATE^CODE[0:1];
+    INT    YEAR;
+    FIXED  PAYROLL;               ! Annual payroll for this class
+    FIXED  MANUAL^RATE;           ! Manual rate per $100
+    FIXED  MANUAL^PREMIUM;
+    FIXED  EXPECTED^LOSSES;       ! ELR * payroll/100
+    FIXED  EXPECTED^PRIMARY;      ! Expected primary losses
+    FIXED  EXPECTED^EXCESS;       ! Expected excess losses
+  END;
+
+! Claim history entry
+STRUCT CLAIM^HIST (*);
+  BEGIN
+    STRING POLICY^NUM[0:11];
+    STRING CLAIM^NUM[0:11];
+    STRING CLASS^CODE[0:3];
+    STRING STATE^CODE[0:1];
+    INT    INJURY^DATE[0:2];
+    INT    ACCIDENT^YEAR;
+    FIXED  MEDICAL^PAID;
+    FIXED  MEDICAL^RESERVE;
+    FIXED  INDEMNITY^PAID;
+    FIXED  INDEMNITY^RESERVE;
+    FIXED  TOTAL^INCURRED;
+    FIXED  PRIMARY^LOSS;          ! Capped at primary threshold
+    FIXED  EXCESS^LOSS;           ! Amount above primary threshold
+    INT    CLAIM^STATUS;          ! 0=open, 1=closed
+    INT    CLAIM^TYPE;            ! 1=medical-only, 2=lost-time, 3=fatal
+  END;
+
+! Experience modification result
+STRUCT MOD^RESULT (*);
+  BEGIN
+    STRING POLICY^NUM[0:11];
+    STRING STATE^CODE[0:1];
+    INT    RATING^EFFECTIVE^DATE[0:2];
+    INT    EXP^PERIOD^FROM;       ! First year of experience period
+    INT    EXP^PERIOD^TO;         ! Last year of experience period
+    FIXED  TOTAL^EXPECTED^LOSSES;
+    FIXED  EXPECTED^PRIMARY;
+    FIXED  EXPECTED^EXCESS;
+    FIXED  ACTUAL^PRIMARY;
+    FIXED  ACTUAL^EXCESS;
+    FIXED  BALLAST^VALUE;
+    FIXED  W^FACTOR;              ! Excess credibility weight
+    FIXED  WEIGHTED^EXCESS;       ! W * Ee
+    FIXED  MOD^NUMERATOR;         ! Ap + We + B
+    FIXED  MOD^DENOMINATOR;       ! Ep + Ee + B
+    FIXED  CALCULATED^MOD;
+    FIXED  FINAL^MOD;             ! After min/max bounds
+    INT    CLASS^CODE^COUNT;
+    INT    CLAIM^COUNT;
+    FIXED  TOTAL^MANUAL^PREMIUM;
+    FIXED  MODIFIED^PREMIUM;
+  END;
+
+! In-memory tables
+STRUCT ELR^TABLE(RATE^TABLE^SIZE) (ELR^ENTRY);
+INT    ELR^TABLE^COUNT;
+
+STRUCT SPLIT^TABLE(SPLIT^TABLE^SIZE) (SPLIT^ENTRY);
+INT    SPLIT^TABLE^COUNT;
+
+! Working storage
+STRUCT W^CLASSES(MAX^CLASS^CODES) (CLASS^EXPOSURE);
+INT    W^CLASS^COUNT;
+
+STRUCT W^CLAIMS(MAX^CLAIMS) (CLAIM^HIST);
+INT    W^CLAIM^COUNT;
+
+STRUCT W^RESULT (MOD^RESULT);
+
+! File numbers
+INT    ELR^FNUM;
+INT    SPLIT^FNUM;
+INT    CLMHST^FNUM;
+INT    EXPOS^FNUM;
+INT    AUDIT^FNUM;
+
+!---------------------------------------------------------------
+! PROC LOOKUP^ELR -- Look up expected loss rate for class/state/year
+!---------------------------------------------------------------
+INT PROC LOOKUP^ELR(CLASS^CODE, STATE^CODE, YEAR, RESULT);
+  STRING .CLASS^CODE[0:3];
+  STRING .STATE^CODE[0:1];
+  INT    YEAR;
+  STRUCT .RESULT (ELR^ENTRY);
+  BEGIN
+    INT I;
+    INT BEST^IDX := -1;
+    INT BEST^YEAR := 0;
+
+    FOR I := 0 TO ELR^TABLE^COUNT - 1 DO
+      BEGIN
+        IF ELR^TABLE(I).CLASS^CODE = CLASS^CODE FOR 4 AND
+           ELR^TABLE(I).STATE^CODE = STATE^CODE FOR 2 AND
+           ELR^TABLE(I).EFFECTIVE^YEAR <= YEAR AND
+           ELR^TABLE(I).EFFECTIVE^YEAR > BEST^YEAR AND
+           ELR^TABLE(I).STATUS = 0 THEN
+          BEGIN
+            BEST^IDX := I;
+            BEST^YEAR := ELR^TABLE(I).EFFECTIVE^YEAR;
+          END;
+      END;
+
+    IF BEST^IDX >= 0 THEN
+      BEGIN
+        RESULT ':=' ELR^TABLE(BEST^IDX) FOR $LEN(ELR^ENTRY);
+        RETURN 0;
+      END;
+
+    RETURN -1;
+  END;
+
+!---------------------------------------------------------------
+! PROC LOOKUP^SPLIT -- Look up D and W values for split point
+!---------------------------------------------------------------
+INT PROC LOOKUP^SPLIT(STATE^CODE, YEAR, EXPECTED^LOSSES, D^VAL, W^VAL);
+  STRING .STATE^CODE[0:1];
+  INT    YEAR;
+  FIXED  EXPECTED^LOSSES;
+  FIXED  .D^VAL;
+  FIXED  .W^VAL;
+  BEGIN
+    INT I;
+    INT EXP^INT := $INT(EXPECTED^LOSSES);
+
+    FOR I := 0 TO SPLIT^TABLE^COUNT - 1 DO
+      BEGIN
+        IF SPLIT^TABLE(I).STATE^CODE = STATE^CODE FOR 2 AND
+           SPLIT^TABLE(I).EFFECTIVE^YEAR <= YEAR AND
+           SPLIT^TABLE(I).STATUS = 0 AND
+           EXP^INT >= SPLIT^TABLE(I).EXPECTED^LOSS^RANGE^LO AND
+           EXP^INT <= SPLIT^TABLE(I).EXPECTED^LOSS^RANGE^HI THEN
+          BEGIN
+            D^VAL := SPLIT^TABLE(I).D^VALUE;
+            W^VAL := SPLIT^TABLE(I).W^VALUE;
+            RETURN 0;
+          END;
+      END;
+
+    ! Default values if not found
+    D^VAL := 0.30F;
+    W^VAL := 0.30F;
+    RETURN -1;
+  END;
+
+!---------------------------------------------------------------
+! PROC LOAD^EXPOSURE^DATA -- Load payroll/exposure for employer
+!---------------------------------------------------------------
+PROC LOAD^EXPOSURE^DATA(POLICY^NUM, STATE^CODE, FROM^YEAR, TO^YEAR);
+  STRING .POLICY^NUM[0:11];
+  STRING .STATE^CODE[0:1];
+  INT    FROM^YEAR;
+  INT    TO^YEAR;
+  BEGIN
+    STRING KEY^BUF[0:13];
+    STRUCT EXP^REC[0:99];
+
+    W^CLASS^COUNT := 0;
+    KEY^BUF ':=' POLICY^NUM FOR 12;
+    KEY^BUF[12] ':=' STATE^CODE FOR 2;
+
+    CALL KEYPOSITION(EXPOS^FNUM, KEY^BUF, , 0, 2);
+    WHILE W^CLASS^COUNT < MAX^CLASS^CODES DO
+      BEGIN
+        CALL READ(EXPOS^FNUM, EXP^REC, 100);
+        IF <> THEN RETURN;
+
+        ! Check we're still on this policy
+        IF EXP^REC[0] ':' POLICY^NUM <> POLICY^NUM FOR 12 THEN
+          RETURN;
+
+        ! Parse exposure record and filter by experience period
+        STRUCT TEMP^CLASS (CLASS^EXPOSURE);
+        TEMP^CLASS.CLASS^CODE ':=' EXP^REC[14] FOR 4;
+        TEMP^CLASS.STATE^CODE ':=' STATE^CODE FOR 2;
+        TEMP^CLASS.YEAR := EXP^REC.$INT(18);
+
+        IF TEMP^CLASS.YEAR >= FROM^YEAR AND
+           TEMP^CLASS.YEAR <= TO^YEAR THEN
+          BEGIN
+            TEMP^CLASS.PAYROLL := EXP^REC.$FIXED(20);
+            TEMP^CLASS.MANUAL^RATE := EXP^REC.$FIXED(28);
+
+            ! Look up expected loss rate
+            STRUCT W^ELR (ELR^ENTRY);
+            IF LOOKUP^ELR(TEMP^CLASS.CLASS^CODE,
+                          TEMP^CLASS.STATE^CODE,
+                          TEMP^CLASS.YEAR, W^ELR) = 0 THEN
+              BEGIN
+                ! Expected losses = ELR * payroll / 100
+                TEMP^CLASS.EXPECTED^LOSSES :=
+                  W^ELR.EXPECTED^LOSS^RATE * TEMP^CLASS.PAYROLL / 100F;
+
+                ! Manual premium = manual rate * payroll / 100
+                TEMP^CLASS.MANUAL^PREMIUM :=
+                  TEMP^CLASS.MANUAL^RATE * TEMP^CLASS.PAYROLL / 100F;
+              END
+            ELSE
+              BEGIN
+                TEMP^CLASS.EXPECTED^LOSSES := 0F;
+                TEMP^CLASS.MANUAL^PREMIUM := 0F;
+              END;
+
+            W^CLASSES(W^CLASS^COUNT) ':=' TEMP^CLASS
+              FOR $LEN(CLASS^EXPOSURE);
+            W^CLASS^COUNT := W^CLASS^COUNT + 1;
+          END;
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC LOAD^CLAIM^HISTORY -- Load claims for experience period
+!---------------------------------------------------------------
+PROC LOAD^CLAIM^HISTORY(POLICY^NUM, FROM^YEAR, TO^YEAR);
+  STRING .POLICY^NUM[0:11];
+  INT    FROM^YEAR;
+  INT    TO^YEAR;
+  BEGIN
+    W^CLAIM^COUNT := 0;
+
+    CALL KEYPOSITION(CLMHST^FNUM, POLICY^NUM, , 0, 2);
+    WHILE W^CLAIM^COUNT < MAX^CLAIMS DO
+      BEGIN
+        CALL READ(CLMHST^FNUM, W^CLAIMS(W^CLAIM^COUNT),
+                   $LEN(CLAIM^HIST));
+        IF <> THEN RETURN;
+
+        ! Check policy
+        IF W^CLAIMS(W^CLAIM^COUNT).POLICY^NUM <> POLICY^NUM FOR 12
+          THEN RETURN;
+
+        ! Filter by experience period
+        IF W^CLAIMS(W^CLAIM^COUNT).ACCIDENT^YEAR >= FROM^YEAR AND
+           W^CLAIMS(W^CLAIM^COUNT).ACCIDENT^YEAR <= TO^YEAR THEN
+          BEGIN
+            ! Calculate primary/excess split for this claim
+            CALL SPLIT^CLAIM^LOSSES(W^CLAIMS(W^CLAIM^COUNT));
+            W^CLAIM^COUNT := W^CLAIM^COUNT + 1;
+          END;
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC SPLIT^CLAIM^LOSSES -- Split claim into primary and excess
+!---------------------------------------------------------------
+PROC SPLIT^CLAIM^LOSSES(CLAIM^REC);
+  STRUCT .CLAIM^REC (CLAIM^HIST);
+  BEGIN
+    ! Total incurred = medical + indemnity (paid + reserves)
+    CLAIM^REC.TOTAL^INCURRED :=
+      CLAIM^REC.MEDICAL^PAID + CLAIM^REC.MEDICAL^RESERVE +
+      CLAIM^REC.INDEMNITY^PAID + CLAIM^REC.INDEMNITY^RESERVE;
+
+    ! Medical-only claims: entire amount is primary
+    IF CLAIM^REC.CLAIM^TYPE = 1 THEN
+      BEGIN
+        CLAIM^REC.PRIMARY^LOSS := CLAIM^REC.TOTAL^INCURRED;
+        CLAIM^REC.EXCESS^LOSS := 0F;
+        RETURN;
+      END;
+
+    ! Lost-time and fatal claims: cap primary at split point
+    IF CLAIM^REC.TOTAL^INCURRED <= $FIXED(PRIMARY^LOSS^CAP) THEN
+      BEGIN
+        CLAIM^REC.PRIMARY^LOSS := CLAIM^REC.TOTAL^INCURRED;
+        CLAIM^REC.EXCESS^LOSS := 0F;
+      END
+    ELSE
+      BEGIN
+        CLAIM^REC.PRIMARY^LOSS := $FIXED(PRIMARY^LOSS^CAP);
+        CLAIM^REC.EXCESS^LOSS :=
+          CLAIM^REC.TOTAL^INCURRED - $FIXED(PRIMARY^LOSS^CAP);
+      END;
+  END;
+
+!---------------------------------------------------------------
+! PROC CALC^EXPECTED^SPLITS -- Calculate expected primary/excess
+!---------------------------------------------------------------
+PROC CALC^EXPECTED^SPLITS(STATE^CODE, TOTAL^EXPECTED, D^RATIO,
+                           EXP^PRIMARY, EXP^EXCESS);
+  STRING .STATE^CODE[0:1];
+  FIXED  TOTAL^EXPECTED;
+  FIXED  D^RATIO;
+  FIXED  .EXP^PRIMARY;
+  FIXED  .EXP^EXCESS;
+  BEGIN
+    ! Expected Primary = D * Expected Losses
+    ! D ratio from split point table based on total expected losses
+    EXP^PRIMARY := D^RATIO * TOTAL^EXPECTED;
+    EXP^EXCESS := TOTAL^EXPECTED - EXP^PRIMARY;
+  END;
+
+!---------------------------------------------------------------
+! PROC CALC^BALLAST -- Calculate ballast value (B)
+!---------------------------------------------------------------
+FIXED PROC CALC^BALLAST(EXPECTED^EXCESS, W^FACTOR);
+  FIXED EXPECTED^EXCESS;
+  FIXED W^FACTOR;
+  BEGIN
+    ! B = (1 - w) * Ee
+    ! Ballast stabilizes the formula for small employers
+    RETURN (1F - W^FACTOR) * EXPECTED^EXCESS;
+  END;
+
+!---------------------------------------------------------------
+! PROC CALCULATE^MOD -- Main experience mod calculation
+!---------------------------------------------------------------
+PROC CALCULATE^MOD(POLICY^NUM, STATE^CODE, RATING^YEAR, RESULT);
+  STRING .POLICY^NUM[0:11];
+  STRING .STATE^CODE[0:1];
+  INT    RATING^YEAR;
+  STRUCT .RESULT (MOD^RESULT);
+  BEGIN
+    INT I;
+    FIXED D^VALUE;
+    FIXED W^VALUE;
+
+    ! Initialize result
+    RESULT ':=' 0 FOR $LEN(MOD^RESULT);
+    RESULT.POLICY^NUM ':=' POLICY^NUM FOR 12;
+    RESULT.STATE^CODE ':=' STATE^CODE FOR 2;
+
+    ! Experience period: 3 years, excluding most recent
+    ! For 2026 rating year, experience period = 2022-2024
+    RESULT.EXP^PERIOD^FROM := RATING^YEAR - 4;
+    RESULT.EXP^PERIOD^TO := RATING^YEAR - 2;
+
+    ! Step 1: Load exposure data for experience period
+    CALL LOAD^EXPOSURE^DATA(POLICY^NUM, STATE^CODE,
+                             RESULT.EXP^PERIOD^FROM,
+                             RESULT.EXP^PERIOD^TO);
+
+    ! Step 2: Accumulate total expected losses and manual premium
+    RESULT.TOTAL^EXPECTED^LOSSES := 0F;
+    RESULT.TOTAL^MANUAL^PREMIUM := 0F;
+    RESULT.CLASS^CODE^COUNT := W^CLASS^COUNT;
+
+    FOR I := 0 TO W^CLASS^COUNT - 1 DO
+      BEGIN
+        RESULT.TOTAL^EXPECTED^LOSSES :=
+          RESULT.TOTAL^EXPECTED^LOSSES +
+          W^CLASSES(I).EXPECTED^LOSSES;
+        RESULT.TOTAL^MANUAL^PREMIUM :=
+          RESULT.TOTAL^MANUAL^PREMIUM +
+          W^CLASSES(I).MANUAL^PREMIUM;
+      END;
+
+    ! Step 3: Look up D and W values from split table
+    IF LOOKUP^SPLIT(STATE^CODE, RATING^YEAR,
+                     RESULT.TOTAL^EXPECTED^LOSSES,
+                     D^VALUE, W^VALUE) < 0 THEN
+      CALL WRITE^AUDIT("SPLIT TABLE MISS", POLICY^NUM);
+
+    RESULT.W^FACTOR := W^VALUE;
+
+    ! Step 4: Calculate expected primary and excess
+    CALL CALC^EXPECTED^SPLITS(STATE^CODE,
+                               RESULT.TOTAL^EXPECTED^LOSSES,
+                               D^VALUE,
+                               RESULT.EXPECTED^PRIMARY,
+                               RESULT.EXPECTED^EXCESS);
+
+    ! Step 5: Assign expected primary/excess to each class code
+    FOR I := 0 TO W^CLASS^COUNT - 1 DO
+      BEGIN
+        IF RESULT.TOTAL^EXPECTED^LOSSES > 0F THEN
+          BEGIN
+            FIXED CLASS^PROPORTION :=
+              W^CLASSES(I).EXPECTED^LOSSES /
+              RESULT.TOTAL^EXPECTED^LOSSES;
+
+            W^CLASSES(I).EXPECTED^PRIMARY :=
+              RESULT.EXPECTED^PRIMARY * CLASS^PROPORTION;
+            W^CLASSES(I).EXPECTED^EXCESS :=
+              RESULT.EXPECTED^EXCESS * CLASS^PROPORTION;
+          END;
+      END;
+
+    ! Step 6: Load and split actual claim losses
+    CALL LOAD^CLAIM^HISTORY(POLICY^NUM,
+                             RESULT.EXP^PERIOD^FROM,
+                             RESULT.EXP^PERIOD^TO);
+    RESULT.CLAIM^COUNT := W^CLAIM^COUNT;
+
+    ! Step 7: Accumulate actual primary and excess losses
+    RESULT.ACTUAL^PRIMARY := 0F;
+    RESULT.ACTUAL^EXCESS := 0F;
+
+    FOR I := 0 TO W^CLAIM^COUNT - 1 DO
+      BEGIN
+        RESULT.ACTUAL^PRIMARY :=
+          RESULT.ACTUAL^PRIMARY + W^CLAIMS(I).PRIMARY^LOSS;
+        RESULT.ACTUAL^EXCESS :=
+          RESULT.ACTUAL^EXCESS + W^CLAIMS(I).EXCESS^LOSS;
+      END;
+
+    ! Step 8: Calculate ballast value
+    RESULT.BALLAST^VALUE := CALC^BALLAST(RESULT.EXPECTED^EXCESS,
+                                          RESULT.W^FACTOR);
+
+    ! Step 9: Calculate weighted expected excess
+    ! We = w * Ee (weighted by credibility)
+    RESULT.WEIGHTED^EXCESS := RESULT.W^FACTOR * RESULT.EXPECTED^EXCESS;
+
+    ! Step 10: Apply the experience modification formula
+    !   Mod = (Ap + We + B) / (Ep + Ee + B)
+    RESULT.MOD^NUMERATOR :=
+      RESULT.ACTUAL^PRIMARY +
+      RESULT.WEIGHTED^EXCESS +
+      RESULT.BALLAST^VALUE;
+
+    RESULT.MOD^DENOMINATOR :=
+      RESULT.EXPECTED^PRIMARY +
+      RESULT.EXPECTED^EXCESS +
+      RESULT.BALLAST^VALUE;
+
+    IF RESULT.MOD^DENOMINATOR > 0F THEN
+      RESULT.CALCULATED^MOD :=
+        RESULT.MOD^NUMERATOR / RESULT.MOD^DENOMINATOR
+    ELSE
+      RESULT.CALCULATED^MOD := 1.0F;  ! Unity mod if no data
+
+    ! Step 11: Apply min/max bounds
+    IF RESULT.CALCULATED^MOD < MIN^MOD^FACTOR THEN
+      RESULT.FINAL^MOD := MIN^MOD^FACTOR
+    ELSE IF RESULT.CALCULATED^MOD > MAX^MOD^FACTOR THEN
+      RESULT.FINAL^MOD := MAX^MOD^FACTOR
+    ELSE
+      RESULT.FINAL^MOD := RESULT.CALCULATED^MOD;
+
+    ! Step 12: Calculate modified premium
+    RESULT.MODIFIED^PREMIUM :=
+      RESULT.TOTAL^MANUAL^PREMIUM * RESULT.FINAL^MOD;
+
+    CALL WRITE^AUDIT("MOD CALCULATED  ", POLICY^NUM);
+  END;
+
+!---------------------------------------------------------------
+! PROC CALC^MERIT^RATING -- Merit rating plan (alternative to exp mod)
+!---------------------------------------------------------------
+FIXED PROC CALC^MERIT^RATING(CLAIM^COUNT, PREMIUM);
+  INT   CLAIM^COUNT;
+  FIXED PREMIUM;
+  BEGIN
+    ! Merit rating for employers too small for experience rating
+    ! NCCI threshold: ~$5,500 expected annual premium
+    ! Merit plan: credit/debit based on claim count
+    ! 0 claims = -5% credit
+    ! 1 claim  = 0% (neutral)
+    ! 2 claims = +5% debit
+    ! 3+ claims = +10% debit
+
+    FIXED MERIT^FACTOR;
+
+    IF CLAIM^COUNT = 0 THEN
+      MERIT^FACTOR := 0.95F       ! 5% credit
+    ELSE IF CLAIM^COUNT = 1 THEN
+      MERIT^FACTOR := 1.00F       ! Neutral
+    ELSE IF CLAIM^COUNT = 2 THEN
+      MERIT^FACTOR := 1.05F       ! 5% debit
+    ELSE
+      MERIT^FACTOR := 1.10F;      ! 10% debit
+
+    RETURN PREMIUM * MERIT^FACTOR;
+  END;
+
+!---------------------------------------------------------------
+! PROC WRITE^AUDIT -- Write audit record
+!---------------------------------------------------------------
+PROC WRITE^AUDIT(ACTION, POLICY^NUM);
+  STRING .ACTION[0:15];
+  STRING .POLICY^NUM[0:11];
+  BEGIN
+    STRING AUDIT^BUF[0:49];
+    INT TIMESTAMP[0:6];
+    CALL TIMESTAMP(TIMESTAMP);
+    AUDIT^BUF ':=' POLICY^NUM FOR 12;
+    AUDIT^BUF[12] ':=' " " FOR 1;
+    AUDIT^BUF[13] ':=' ACTION FOR 16;
+    CALL WRITE(AUDIT^FNUM, AUDIT^BUF, 50);
+  END;
+
+!---------------------------------------------------------------
+! PROC SERVER^MAIN -- Pathway server main loop
+!---------------------------------------------------------------
+PROC SERVER^MAIN MAIN;
+  BEGIN
+    INT RECV^FNUM;
+    STRING REQ^BUF[0:4095];
+    STRING RESP^BUF[0:4095];
+    INT MSGCODE;
+
+    ! Initialize -- load rate tables into memory
+    CALL OPEN^FILES;
+    CALL LOAD^ELR^TABLE;
+    CALL LOAD^SPLIT^TABLE;
+    CALL WRITE^AUDIT("SERVER STARTED  ", "            ");
+
+    CALL OPEN(RECV^FNUM, "$RECEIVE", 1);
+    IF <> THEN CALL ABEND^PROCESS(99);
+
+    WHILE 1 DO
+      BEGIN
+        CALL READ(RECV^FNUM, REQ^BUF, 4096);
+        IF < THEN CALL READUPDATE(RECV^FNUM, REQ^BUF, 4096);
+
+        MSGCODE := $MSGCODE;
+
+        IF MSGCODE = -30 THEN
+          CALL REPLY(, , 0)
+        ELSE IF MSGCODE = -33 THEN
+          CALL REPLY(, , 0)
+        ELSE IF MSGCODE = 1 THEN  ! Calculate experience mod
+          BEGIN
+            STRING POLICY^NUM[0:11];
+            STRING STATE^CODE[0:1];
+            INT    RATING^YEAR;
+
+            POLICY^NUM ':=' REQ^BUF FOR 12;
+            STATE^CODE ':=' REQ^BUF[12] FOR 2;
+            RATING^YEAR := REQ^BUF.$INT(14);
+
+            CALL CALCULATE^MOD(POLICY^NUM, STATE^CODE,
+                                RATING^YEAR, W^RESULT);
+
+            RESP^BUF ':=' W^RESULT FOR $LEN(MOD^RESULT);
+            CALL REPLY(RESP^BUF, $LEN(MOD^RESULT));
+          END
+        ELSE IF MSGCODE = 2 THEN  ! Merit rating calculation
+          BEGIN
+            INT    M^CLAIM^CNT := REQ^BUF.$INT(0);
+            FIXED  M^PREMIUM := REQ^BUF.$FIXED(2);
+            FIXED  M^RESULT;
+            M^RESULT := CALC^MERIT^RATING(M^CLAIM^CNT, M^PREMIUM);
+            RESP^BUF.$FIXED(0) := M^RESULT;
+            CALL REPLY(RESP^BUF, 8);
+          END
+        ELSE
+          CALL REPLY(, , 2);
+      END;
+  END;

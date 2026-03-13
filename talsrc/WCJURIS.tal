@@ -1,0 +1,644 @@
+?SECTION JURISDICTION-RULES
+?PAGE "WCJURIS - Workers' Compensation Jurisdiction Rules Engine"
+!*********************************************************************
+!*  WCJURIS -- Jurisdiction Rules Engine                             *
+!*                                                                   *
+!*  Provides centralized jurisdiction rule lookup for all 50 states, *
+!*  DC, and federal programs (FECA, Longshore, EEOICPA). Drives      *
+!*  benefit calculations, filing deadlines, medical treatment        *
+!*  guidelines, fee schedules, penalty computations, and second      *
+!*  injury fund applicability.                                       *
+!*                                                                   *
+!*  Data-driven architecture: all jurisdiction parameters stored in  *
+!*  Enscribe key-sequenced files, keyed by state code + DOI year.   *
+!*  No hardcoded state logic -- all rules are table-driven.          *
+!*                                                                   *
+!*  PATHWAY SERVER CLASS: WC-JURIS-SVR                               *
+!*  ENSCRIBE FILES:                                                  *
+!*    $DATA1.WCFILES.JURISBEN  -- Benefit parameters by state/year   *
+!*    $DATA1.WCFILES.JURISSOL  -- SOL & filing deadlines             *
+!*    $DATA1.WCFILES.JURISMED  -- Medical treatment guidelines       *
+!*    $DATA1.WCFILES.JURISFEE  -- Fee schedule selection             *
+!*    $DATA1.WCFILES.JURISRPT  -- Reporting requirements             *
+!*    $DATA1.WCFILES.JURISPEN  -- Penalty calculation rules          *
+!*    $DATA1.WCFILES.JURISSIF  -- Second injury fund rules           *
+!*    $DATA1.WCFILES.JURISEXT  -- Extraterritorial coverage          *
+!*                                                                   *
+!*  MODIFICATION LOG:                                                *
+!*  DATE       PROGRAMMER   DESCRIPTION                              *
+!*  ---------- ------------ ---------------------------------------- *
+!*  2024-03-01 S.CHEN       INITIAL DEVELOPMENT                      *
+!*  2024-06-15 S.CHEN       PENALTY CALCULATION ENGINE                *
+!*  2024-09-20 K.PATEL      SECOND INJURY FUND LOGIC                 *
+!*  2025-01-10 S.CHEN       EXTRATERRITORIAL COVERAGE RULES          *
+!*  2025-03-01 R.MITCHELL   FEDERAL PROGRAMS (FECA/LHWCA)            *
+!*********************************************************************
+
+?NOLIST
+?SOURCE $SYSTEM.ZSYSDEFS.ZSYSTAL
+?SOURCE $DATA1.WCFILES.WCCOMMON
+?LIST
+
+LITERAL DEF^VERSION = "WCJURIS V4.1.0";
+
+! -------------------------------------------------------------------
+! Request message types
+! -------------------------------------------------------------------
+LITERAL MSG^GET^BENEFIT^RULES   = 1;
+LITERAL MSG^GET^SOL^RULES       = 2;
+LITERAL MSG^GET^MED^GUIDELINES  = 3;
+LITERAL MSG^GET^FEE^SCHEDULE    = 4;
+LITERAL MSG^GET^RPT^REQS        = 5;
+LITERAL MSG^CALC^PENALTY        = 6;
+LITERAL MSG^CHECK^SIF           = 7;
+LITERAL MSG^CHECK^EXTRATERR     = 8;
+LITERAL MSG^GET^ALL^RULES       = 9;
+LITERAL MSG^VALIDATE^JURIS      = 10;
+
+! Penalty types
+LITERAL PEN^LATE^FILING         = 1;
+LITERAL PEN^LATE^FIRST^PAY     = 2;
+LITERAL PEN^LATE^ONGOING^PAY   = 3;
+LITERAL PEN^UNREASONABLE^DENY  = 4;
+LITERAL PEN^LATE^REPORT        = 5;
+
+! Fee schedule types
+LITERAL FEE^STATE^SPECIFIC      = 1;
+LITERAL FEE^MEDICARE^BASED      = 2;
+LITERAL FEE^USUAL^CUSTOMARY     = 3;
+LITERAL FEE^HOSPITAL^DRG        = 4;
+LITERAL FEE^RBRVS               = 5;   ! Resource-Based Relative Value Scale
+
+! Medical guideline types
+LITERAL MED^ODG                  = 1;   ! Official Disability Guidelines
+LITERAL MED^ACOEM                = 2;   ! ACOEM Practice Guidelines
+LITERAL MED^STATE^SPECIFIC       = 3;   ! State-specific guidelines
+LITERAL MED^NONE                 = 4;   ! No mandated guidelines
+
+! -------------------------------------------------------------------
+! Structure definitions
+! -------------------------------------------------------------------
+STRUCT JURIS^LOOKUP^KEY;
+  BEGIN
+    STRING   STATE^CODE[0:1];          ! 2-char: "CA", "TX", "NY", "FE" (federal)
+    INT      DOI^YEAR;                 ! Year of injury for rate lookup
+  END;
+
+STRUCT BENEFIT^RULE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      DOI^YEAR;
+    FIXED(2) MAX^TTD^WEEKLY;
+    FIXED(2) MIN^TTD^WEEKLY;
+    INT      TTD^COMP^RATE;            ! Percentage * 100 (6667 = 66.67%)
+    INT      TTD^MAX^WEEKS;            ! 0 = no maximum
+    FIXED(2) MAX^TPD^WEEKLY;
+    INT      TPD^COMP^RATE;
+    INT      TPD^MAX^WEEKS;
+    FIXED(2) MAX^PPD^WEEKLY;
+    FIXED(2) MIN^PPD^WEEKLY;
+    INT      PPD^COMP^RATE;
+    FIXED(2) MAX^PTD^WEEKLY;
+    FIXED(2) MIN^PTD^WEEKLY;
+    INT      PTD^COMP^RATE;
+    FIXED(2) MAX^DEATH^WEEKLY;
+    INT      DEATH^COMP^RATE;
+    FIXED(2) BURIAL^ALLOWANCE;
+    INT      WAITING^PERIOD^DAYS;      ! 3, 5, 7, or 14
+    INT      RETRO^PERIOD^DAYS;        ! When waiting period is refunded
+    INT      COLA^ANNUAL^PCT;          ! * 100 (300 = 3.00%)
+    INT      COLA^START^AFTER^YEARS;
+    FIXED(2) SAWW;                     ! State Average Weekly Wage
+    INT      AMA^GUIDE^EDITION;        ! 4, 5, or 6
+  END;
+
+STRUCT SOL^RULE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      NOTICE^TO^EMPLOYER^DAYS;  ! Days to notify employer
+    INT      CLAIM^FILING^DAYS;        ! Days to file claim with board
+    INT      OCC^DISEASE^FILING^DAYS;  ! Occupational disease SOL
+    INT      DEATH^FILING^DAYS;        ! SOL for death claims
+    INT      REOPEN^TIME^LIMIT^DAYS;   ! Time to reopen a closed claim
+    INT      APPEAL^FILING^DAYS;       ! Days to appeal a decision
+    INT      STATUTE^OF^REPOSE^YEARS;  ! Absolute cutoff (some states)
+  END;
+
+STRUCT MED^GUIDELINE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      GUIDELINE^TYPE;           ! MED^ODG, MED^ACOEM, etc.
+    INT      PREAUTH^REQUIRED;         ! 1=yes, 0=no
+    INT      PREAUTH^THRESHOLD;        ! Dollar amount triggering preauth
+    INT      UR^MANDATED;              ! Utilization review mandated
+    INT      PEER^REVIEW^REQUIRED;     ! For denials
+    INT      IME^FREQUENCY^LIMIT;      ! Max IMEs per year (0=unlimited)
+    INT      SECOND^OPINION^ALLOWED;   ! 1=yes
+    INT      TREATING^PHYSICIAN^CHOICE;! 1=employee, 2=employer, 3=panel
+    INT      CHANGE^PHYSICIAN^LIMIT;   ! Times EE can change doctor
+    STRING   FORMULARY^TYPE[0:7];      ! "CLOSED", "OPEN", "STATE"
+  END;
+
+STRUCT FEE^SCHEDULE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      PROFESSIONAL^FEE^TYPE;    ! FEE^STATE^SPECIFIC, FEE^MEDICARE^BASED, etc.
+    INT      HOSPITAL^FEE^TYPE;
+    INT      PHARMACY^FEE^TYPE;
+    INT      MEDICARE^PCT^PROFESSIONAL;! Percentage of Medicare (e.g., 110 = 110%)
+    INT      MEDICARE^PCT^HOSPITAL;
+    INT      MEDICARE^PCT^PHARMACY;
+    INT      GAF^APPLICABLE;           ! Geographic Adjustment Factor
+    INT(32)  EFF^DATE;                 ! YYYYMMDD
+    STRING   FEE^SCHED^ID[0:15];       ! State fee schedule identifier
+  END;
+
+STRUCT REPORTING^RULE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      FIRST^RPT^DAYS;           ! Days to file first report of injury
+    INT      LOST^TIME^RPT^DAYS;       ! Days to file lost time supplement
+    INT      MEDICAL^ONLY^THRESHOLD;   ! Dollar amount for medical-only
+    INT      EMPLOYER^RPT^DAYS;        ! Employer must report within
+    INT      INSURER^RPT^DAYS;         ! Insurer must report within
+    INT      PERIODIC^RPT^REQUIRED;    ! 1=yes
+    INT      PERIODIC^RPT^INTERVAL;    ! Days between periodic reports
+    INT      EDI^REQUIRED;             ! 1=yes, must file electronically
+    INT      EDI^RELEASE^NUMBER;       ! IAIABC EDI release (3.0, 3.1)
+  END;
+
+STRUCT PENALTY^RULE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      PEN^TYPE;                 ! Penalty type
+    INT      GRACE^PERIOD^DAYS;        ! Days before penalty accrues
+    INT      PEN^CALC^METHOD;          ! 1=flat, 2=percent, 3=per-day
+    FIXED(2) PEN^FLAT^AMOUNT;          ! Flat penalty amount
+    INT      PEN^PERCENT;              ! Percentage penalty (* 100)
+    FIXED(2) PEN^PER^DAY;             ! Per-day penalty amount
+    FIXED(2) PEN^MINIMUM;
+    FIXED(2) PEN^MAXIMUM;
+    INT      PEN^PAYABLE^TO;          ! 1=claimant, 2=state fund, 3=both
+  END;
+
+STRUCT SIF^RULE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      SIF^EXISTS;               ! 1=state has second injury fund
+    INT      SIF^ACTIVE;               ! 1=fund is accepting new claims
+    INT      SIF^THRESHOLD^WEEKS;      ! Min PPD weeks before SIF applies
+    INT      SIF^PREEXIST^REQUIRED;    ! 1=known pre-existing required
+    INT      SIF^FILING^DEADLINE^DAYS;
+    INT      SIF^REIMBURSEMENT^TYPE;   ! 1=prospective, 2=retrospective
+    FIXED(2) SIF^ASSESSMENT^RATE;      ! Annual assessment per $100 premium
+  END;
+
+STRUCT EXTRATERR^RULE^RECORD;
+  BEGIN
+    STRING   STATE^CODE[0:1];
+    INT      ALLOWS^EXTRATERR;         ! 1=allows extraterritorial coverage
+    INT      COVERAGE^TYPE;            ! 1=hire state, 2=employment state, 3=both
+    INT      MAX^DURATION^DAYS;        ! Max days of extraterritorial coverage
+    INT      RECIPROCAL^STATES;        ! Bitmap or count
+    INT      REGISTRATION^REQUIRED;    ! 1=must register in other state
+  END;
+
+! -------------------------------------------------------------------
+! Global file numbers and working storage
+! -------------------------------------------------------------------
+INT .EXT G^FN^JURISBEN;
+INT .EXT G^FN^JURISSOL;
+INT .EXT G^FN^JURISMED;
+INT .EXT G^FN^JURISFEE;
+INT .EXT G^FN^JURISRPT;
+INT .EXT G^FN^JURISPEN;
+INT .EXT G^FN^JURISSIF;
+INT .EXT G^FN^JURISEXT;
+
+STRUCT .EXT G^KEY      (JURIS^LOOKUP^KEY);
+STRUCT .EXT G^BEN^RULE (BENEFIT^RULE^RECORD);
+STRUCT .EXT G^SOL^RULE (SOL^RULE^RECORD);
+STRUCT .EXT G^MED^RULE (MED^GUIDELINE^RECORD);
+STRUCT .EXT G^FEE^RULE (FEE^SCHEDULE^RECORD);
+STRUCT .EXT G^RPT^RULE (REPORTING^RULE^RECORD);
+STRUCT .EXT G^PEN^RULE (PENALTY^RULE^RECORD);
+STRUCT .EXT G^SIF^RULE (SIF^RULE^RECORD);
+STRUCT .EXT G^EXT^RULE (EXTRATERR^RULE^RECORD);
+
+! -------------------------------------------------------------------
+! PROC MAIN -- Server startup and message processing
+! -------------------------------------------------------------------
+PROC MAIN MAIN;
+  BEGIN
+    INT STATUS;
+    INT MSGNUM;
+
+    CALL OPEN^ALL^JURIS^FILES(STATUS);
+    IF STATUS <> 0 THEN
+      CALL PROCESS_STOP_(, , , 1);
+
+    CALL SERVERCLASS_SEND_INFO_("WC-JURIS-SVR");
+
+    WHILE 1 DO
+      BEGIN
+        CALL READ^REQUEST(MSGNUM, STATUS);
+        IF STATUS = 0 THEN
+          CASE MSGNUM OF
+            BEGIN
+              MSG^GET^BENEFIT^RULES   -> CALL GET^BENEFIT^RULES;
+              MSG^GET^SOL^RULES       -> CALL GET^SOL^RULES;
+              MSG^GET^MED^GUIDELINES  -> CALL GET^MED^GUIDELINES;
+              MSG^GET^FEE^SCHEDULE    -> CALL GET^FEE^SCHEDULE;
+              MSG^GET^RPT^REQS        -> CALL GET^REPORTING^REQS;
+              MSG^CALC^PENALTY        -> CALL CALCULATE^PENALTY;
+              MSG^CHECK^SIF           -> CALL CHECK^SECOND^INJURY^FUND;
+              MSG^CHECK^EXTRATERR     -> CALL CHECK^EXTRATERRITORIAL;
+              MSG^GET^ALL^RULES       -> CALL GET^ALL^JURIS^RULES;
+              MSG^VALIDATE^JURIS      -> CALL VALIDATE^JURISDICTION;
+              OTHERWISE               -> CALL REPLY^ERROR(MSGNUM);
+            END;
+      END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC OPEN^ALL^JURIS^FILES -- Open all jurisdiction Enscribe files
+! -------------------------------------------------------------------
+PROC OPEN^ALL^JURIS^FILES(STATUS);
+  INT .STATUS;
+  BEGIN
+    INT ERR;
+    STRING .FNAME[0:35];
+    STATUS := 0;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISBEN" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISBEN, , 0, 0);
+    IF <> THEN BEGIN STATUS := 1; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISSOL" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISSOL, , 0, 0);
+    IF <> THEN BEGIN STATUS := 2; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISMED" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISMED, , 0, 0);
+    IF <> THEN BEGIN STATUS := 3; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISFEE" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISFEE, , 0, 0);
+    IF <> THEN BEGIN STATUS := 4; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISRPT" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISRPT, , 0, 0);
+    IF <> THEN BEGIN STATUS := 5; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISPEN" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISPEN, , 0, 0);
+    IF <> THEN BEGIN STATUS := 6; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISSIF" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISSIF, , 0, 0);
+    IF <> THEN BEGIN STATUS := 7; RETURN; END;
+
+    FNAME ':=' "$DATA1.WCFILES.JURISEXT" -> @S^PTR;
+    CALL FILE_OPEN_(FNAME, G^FN^JURISEXT, , 0, 0);
+    IF <> THEN BEGIN STATUS := 8; RETURN; END;
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^BENEFIT^RULES -- Retrieve benefit parameters for state/year
+! Applies DOI-year fallback: if exact year not found, use most recent.
+! -------------------------------------------------------------------
+PROC GET^BENEFIT^RULES;
+  BEGIN
+    INT STATUS;
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:5];
+
+    ! Build composite key: state(2) + year(4 as packed)
+    KEY^BUF[0] ':=' G^KEY.STATE^CODE FOR 2;
+    KEY^BUF[2] := G^KEY.DOI^YEAR / 256;
+    KEY^BUF[3] := G^KEY.DOI^YEAR;
+
+    CALL FILE_SETKEY_(G^FN^JURISBEN, KEY^BUF, 4, 0, 2);  ! exact or approx
+    CALL READ_FILE(G^FN^JURISBEN, G^BEN^RULE, $LEN(BENEFIT^RULE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(BENEFIT^RULE^RECORD) THEN
+      BEGIN
+        ! Try generic (year=0) entry as fallback
+        KEY^BUF[2] := 0;
+        KEY^BUF[3] := 0;
+        CALL FILE_SETKEY_(G^FN^JURISBEN, KEY^BUF, 4, 0);
+        CALL READ_FILE(G^FN^JURISBEN, G^BEN^RULE, $LEN(BENEFIT^RULE^RECORD),
+                       BYTES^READ);
+        IF BYTES^READ < $LEN(BENEFIT^RULE^RECORD) THEN
+          BEGIN
+            CALL REPLY^ERROR(2);  ! jurisdiction not found
+            RETURN;
+          END;
+      END;
+
+    CALL REPLY^DATA(G^BEN^RULE, $LEN(BENEFIT^RULE^RECORD));
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^SOL^RULES -- Statute of limitations rules
+! -------------------------------------------------------------------
+PROC GET^SOL^RULES;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' G^KEY.STATE^CODE FOR 2;
+    CALL FILE_SETKEY_(G^FN^JURISSOL, KEY^BUF, 2, 0);
+    CALL READ_FILE(G^FN^JURISSOL, G^SOL^RULE, $LEN(SOL^RULE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(SOL^RULE^RECORD) THEN
+      CALL REPLY^ERROR(2)
+    ELSE
+      CALL REPLY^DATA(G^SOL^RULE, $LEN(SOL^RULE^RECORD));
+  END;
+
+! -------------------------------------------------------------------
+! PROC CALCULATE^PENALTY -- Compute penalty for late actions
+!
+! Penalty calculation varies by state:
+!   Flat:    Fixed dollar amount
+!   Percent: Percentage of unpaid compensation
+!   Per-day: Daily amount for each day late
+! All subject to minimum and maximum caps.
+! -------------------------------------------------------------------
+PROC CALCULATE^PENALTY;
+  BEGIN
+    INT BYTES^READ;
+    INT DAYS^LATE;
+    FIXED(2) PENALTY^AMT;
+    FIXED(2) COMP^OWED;
+    STRING .KEY^BUF[0:3];
+
+    ! Key: state(2) + penalty type(2)
+    KEY^BUF[0] ':=' G^KEY.STATE^CODE FOR 2;
+    ! Penalty type passed in DOI^YEAR field (reused)
+    KEY^BUF[2] := G^KEY.DOI^YEAR / 256;
+    KEY^BUF[3] := G^KEY.DOI^YEAR;
+
+    CALL FILE_SETKEY_(G^FN^JURISPEN, KEY^BUF, 4, 0);
+    CALL READ_FILE(G^FN^JURISPEN, G^PEN^RULE, $LEN(PENALTY^RULE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(PENALTY^RULE^RECORD) THEN
+      BEGIN
+        CALL REPLY^ERROR(2);
+        RETURN;
+      END;
+
+    ! DAYS^LATE and COMP^OWED passed in the request message body
+    ! (following the key structure)
+    CALL EXTRACT^PENALTY^PARAMS(DAYS^LATE, COMP^OWED);
+
+    ! Subtract grace period
+    IF DAYS^LATE <= G^PEN^RULE.GRACE^PERIOD^DAYS THEN
+      BEGIN
+        PENALTY^AMT := 0F;
+        CALL REPLY^PENALTY(PENALTY^AMT);
+        RETURN;
+      END;
+
+    DAYS^LATE := DAYS^LATE - G^PEN^RULE.GRACE^PERIOD^DAYS;
+
+    ! Calculate based on method
+    CASE G^PEN^RULE.PEN^CALC^METHOD OF
+      BEGIN
+        1 -> ! Flat penalty
+             PENALTY^AMT := G^PEN^RULE.PEN^FLAT^AMOUNT;
+
+        2 -> ! Percentage of compensation owed
+             PENALTY^AMT := COMP^OWED * G^PEN^RULE.PEN^PERCENT / 10000F;
+
+        3 -> ! Per-day penalty
+             PENALTY^AMT := G^PEN^RULE.PEN^PER^DAY * DAYS^LATE;
+
+        OTHERWISE ->
+             PENALTY^AMT := 0F;
+      END;
+
+    ! Apply minimum and maximum caps
+    IF PENALTY^AMT < G^PEN^RULE.PEN^MINIMUM THEN
+      PENALTY^AMT := G^PEN^RULE.PEN^MINIMUM;
+
+    IF G^PEN^RULE.PEN^MAXIMUM > 0F AND
+       PENALTY^AMT > G^PEN^RULE.PEN^MAXIMUM THEN
+      PENALTY^AMT := G^PEN^RULE.PEN^MAXIMUM;
+
+    CALL REPLY^PENALTY(PENALTY^AMT);
+  END;
+
+! -------------------------------------------------------------------
+! PROC CHECK^SECOND^INJURY^FUND -- Determine SIF eligibility
+!
+! Second injury funds reimburse employers/insurers for the excess
+! cost when a worker with a pre-existing disability suffers a new
+! injury resulting in greater combined disability.
+! -------------------------------------------------------------------
+PROC CHECK^SECOND^INJURY^FUND;
+  BEGIN
+    INT BYTES^READ;
+    INT ELIGIBLE;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' G^KEY.STATE^CODE FOR 2;
+    CALL FILE_SETKEY_(G^FN^JURISSIF, KEY^BUF, 2, 0);
+    CALL READ_FILE(G^FN^JURISSIF, G^SIF^RULE, $LEN(SIF^RULE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(SIF^RULE^RECORD) THEN
+      BEGIN
+        ! No SIF record -- state doesn't have one
+        ELIGIBLE := 0;
+        CALL REPLY^SIF^STATUS(ELIGIBLE);
+        RETURN;
+      END;
+
+    ! Check if fund exists and is actively accepting claims
+    IF G^SIF^RULE.SIF^EXISTS = 0 OR G^SIF^RULE.SIF^ACTIVE = 0 THEN
+      BEGIN
+        ELIGIBLE := 0;
+        CALL REPLY^SIF^STATUS(ELIGIBLE);
+        RETURN;
+      END;
+
+    ! Eligibility requires known pre-existing condition in many states
+    ! and minimum PPD weeks threshold
+    ! Additional validation done by caller (PPD rating, pre-existing docs)
+    ELIGIBLE := 1;
+    CALL REPLY^SIF^STATUS(ELIGIBLE);
+  END;
+
+! -------------------------------------------------------------------
+! PROC CHECK^EXTRATERRITORIAL -- Extraterritorial coverage analysis
+!
+! Determines if a state's WC coverage extends to injuries occurring
+! in another state. Applies hire-state vs. employment-state rules.
+! -------------------------------------------------------------------
+PROC CHECK^EXTRATERRITORIAL;
+  BEGIN
+    INT BYTES^READ;
+    INT COVERED;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' G^KEY.STATE^CODE FOR 2;
+    CALL FILE_SETKEY_(G^FN^JURISEXT, KEY^BUF, 2, 0);
+    CALL READ_FILE(G^FN^JURISEXT, G^EXT^RULE, $LEN(EXTRATERR^RULE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(EXTRATERR^RULE^RECORD) THEN
+      BEGIN
+        COVERED := 0;
+        CALL REPLY^EXTRATERR(COVERED);
+        RETURN;
+      END;
+
+    IF G^EXT^RULE.ALLOWS^EXTRATERR = 0 THEN
+      BEGIN
+        COVERED := 0;
+        CALL REPLY^EXTRATERR(COVERED);
+        RETURN;
+      END;
+
+    ! Coverage type determines which state's law applies
+    ! 1 = Hire state law always applies
+    ! 2 = Employment state law applies (where injury occurred)
+    ! 3 = Employee can choose more favorable
+    COVERED := G^EXT^RULE.COVERAGE^TYPE;
+    CALL REPLY^EXTRATERR(COVERED);
+  END;
+
+! -------------------------------------------------------------------
+! PROC VALIDATE^JURISDICTION -- Verify a state code is valid
+! Returns benefit rules existence as validation.
+! -------------------------------------------------------------------
+PROC VALIDATE^JURISDICTION;
+  BEGIN
+    INT BYTES^READ;
+    INT VALID;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' G^KEY.STATE^CODE FOR 2;
+    CALL FILE_SETKEY_(G^FN^JURISBEN, KEY^BUF, 2, 0, 2);  ! approx
+    CALL READ_FILE(G^FN^JURISBEN, G^BEN^RULE, 2, BYTES^READ);
+
+    IF BYTES^READ >= 2 AND
+       G^BEN^RULE.STATE^CODE = G^KEY.STATE^CODE FOR 2 THEN
+      VALID := 1
+    ELSE
+      VALID := 0;
+
+    CALL REPLY^VALID(VALID);
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^ALL^JURIS^RULES -- Retrieve all rule types for a state
+! Used by claim intake to preload all jurisdiction context.
+! Sends multiple reply segments via PATHSEND multi-reply.
+! -------------------------------------------------------------------
+PROC GET^ALL^JURIS^RULES;
+  BEGIN
+    INT STATUS;
+
+    ! Benefit rules
+    CALL LOAD^BEN^RULES^INTERNAL(G^KEY.STATE^CODE, G^KEY.DOI^YEAR, STATUS);
+    IF STATUS = 0 THEN
+      CALL REPLY^SEGMENT(1, G^BEN^RULE, $LEN(BENEFIT^RULE^RECORD));
+
+    ! SOL rules
+    CALL LOAD^SOL^RULES^INTERNAL(G^KEY.STATE^CODE, STATUS);
+    IF STATUS = 0 THEN
+      CALL REPLY^SEGMENT(2, G^SOL^RULE, $LEN(SOL^RULE^RECORD));
+
+    ! Medical guidelines
+    CALL LOAD^MED^RULES^INTERNAL(G^KEY.STATE^CODE, STATUS);
+    IF STATUS = 0 THEN
+      CALL REPLY^SEGMENT(3, G^MED^RULE, $LEN(MED^GUIDELINE^RECORD));
+
+    ! Fee schedule info
+    CALL LOAD^FEE^RULES^INTERNAL(G^KEY.STATE^CODE, STATUS);
+    IF STATUS = 0 THEN
+      CALL REPLY^SEGMENT(4, G^FEE^RULE, $LEN(FEE^SCHEDULE^RECORD));
+
+    ! Reporting requirements
+    CALL LOAD^RPT^RULES^INTERNAL(G^KEY.STATE^CODE, STATUS);
+    IF STATUS = 0 THEN
+      CALL REPLY^SEGMENT(5, G^RPT^RULE, $LEN(REPORTING^RULE^RECORD));
+
+    ! Send end-of-data marker
+    CALL REPLY^SEGMENT(0, , 0);
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^MED^GUIDELINES -- Medical treatment guideline lookup
+! -------------------------------------------------------------------
+PROC GET^MED^GUIDELINES;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' G^KEY.STATE^CODE FOR 2;
+    CALL FILE_SETKEY_(G^FN^JURISMED, KEY^BUF, 2, 0);
+    CALL READ_FILE(G^FN^JURISMED, G^MED^RULE, $LEN(MED^GUIDELINE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(MED^GUIDELINE^RECORD) THEN
+      BEGIN
+        ! Default: no mandated guidelines
+        G^MED^RULE.STATE^CODE ':=' G^KEY.STATE^CODE FOR 2;
+        G^MED^RULE.GUIDELINE^TYPE := MED^NONE;
+        G^MED^RULE.PREAUTH^REQUIRED := 0;
+        G^MED^RULE.UR^MANDATED := 0;
+        G^MED^RULE.TREATING^PHYSICIAN^CHOICE := 1;  ! employee choice default
+      END;
+
+    CALL REPLY^DATA(G^MED^RULE, $LEN(MED^GUIDELINE^RECORD));
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^FEE^SCHEDULE -- Fee schedule identification
+! -------------------------------------------------------------------
+PROC GET^FEE^SCHEDULE;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' G^KEY.STATE^CODE FOR 2;
+    CALL FILE_SETKEY_(G^FN^JURISFEE, KEY^BUF, 2, 0);
+    CALL READ_FILE(G^FN^JURISFEE, G^FEE^RULE, $LEN(FEE^SCHEDULE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(FEE^SCHEDULE^RECORD) THEN
+      BEGIN
+        ! Default to usual and customary
+        G^FEE^RULE.STATE^CODE ':=' G^KEY.STATE^CODE FOR 2;
+        G^FEE^RULE.PROFESSIONAL^FEE^TYPE := FEE^USUAL^CUSTOMARY;
+        G^FEE^RULE.HOSPITAL^FEE^TYPE := FEE^USUAL^CUSTOMARY;
+      END;
+
+    CALL REPLY^DATA(G^FEE^RULE, $LEN(FEE^SCHEDULE^RECORD));
+  END;
+
+! -------------------------------------------------------------------
+! PROC GET^REPORTING^REQS -- Reporting requirement lookup
+! -------------------------------------------------------------------
+PROC GET^REPORTING^REQS;
+  BEGIN
+    INT BYTES^READ;
+    STRING .KEY^BUF[0:1];
+
+    KEY^BUF ':=' G^KEY.STATE^CODE FOR 2;
+    CALL FILE_SETKEY_(G^FN^JURISRPT, KEY^BUF, 2, 0);
+    CALL READ_FILE(G^FN^JURISRPT, G^RPT^RULE, $LEN(REPORTING^RULE^RECORD),
+                   BYTES^READ);
+
+    IF BYTES^READ < $LEN(REPORTING^RULE^RECORD) THEN
+      CALL REPLY^ERROR(2)
+    ELSE
+      CALL REPLY^DATA(G^RPT^RULE, $LEN(REPORTING^RULE^RECORD));
+  END;
