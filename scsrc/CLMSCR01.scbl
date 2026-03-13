@@ -1,0 +1,231 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. CLMSCR01.
+      *============================================================
+      * CLMSCR01 -- Claims Inquiry Screen
+      * HPE NonStop SCREEN COBOL
+      * Provides terminal-based claim lookup and status display
+      * for customer service representatives.
+      *============================================================
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. TANDEM.
+       OBJECT-COMPUTER. TANDEM.
+
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+
+       01  WS-SCREEN-FIELDS.
+           05  WS-POLICY-NUM-IN        PIC X(16).
+           05  WS-CLAIM-NUM-IN         PIC X(12).
+           05  WS-MEMBER-SSN-IN        PIC X(9).
+
+       01  WS-CLAIM-DISPLAY.
+           05  WS-DSP-CLAIM-ID         PIC X(12).
+           05  WS-DSP-POLICY           PIC X(16).
+           05  WS-DSP-CLAIMANT         PIC X(40).
+           05  WS-DSP-TYPE             PIC X(12).
+           05  WS-DSP-STATUS           PIC X(12).
+           05  WS-DSP-BILLED           PIC ZZZ,ZZ9.99.
+           05  WS-DSP-ALLOWED          PIC ZZZ,ZZ9.99.
+           05  WS-DSP-PAID             PIC ZZZ,ZZ9.99.
+           05  WS-DSP-MEMBER-RESP      PIC ZZZ,ZZ9.99.
+           05  WS-DSP-DATE-RCVD        PIC X(10).
+           05  WS-DSP-DATE-PROC        PIC X(10).
+           05  WS-DSP-ADJUSTER         PIC X(8).
+
+       01  WS-CLAIM-LIST.
+           05  WS-LIST-COUNT           PIC 9(3) VALUE 0.
+           05  WS-LIST-ENTRY OCCURS 15 TIMES.
+               10  WS-LE-CLAIM-ID      PIC X(12).
+               10  WS-LE-DATE          PIC X(10).
+               10  WS-LE-TYPE          PIC X(12).
+               10  WS-LE-AMOUNT        PIC ZZZ,ZZ9.99.
+               10  WS-LE-STATUS        PIC X(12).
+
+       01  WS-MESSAGE-AREA.
+           05  WS-MSG-LINE             PIC X(78).
+           05  WS-MSG-TYPE             PIC 9 VALUE 0.
+               88  MSG-INFO              VALUE 0.
+               88  MSG-WARNING           VALUE 1.
+               88  MSG-ERROR             VALUE 2.
+
+       01  WS-PATHSEND-AREA.
+           05  WS-PS-SERVER            PIC X(32) VALUE "$CLMP".
+           05  WS-PS-REQUEST           PIC X(256).
+           05  WS-PS-REPLY             PIC X(4096).
+           05  WS-PS-STATUS            PIC S9(4) COMP.
+
+       01  WS-FUNCTION-KEY             PIC 9(2).
+           88  FK-ENTER                  VALUE 00.
+           88  FK-F1-HELP                VALUE 01.
+           88  FK-F2-DETAIL              VALUE 02.
+           88  FK-F3-EXIT                VALUE 03.
+           88  FK-F5-REFRESH             VALUE 05.
+           88  FK-F8-NEXT-PAGE           VALUE 08.
+           88  FK-F16-EXIT               VALUE 16.
+
+       SCREEN SECTION.
+
+       01  CLAIM-INQUIRY-SCREEN.
+           05  SCREEN-HEADER.
+               10  LINE 01 COL 01 VALUE
+                   "MAINFRAMEMOD CLAIMS INQUIRY".
+               10  LINE 01 COL 60 VALUE "CLMSCR01".
+               10  LINE 02 COL 01 VALUE ALL "-" PIC X(78).
+
+           05  SCREEN-SEARCH.
+               10  LINE 04 COL 01 VALUE "Policy Number:".
+               10  LINE 04 COL 17
+                   PIC X(16) USING WS-POLICY-NUM-IN.
+               10  LINE 04 COL 36 VALUE "Claim Number:".
+               10  LINE 04 COL 51
+                   PIC X(12) USING WS-CLAIM-NUM-IN.
+               10  LINE 05 COL 01 VALUE "Member SSN:".
+               10  LINE 05 COL 17
+                   PIC X(9) USING WS-MEMBER-SSN-IN.
+
+           05  SCREEN-DETAIL.
+               10  LINE 07 COL 01 VALUE ALL "-" PIC X(78).
+               10  LINE 08 COL 01 VALUE "Claim ID:".
+               10  LINE 08 COL 12
+                   PIC X(12) FROM WS-DSP-CLAIM-ID.
+               10  LINE 08 COL 28 VALUE "Policy:".
+               10  LINE 08 COL 37
+                   PIC X(16) FROM WS-DSP-POLICY.
+               10  LINE 09 COL 01 VALUE "Claimant:".
+               10  LINE 09 COL 12
+                   PIC X(40) FROM WS-DSP-CLAIMANT.
+               10  LINE 10 COL 01 VALUE "Type:".
+               10  LINE 10 COL 12
+                   PIC X(12) FROM WS-DSP-TYPE.
+               10  LINE 10 COL 28 VALUE "Status:".
+               10  LINE 10 COL 37
+                   PIC X(12) FROM WS-DSP-STATUS.
+               10  LINE 12 COL 01 VALUE "Billed:".
+               10  LINE 12 COL 12
+                   PIC ZZZ,ZZ9.99 FROM WS-DSP-BILLED.
+               10  LINE 12 COL 28 VALUE "Allowed:".
+               10  LINE 12 COL 38
+                   PIC ZZZ,ZZ9.99 FROM WS-DSP-ALLOWED.
+               10  LINE 13 COL 01 VALUE "Paid:".
+               10  LINE 13 COL 12
+                   PIC ZZZ,ZZ9.99 FROM WS-DSP-PAID.
+               10  LINE 13 COL 28 VALUE "Member Resp:".
+               10  LINE 13 COL 42
+                   PIC ZZZ,ZZ9.99 FROM WS-DSP-MEMBER-RESP.
+               10  LINE 14 COL 01 VALUE "Date Received:".
+               10  LINE 14 COL 17
+                   PIC X(10) FROM WS-DSP-DATE-RCVD.
+               10  LINE 14 COL 30 VALUE "Processed:".
+               10  LINE 14 COL 42
+                   PIC X(10) FROM WS-DSP-DATE-PROC.
+               10  LINE 14 COL 55 VALUE "Adjuster:".
+               10  LINE 14 COL 66
+                   PIC X(8) FROM WS-DSP-ADJUSTER.
+
+           05  SCREEN-FOOTER.
+               10  LINE 22 COL 01 VALUE ALL "-" PIC X(78).
+               10  LINE 23 COL 01
+                   PIC X(78) FROM WS-MSG-LINE.
+               10  LINE 24 COL 01 VALUE
+                   "F1=Help F2=Detail F3=Exit F5=Refresh F8=Next".
+
+       PROCEDURE DIVISION.
+
+       0000-MAIN-CONTROL.
+           PERFORM 1000-INITIALIZE
+           PERFORM 2000-SCREEN-LOOP
+               UNTIL FK-F3-EXIT OR FK-F16-EXIT
+           STOP RUN.
+
+       1000-INITIALIZE.
+           INITIALIZE WS-SCREEN-FIELDS
+           INITIALIZE WS-CLAIM-DISPLAY
+           MOVE "Enter policy number or claim number to search"
+               TO WS-MSG-LINE.
+
+       2000-SCREEN-LOOP.
+           DISPLAY CLAIM-INQUIRY-SCREEN
+           ACCEPT CLAIM-INQUIRY-SCREEN
+
+           EVALUATE TRUE
+               WHEN FK-ENTER
+                   PERFORM 3000-SEARCH-CLAIMS
+               WHEN FK-F1-HELP
+                   PERFORM 4000-SHOW-HELP
+               WHEN FK-F2-DETAIL
+                   PERFORM 5000-SHOW-DETAIL
+               WHEN FK-F5-REFRESH
+                   PERFORM 3000-SEARCH-CLAIMS
+               WHEN FK-F8-NEXT-PAGE
+                   PERFORM 6000-NEXT-PAGE
+           END-EVALUATE.
+
+       3000-SEARCH-CLAIMS.
+           IF WS-CLAIM-NUM-IN NOT = SPACES
+               PERFORM 3100-LOOKUP-BY-CLAIM
+           ELSE IF WS-POLICY-NUM-IN NOT = SPACES
+               PERFORM 3200-LOOKUP-BY-POLICY
+           ELSE
+               MOVE "Enter a policy or claim number to search"
+                   TO WS-MSG-LINE
+               SET MSG-WARNING TO TRUE
+           END-IF.
+
+       3100-LOOKUP-BY-CLAIM.
+      *    PATHSEND to claims processor for single claim lookup
+           STRING "LOOKUP|" WS-CLAIM-NUM-IN
+               DELIMITED BY SIZE INTO WS-PS-REQUEST
+
+           ENTER TAL "SERVERCLASS_SEND_" USING
+               WS-PS-SERVER
+               WS-PS-REQUEST
+               WS-PS-REPLY
+               WS-PS-STATUS
+
+           IF WS-PS-STATUS = 0
+               PERFORM 3300-PARSE-CLAIM-RESPONSE
+               MOVE "Claim found" TO WS-MSG-LINE
+               SET MSG-INFO TO TRUE
+           ELSE
+               MOVE "Claim not found" TO WS-MSG-LINE
+               SET MSG-ERROR TO TRUE
+           END-IF.
+
+       3200-LOOKUP-BY-POLICY.
+      *    PATHSEND for policy claim history
+           STRING "HISTORY|" WS-POLICY-NUM-IN
+               DELIMITED BY SIZE INTO WS-PS-REQUEST
+
+           ENTER TAL "SERVERCLASS_SEND_" USING
+               WS-PS-SERVER
+               WS-PS-REQUEST
+               WS-PS-REPLY
+               WS-PS-STATUS
+
+           IF WS-PS-STATUS = 0
+               PERFORM 3400-PARSE-LIST-RESPONSE
+               MOVE "Claims found for policy" TO WS-MSG-LINE
+               SET MSG-INFO TO TRUE
+           ELSE
+               MOVE "No claims found for this policy"
+                   TO WS-MSG-LINE
+               SET MSG-WARNING TO TRUE
+           END-IF.
+
+       3300-PARSE-CLAIM-RESPONSE.
+           CONTINUE.
+
+       3400-PARSE-LIST-RESPONSE.
+           CONTINUE.
+
+       4000-SHOW-HELP.
+           MOVE "Enter policy# or claim# and press ENTER"
+               TO WS-MSG-LINE.
+
+       5000-SHOW-DETAIL.
+           CONTINUE.
+
+       6000-NEXT-PAGE.
+           CONTINUE.

@@ -1,0 +1,241 @@
+! ============================================================
+! POLMAINT -- Policy Maintenance Server
+! HPE NonStop TAL
+! Manages insurance policy CRUD operations via Enscribe
+! ============================================================
+
+?INSPECT, SYMBOLS
+?NOLIST, SOURCE $SYSTEM.SYSTEM.EXTDECS0 (
+    INITIALIZER,
+    FILE_OPEN_,
+    FILE_CLOSE_,
+    FILE_GETINFO_,
+    READX,
+    READUPDATEX,
+    WRITEX,
+    REPLYX,
+    KEYPOSITION,
+    POSITION,
+    LOCKFILE,
+    UNLOCKFILE
+)
+?LIST
+
+LITERAL max^policies      = 100000;
+LITERAL policy^active     = 1;
+LITERAL policy^lapsed     = 2;
+LITERAL policy^cancelled  = 3;
+LITERAL policy^expired    = 4;
+
+! Policy master record -- Enscribe key-sequenced file
+STRUCT policy^master (*);
+BEGIN
+    STRING  policy^number[0:15];       ! Primary key
+    STRING  insured^name[0:39];
+    STRING  insured^ssn[0:8];
+    STRING  insured^dob[0:7];          ! YYYYMMDD
+    STRING  employer^id[0:9];
+    STRING  group^number[0:11];
+    INT     plan^type;                 ! 1=Medical, 2=Dental, 3=Vision, 4=Life
+    INT     status;
+    INT(32) effective^date;
+    INT(32) termination^date;
+    FIXED   premium^amount;
+    FIXED   deductible;
+    FIXED   deductible^met;
+    FIXED   out^of^pocket^max;
+    FIXED   out^of^pocket^met;
+    STRING  agent^code[0:5];
+    INT(32) last^modified;
+    STRING  modified^by[0:7];
+END;
+
+! Dependent record
+STRUCT dependent^record (*);
+BEGIN
+    STRING  policy^number[0:15];       ! Foreign key
+    STRING  dependent^name[0:39];
+    STRING  relationship[0:9];         ! SPOUSE, CHILD, etc.
+    STRING  dependent^dob[0:7];
+    STRING  dependent^ssn[0:8];
+    INT     status;
+END;
+
+! Global file numbers
+INT policy^file^num;
+INT dependent^file^num;
+INT audit^file^num;
+
+! ============================================================
+! PROC open^files -- Open Enscribe data files
+! ============================================================
+INT PROC open^files;
+BEGIN
+    INT error;
+
+    error := FILE_OPEN_("$DATA1.POLDATA.POLMAST",
+                          policy^file^num);
+    IF error <> 0 THEN RETURN error;
+
+    error := FILE_OPEN_("$DATA1.POLDATA.DEPEND",
+                          dependent^file^num);
+    IF error <> 0 THEN RETURN error;
+
+    error := FILE_OPEN_("$DATA1.POLDATA.AUDIT",
+                          audit^file^num);
+    IF error <> 0 THEN RETURN error;
+
+    RETURN 0;
+END;
+
+! ============================================================
+! PROC lookup^policy -- Read policy by policy number
+! ============================================================
+INT PROC lookup^policy(pol^number, pol^rec);
+    STRING .pol^number[0:15];
+    INT    .pol^rec(policy^master);
+BEGIN
+    INT error;
+    INT bytes^read;
+
+    ! Position to the key
+    CALL KEYPOSITION(policy^file^num,
+                      pol^number, , 16, 0);
+    error := FILE_GETINFO_(policy^file^num, error);
+    IF error <> 0 THEN RETURN error;
+
+    ! Read the record
+    CALL READX(policy^file^num, pol^rec,
+                $LEN(policy^master), bytes^read);
+    error := FILE_GETINFO_(policy^file^num, error);
+
+    RETURN error;
+END;
+
+! ============================================================
+! PROC update^policy -- Update existing policy record
+! ============================================================
+INT PROC update^policy(pol^rec, user^id);
+    INT    .pol^rec(policy^master);
+    STRING .user^id[0:7];
+BEGIN
+    INT error;
+    INT bytes^read;
+    INT .existing^rec(policy^master);
+
+    ! Lock and read current record
+    CALL KEYPOSITION(policy^file^num,
+                      pol^rec.policy^number, , 16, 0);
+    CALL READUPDATEX(policy^file^num, existing^rec,
+                      $LEN(policy^master), bytes^read);
+    error := FILE_GETINFO_(policy^file^num, error);
+    IF error <> 0 THEN RETURN error;
+
+    ! Update timestamp and user
+    pol^rec.last^modified := JULIANTIMESTAMP;
+    pol^rec.modified^by ':=' user^id FOR 8;
+
+    ! Write back
+    CALL WRITEX(policy^file^num, pol^rec,
+                 $LEN(policy^master));
+    error := FILE_GETINFO_(policy^file^num, error);
+
+    IF error = 0 THEN
+        CALL write^audit^trail(pol^rec.policy^number,
+                                "UPDATE", user^id);
+
+    RETURN error;
+END;
+
+! ============================================================
+! PROC check^eligibility -- Verify member is eligible
+! ============================================================
+INT PROC check^eligibility(pol^number, service^date);
+    STRING  .pol^number[0:15];
+    INT(32) service^date;
+BEGIN
+    INT .pol^rec(policy^master);
+    INT error;
+
+    error := lookup^policy(pol^number, pol^rec);
+    IF error <> 0 THEN RETURN -1;  ! Policy not found
+
+    ! Check status
+    IF pol^rec.status <> policy^active THEN RETURN 1;
+
+    ! Check dates
+    IF service^date < pol^rec.effective^date THEN RETURN 2;
+    IF pol^rec.termination^date <> 0 AND
+       service^date > pol^rec.termination^date THEN RETURN 3;
+
+    RETURN 0;  ! Eligible
+END;
+
+! ============================================================
+! PROC calculate^member^liability -- Compute copay/coinsurance
+! ============================================================
+FIXED PROC calculate^member^liability(pol^number, allowed^amount);
+    STRING .pol^number[0:15];
+    FIXED  allowed^amount;
+BEGIN
+    INT .pol^rec(policy^master);
+    INT error;
+    FIXED remaining^deductible;
+    FIXED member^share;
+    FIXED coinsurance^rate := 0.20D;  ! 80/20 split
+
+    error := lookup^policy(pol^number, pol^rec);
+    IF error <> 0 THEN RETURN allowed^amount;
+
+    ! Apply deductible first
+    remaining^deductible := pol^rec.deductible - pol^rec.deductible^met;
+    IF remaining^deductible > 0D THEN
+    BEGIN
+        IF allowed^amount <= remaining^deductible THEN
+        BEGIN
+            member^share := allowed^amount;
+            RETURN member^share;
+        END
+        ELSE
+        BEGIN
+            member^share := remaining^deductible;
+            allowed^amount := allowed^amount - remaining^deductible;
+        END;
+    END
+    ELSE
+        member^share := 0D;
+
+    ! Apply coinsurance to remainder
+    member^share := member^share + (allowed^amount * coinsurance^rate);
+
+    ! Check out-of-pocket maximum
+    IF (pol^rec.out^of^pocket^met + member^share) > pol^rec.out^of^pocket^max THEN
+        member^share := pol^rec.out^of^pocket^max - pol^rec.out^of^pocket^met;
+
+    RETURN member^share;
+END;
+
+! ============================================================
+! PROC main -- Server entry point
+! ============================================================
+PROC main MAIN;
+BEGIN
+    INT error;
+
+    CALL INITIALIZER;
+
+    error := open^files;
+    IF error <> 0 THEN
+    BEGIN
+        CALL log^error("Failed to open data files", error);
+        RETURN;
+    END;
+
+    ! Enter server receive loop
+    CALL server^loop;
+
+    ! Cleanup
+    CALL FILE_CLOSE_(policy^file^num);
+    CALL FILE_CLOSE_(dependent^file^num);
+    CALL FILE_CLOSE_(audit^file^num);
+END;

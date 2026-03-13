@@ -1,0 +1,282 @@
+! ============================================================
+! PMTPROC -- Payment Processing Server
+! HPE NonStop TAL
+! Handles check runs, EFT payments, and payment reconciliation
+! for adjudicated claims.
+! ============================================================
+
+?INSPECT, SYMBOLS
+?NOLIST, SOURCE $SYSTEM.SYSTEM.EXTDECS0 (
+    INITIALIZER,
+    FILE_OPEN_,
+    FILE_CLOSE_,
+    FILE_GETINFO_,
+    READX,
+    READUPDATEX,
+    WRITEX,
+    REPLYX,
+    KEYPOSITION,
+    LOCKFILE,
+    UNLOCKFILE,
+    TMF_BEGIN_,
+    TMF_END_,
+    TMF_ABORT_
+)
+?LIST
+
+LITERAL pmt^method^check = 1;
+LITERAL pmt^method^eft   = 2;
+LITERAL pmt^method^ach   = 3;
+
+LITERAL pmt^status^pending   = 0;
+LITERAL pmt^status^approved  = 1;
+LITERAL pmt^status^issued    = 2;
+LITERAL pmt^status^cleared   = 3;
+LITERAL pmt^status^voided    = 4;
+LITERAL pmt^status^stale     = 5;
+
+! Payment record
+STRUCT payment^record (*);
+BEGIN
+    STRING  payment^id[0:11];
+    STRING  claim^id[0:11];
+    STRING  payee^name[0:39];
+    STRING  payee^tax^id[0:8];
+    INT     payment^method;
+    FIXED   payment^amount;
+    INT     status;
+    INT(32) date^created;
+    INT(32) date^issued;
+    INT(32) date^cleared;
+    STRING  check^number[0:9];
+    STRING  bank^routing[0:8];
+    STRING  bank^account[0:16];
+    STRING  batch^id[0:7];
+END;
+
+! Check batch control
+STRUCT batch^control (*);
+BEGIN
+    STRING  batch^id[0:7];
+    INT(32) batch^date;
+    INT     payment^count;
+    FIXED   batch^total;
+    INT     status;           ! 0=open, 1=closed, 2=posted
+    STRING  created^by[0:7];
+END;
+
+! Global state
+INT payment^file^num;
+INT batch^file^num;
+INT claim^file^num;
+INT audit^file^num;
+
+! ============================================================
+! PROC create^payment -- Create payment record for claim
+! ============================================================
+INT PROC create^payment(claim^id, payee, amount, method, pmt^rec);
+    STRING .claim^id[0:11];
+    STRING .payee[0:39];
+    FIXED  amount;
+    INT    method;
+    INT    .pmt^rec(payment^record);
+BEGIN
+    INT error;
+
+    ! Generate payment ID
+    CALL generate^payment^id(pmt^rec.payment^id);
+
+    pmt^rec.claim^id ':=' claim^id FOR 12;
+    pmt^rec.payee^name ':=' payee FOR 40;
+    pmt^rec.payment^method := method;
+    pmt^rec.payment^amount := amount;
+    pmt^rec.status := pmt^status^pending;
+    pmt^rec.date^created := JULIANTIMESTAMP;
+
+    ! Write to payment file within TMF transaction
+    error := TMF_BEGIN_;
+    IF error <> 0 THEN RETURN error;
+
+    CALL WRITEX(payment^file^num, pmt^rec, $LEN(payment^record));
+    error := FILE_GETINFO_(payment^file^num, error);
+
+    IF error <> 0 THEN
+    BEGIN
+        CALL TMF_ABORT_;
+        RETURN error;
+    END;
+
+    CALL TMF_END_;
+    RETURN 0;
+END;
+
+! ============================================================
+! PROC process^check^batch -- Issue checks for pending payments
+! ============================================================
+INT PROC process^check^batch(batch^id, user^id);
+    STRING .batch^id[0:7];
+    STRING .user^id[0:7];
+BEGIN
+    INT error;
+    INT count := 0;
+    FIXED total := 0D;
+    INT .pmt^rec(payment^record);
+    INT bytes^read;
+    STRING .next^check[0:9];
+
+    ! Get next check number from sequence
+    CALL get^next^check^number(next^check);
+
+    ! Scan payment file for pending payments in this batch
+    CALL KEYPOSITION(payment^file^num, batch^id, , 8, 0);
+
+    WHILE 1 DO
+    BEGIN
+        CALL READUPDATEX(payment^file^num, pmt^rec,
+                          $LEN(payment^record), bytes^read);
+        error := FILE_GETINFO_(payment^file^num, error);
+        IF error <> 0 THEN RETURN error;
+
+        ! Check if still in same batch
+        IF pmt^rec.batch^id <> batch^id THEN RETURN 0;
+
+        IF pmt^rec.status = pmt^status^pending THEN
+        BEGIN
+            pmt^rec.status := pmt^status^issued;
+            pmt^rec.check^number ':=' next^check FOR 10;
+            pmt^rec.date^issued := JULIANTIMESTAMP;
+
+            CALL WRITEX(payment^file^num, pmt^rec,
+                         $LEN(payment^record));
+
+            count := count + 1;
+            total := total + pmt^rec.payment^amount;
+
+            ! Increment check number
+            CALL increment^check^number(next^check);
+        END;
+    END;
+
+    ! Update batch control
+    CALL update^batch^totals(batch^id, count, total);
+
+    RETURN 0;
+END;
+
+! ============================================================
+! PROC void^payment -- Void an issued payment
+! ============================================================
+INT PROC void^payment(payment^id, reason, user^id);
+    STRING .payment^id[0:11];
+    STRING .reason[0:79];
+    STRING .user^id[0:7];
+BEGIN
+    INT error;
+    INT bytes^read;
+    INT .pmt^rec(payment^record);
+
+    error := TMF_BEGIN_;
+    IF error <> 0 THEN RETURN error;
+
+    CALL KEYPOSITION(payment^file^num, payment^id, , 12, 0);
+    CALL READUPDATEX(payment^file^num, pmt^rec,
+                      $LEN(payment^record), bytes^read);
+    error := FILE_GETINFO_(payment^file^num, error);
+
+    IF error <> 0 THEN
+    BEGIN
+        CALL TMF_ABORT_;
+        RETURN error;
+    END;
+
+    IF pmt^rec.status <> pmt^status^issued THEN
+    BEGIN
+        CALL TMF_ABORT_;
+        RETURN -1;  ! Can only void issued payments
+    END;
+
+    pmt^rec.status := pmt^status^voided;
+
+    CALL WRITEX(payment^file^num, pmt^rec, $LEN(payment^record));
+    error := FILE_GETINFO_(payment^file^num, error);
+
+    IF error <> 0 THEN
+    BEGIN
+        CALL TMF_ABORT_;
+        RETURN error;
+    END;
+
+    ! Log the void to audit trail
+    CALL write^audit^trail(payment^id, "VOID", user^id);
+
+    CALL TMF_END_;
+    RETURN 0;
+END;
+
+! ============================================================
+! PROC reconcile^payments -- Match cleared checks to payments
+! ============================================================
+INT PROC reconcile^payments(bank^file);
+    INT bank^file;
+BEGIN
+    INT error;
+    INT bytes^read;
+    INT matched := 0;
+    INT unmatched := 0;
+    STRING .bank^check^num[0:9];
+    FIXED  bank^amount;
+    INT .pmt^rec(payment^record);
+
+    WHILE 1 DO
+    BEGIN
+        CALL READX(bank^file, bank^check^num, 10, bytes^read);
+        error := FILE_GETINFO_(bank^file, error);
+        IF error = 1 THEN RETURN 0;  ! EOF
+        IF error <> 0 THEN RETURN error;
+
+        ! Look up payment by check number
+        CALL KEYPOSITION(payment^file^num, bank^check^num, , 10, 2);
+        CALL READUPDATEX(payment^file^num, pmt^rec,
+                          $LEN(payment^record), bytes^read);
+        error := FILE_GETINFO_(payment^file^num, error);
+
+        IF error = 0 AND pmt^rec.status = pmt^status^issued THEN
+        BEGIN
+            pmt^rec.status := pmt^status^cleared;
+            pmt^rec.date^cleared := JULIANTIMESTAMP;
+            CALL WRITEX(payment^file^num, pmt^rec,
+                         $LEN(payment^record));
+            matched := matched + 1;
+        END
+        ELSE
+            unmatched := unmatched + 1;
+    END;
+
+    RETURN 0;
+END;
+
+! ============================================================
+! PROC main -- Payment server entry point
+! ============================================================
+PROC main MAIN;
+BEGIN
+    INT error;
+
+    CALL INITIALIZER;
+
+    error := FILE_OPEN_("$DATA1.PMTDATA.PAYMENT", payment^file^num);
+    IF error <> 0 THEN RETURN;
+
+    error := FILE_OPEN_("$DATA1.PMTDATA.BATCH", batch^file^num);
+    IF error <> 0 THEN RETURN;
+
+    error := FILE_OPEN_("$DATA1.CLMDATA.CLAIMS", claim^file^num);
+    IF error <> 0 THEN RETURN;
+
+    ! Enter server receive loop
+    CALL server^loop;
+
+    CALL FILE_CLOSE_(payment^file^num);
+    CALL FILE_CLOSE_(batch^file^num);
+    CALL FILE_CLOSE_(claim^file^num);
+END;

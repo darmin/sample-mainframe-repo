@@ -1,0 +1,185 @@
+! ============================================================
+! CLMPROC -- Claims Processing Server
+! HPE NonStop TAL
+! Handles incoming claim transactions via PATHSEND
+! ============================================================
+
+?INSPECT, SYMBOLS, NOCODE
+?NOLIST, SOURCE $SYSTEM.SYSTEM.EXTDECS0 (
+    INITIALIZER,
+    PROCESS_GETINFO_,
+    FILE_OPEN_,
+    FILE_CLOSE_,
+    READUPDATEX,
+    WRITEX,
+    REPLYX,
+    SERVERCLASS_SEND_,
+    MONITORNEWPROCESS
+)
+?LIST
+
+LITERAL max^claims     = 5000;
+LITERAL max^line^items = 50;
+LITERAL claim^status^new     = 0;
+LITERAL claim^status^pending = 1;
+LITERAL claim^status^approved = 2;
+LITERAL claim^status^denied  = 3;
+LITERAL claim^status^paid    = 4;
+
+! Claim record structure
+STRUCT claim^record (*);
+BEGIN
+    STRING  claim^id[0:11];
+    STRING  policy^number[0:15];
+    STRING  claimant^name[0:39];
+    STRING  claimant^ssn[0:8];
+    INT     claim^type;
+    FIXED   claim^amount;
+    FIXED   approved^amount;
+    INT     status;
+    INT(32) date^received;
+    INT(32) date^processed;
+    STRING  adjuster^id[0:7];
+    STRING  denial^reason[0:79];
+    INT     line^item^count;
+END;
+
+! Line item structure
+STRUCT line^item^record (*);
+BEGIN
+    STRING  service^code[0:9];
+    STRING  description[0:59];
+    FIXED   billed^amount;
+    FIXED   allowed^amount;
+    FIXED   paid^amount;
+    INT     units;
+    INT(32) service^date;
+END;
+
+! Global variables
+INT     .receive^buffer[0:2047];
+INT     .reply^buffer[0:2047];
+INT     error;
+INT     count^replied;
+STRING  .process^name[0:47];
+
+! ============================================================
+! PROC validate^claim -- Validate claim data integrity
+! ============================================================
+INT PROC validate^claim(claim^rec);
+    INT .claim^rec(claim^record);
+BEGIN
+    ! Check required fields
+    IF claim^rec.claim^id[0] = " " THEN RETURN 1;
+    IF claim^rec.policy^number[0] = " " THEN RETURN 2;
+    IF claim^rec.claim^amount < 0D THEN RETURN 3;
+    IF claim^rec.claim^type < 0 OR claim^rec.claim^type > 9 THEN RETURN 4;
+    IF claim^rec.claimant^ssn[0] = " " THEN RETURN 5;
+
+    RETURN 0;
+END;
+
+! ============================================================
+! PROC calculate^allowed^amount -- Apply fee schedule rules
+! ============================================================
+FIXED PROC calculate^allowed^amount(service^code, billed);
+    STRING .service^code[0:9];
+    FIXED  billed;
+BEGIN
+    FIXED allowed;
+    FIXED max^allowed;
+
+    ! Look up fee schedule maximum
+    CALL fee^schedule^lookup(service^code, max^allowed);
+
+    ! Allowed is lesser of billed or fee schedule max
+    IF billed <= max^allowed THEN
+        allowed := billed
+    ELSE
+        allowed := max^allowed;
+
+    RETURN allowed;
+END;
+
+! ============================================================
+! PROC process^claim -- Main claim processing logic
+! ============================================================
+INT PROC process^claim(claim^rec, items, item^count);
+    INT .claim^rec(claim^record);
+    INT .items(line^item^record);
+    INT item^count;
+BEGIN
+    INT i;
+    INT validation^result;
+    FIXED total^allowed := 0D;
+    FIXED total^paid := 0D;
+
+    ! Validate the claim
+    validation^result := validate^claim(claim^rec);
+    IF validation^result <> 0 THEN
+    BEGIN
+        claim^rec.status := claim^status^denied;
+        RETURN validation^result;
+    END;
+
+    ! Process each line item
+    FOR i := 0 TO item^count - 1 DO
+    BEGIN
+        items[i].allowed^amount :=
+            calculate^allowed^amount(items[i].service^code,
+                                      items[i].billed^amount);
+
+        ! Apply copay/deductible rules
+        CALL apply^benefit^rules(claim^rec.policy^number,
+                                  items[i].allowed^amount,
+                                  items[i].paid^amount);
+
+        total^allowed := total^allowed + items[i].allowed^amount;
+        total^paid := total^paid + items[i].paid^amount;
+    END;
+
+    claim^rec.approved^amount := total^allowed;
+
+    ! Auto-adjudicate if under threshold
+    IF total^paid <= 5000D AND validation^result = 0 THEN
+    BEGIN
+        claim^rec.status := claim^status^approved;
+        claim^rec.date^processed := JULIANTIMESTAMP;
+    END
+    ELSE
+        claim^rec.status := claim^status^pending;
+
+    RETURN 0;
+END;
+
+! ============================================================
+! PROC main -- Server main loop
+! ============================================================
+PROC main MAIN;
+BEGIN
+    INT .receive^buf[0:2047];
+    INT .reply^buf[0:2047];
+    INT receive^len;
+    INT msg^tag;
+    INT error;
+
+    CALL INITIALIZER;
+
+    ! Server receive loop
+    WHILE 1 DO
+    BEGIN
+        CALL READUPDATEX(receive^buf, 4096, receive^len);
+        error := FILE_GETINFO_(, error);
+
+        IF error = 0 THEN
+        BEGIN
+            ! Process the request
+            CALL dispatch^request(receive^buf, receive^len,
+                                   reply^buf, msg^tag);
+
+            ! Send reply
+            CALL REPLYX(reply^buf, 4096);
+            count^replied := count^replied + 1;
+        END;
+    END;
+END;

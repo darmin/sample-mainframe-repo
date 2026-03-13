@@ -1,0 +1,169 @@
+?SECTION DAILYRUN ROUTINE
+!============================================================
+! DAILYRUN -- Daily Batch Processing TACL Script
+! HPE NonStop TACL
+! Orchestrates nightly batch cycle for claims processing
+!============================================================
+
+#FRAME
+
+#SET batch_date [#DATEFORMAT [#TIMESTAMP] YYYY-MM-DD]
+#SET log_file $DATA1.LOGS.DAILY[#DATEFORMAT [#TIMESTAMP] YYYYMMDD]
+#SET error_count 0
+#SET start_time [#TIMESTAMP]
+
+#OUTPUT [log_file]
+== Daily Batch Processing Started ==
+== Date: [batch_date]
+== Time: [#DATEFORMAT [start_time] HH:MM:SS]
+==
+
+!------------------------------------------------------------
+! Step 1: Verify prerequisites
+!------------------------------------------------------------
+[#IF [#PROCESSEXISTS $CLMP] |THEN|
+    #OUTPUT Process $CLMP is running - OK
+|ELSE|
+    #OUTPUT ERROR: Claims processor $CLMP is not running
+    #SET error_count [#COMPUTE [error_count] + 1]
+    #GOTO ABORT_BATCH
+]
+
+[#IF [#PROCESSEXISTS $POLM] |THEN|
+    #OUTPUT Process $POLM is running - OK
+|ELSE|
+    #OUTPUT ERROR: Policy server $POLM is not running
+    #SET error_count [#COMPUTE [error_count] + 1]
+    #GOTO ABORT_BATCH
+]
+
+!------------------------------------------------------------
+! Step 2: Run pending claims adjudication
+!------------------------------------------------------------
+#OUTPUT
+#OUTPUT == Step 2: Claims Adjudication ==
+#SET step2_start [#TIMESTAMP]
+
+RUN $DATA1.CLMOBJ.ADJBATCH / IN $DATA1.BATCHIN.ADJCTL, &
+    OUT [log_file], TERM $ZHOME /
+
+#SET adjudication_status [#COMPLETIONSTATUS]
+[#IF [adjudication_status] = 0 |THEN|
+    #OUTPUT Claims adjudication completed successfully
+|ELSE|
+    #OUTPUT ERROR: Claims adjudication failed with status [adjudication_status]
+    #SET error_count [#COMPUTE [error_count] + 1]
+]
+
+#SET step2_elapsed [#COMPUTE [#TIMESTAMP] - [step2_start]]
+#OUTPUT Elapsed time: [#DATEFORMAT [step2_elapsed] HH:MM:SS]
+
+!------------------------------------------------------------
+! Step 3: Generate EOB (Explanation of Benefits)
+!------------------------------------------------------------
+#OUTPUT
+#OUTPUT == Step 3: EOB Generation ==
+#SET step3_start [#TIMESTAMP]
+
+RUN $DATA1.CLMOBJ.EOBGEN / IN $DATA1.BATCHIN.EOBCTL, &
+    OUT [log_file] /
+
+#SET eob_status [#COMPLETIONSTATUS]
+[#IF [eob_status] = 0 |THEN|
+    #OUTPUT EOB generation completed successfully
+|ELSE|
+    #OUTPUT WARNING: EOB generation failed with status [eob_status]
+    #SET error_count [#COMPUTE [error_count] + 1]
+]
+
+!------------------------------------------------------------
+! Step 4: Process premium payments
+!------------------------------------------------------------
+#OUTPUT
+#OUTPUT == Step 4: Premium Payment Processing ==
+#SET step4_start [#TIMESTAMP]
+
+RUN $DATA1.FINOBJ.PREMPAY / IN $DATA1.BATCHIN.PREMCTL, &
+    OUT [log_file] /
+
+[#IF [#COMPLETIONSTATUS] = 0 |THEN|
+    #OUTPUT Premium processing completed
+|ELSE|
+    #OUTPUT ERROR: Premium processing failed
+    #SET error_count [#COMPUTE [error_count] + 1]
+]
+
+!------------------------------------------------------------
+! Step 5: Update accumulators (deductibles, OOP)
+!------------------------------------------------------------
+#OUTPUT
+#OUTPUT == Step 5: Accumulator Updates ==
+
+RUN $DATA1.CLMOBJ.ACCUMUPD / IN $DATA1.BATCHIN.ACCUMCTL, &
+    OUT [log_file] /
+
+[#IF [#COMPLETIONSTATUS] = 0 |THEN|
+    #OUTPUT Accumulator update completed
+|ELSE|
+    #OUTPUT ERROR: Accumulator update failed
+    #SET error_count [#COMPUTE [error_count] + 1]
+]
+
+!------------------------------------------------------------
+! Step 6: Generate daily reports
+!------------------------------------------------------------
+#OUTPUT
+#OUTPUT == Step 6: Report Generation ==
+
+RUN $DATA1.RPTOBJ.DAILYRPT / IN $DATA1.BATCHIN.RPTCTL, &
+    OUT $S.#RPT.[#DATEFORMAT [#TIMESTAMP] MMDD] /
+
+[#IF [#COMPLETIONSTATUS] = 0 |THEN|
+    #OUTPUT Daily reports generated
+|ELSE|
+    #OUTPUT WARNING: Report generation failed
+    #SET error_count [#COMPUTE [error_count] + 1]
+]
+
+!------------------------------------------------------------
+! Step 7: File maintenance / purge old records
+!------------------------------------------------------------
+#OUTPUT
+#OUTPUT == Step 7: File Maintenance ==
+
+FUP PURGEDATA $DATA1.POLDATA.AUDIT, FROM [#DATEFORMAT [#COMPUTE [#TIMESTAMP] - 7776000000000] YYYYMMDD]
+
+!------------------------------------------------------------
+! Summary
+!------------------------------------------------------------
+DAILY_COMPLETE:
+
+#SET end_time [#TIMESTAMP]
+#SET total_elapsed [#COMPUTE [end_time] - [start_time]]
+
+#OUTPUT
+#OUTPUT ============================================
+#OUTPUT Daily Batch Processing Complete
+#OUTPUT Date:     [batch_date]
+#OUTPUT Started:  [#DATEFORMAT [start_time] HH:MM:SS]
+#OUTPUT Ended:    [#DATEFORMAT [end_time] HH:MM:SS]
+#OUTPUT Elapsed:  [#DATEFORMAT [total_elapsed] HH:MM:SS]
+#OUTPUT Errors:   [error_count]
+#OUTPUT ============================================
+
+[#IF [error_count] > 0 |THEN|
+    #OUTPUT
+    #OUTPUT ** BATCH COMPLETED WITH [error_count] ERRORS **
+    #OUTPUT ** Review log: [log_file] **
+]
+
+#UNFRAME
+?ENDSECTION
+
+!============================================================
+ABORT_BATCH:
+#OUTPUT
+#OUTPUT !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#OUTPUT !! BATCH ABORTED - PREREQUISITES NOT MET !!
+#OUTPUT !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#UNFRAME
