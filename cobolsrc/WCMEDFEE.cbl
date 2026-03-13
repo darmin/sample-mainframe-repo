@@ -149,6 +149,10 @@
       *        Y = Can stack with other modifiers, N = No stacking
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCPRVCPY
 
        01  WS-FILE-STATUSES.
            05  WS-FS-STATUS              PIC X(02).
@@ -205,6 +209,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-PROCESS.
+      *
+      *    Inter-program communication calls
+           PATHSEND USING "MEDBILL"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-REQUESTS
                UNTIL WS-PS-ERROR NOT = ZERO

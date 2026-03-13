@@ -45,6 +45,11 @@ FIXED  MAX^MOD^FACTOR := 2.50F;   ! Ceiling (state-specific)
 ! Expected Loss Rate table entry
 STRUCT ELR^ENTRY (*);
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL POLMAINT;
+!XREF: CALL WCWAGE;
     STRING CLASS^CODE[0:3];       ! 4-digit NCCI class code
     STRING STATE^CODE[0:1];       ! 2-char state
     INT    EFFECTIVE^YEAR;

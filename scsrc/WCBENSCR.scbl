@@ -20,6 +20,9 @@
 *
 ?section DATA
 *
+*    Copybook references
+           COPY WCCLMCPY
+*
 SCREEN WCBENSCR.
 *
     01 BEN-SCREEN-RECORD.
@@ -292,6 +295,10 @@ SCREEN WCBENSCR.
        05 BEN-PREV-PPD-WEEKS      PIC 9(5)   HIDDEN.
 *
 ?section LOGIC
+*
+*    Server communication via PATHSEND
+           PATHSEND USING "WCBENCALC"
+           PATHSEND USING "WCJURIS"
 *
 *================================================================
 *  MAIN PROCESSING LOGIC

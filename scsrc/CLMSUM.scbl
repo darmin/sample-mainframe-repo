@@ -28,6 +28,10 @@
        DATA DIVISION.
 
        WORKING-STORAGE SECTION.
+      *
+      *    Copybook references
+           COPY WCCLMCPY
+           COPY WCRSVCPY
 
        01  WS-CONTROL-FIELDS.
            05  WS-FUNCTION-KEY     PIC 99.
@@ -295,6 +299,10 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-CONTROL.
+      *
+      *    Server communication via PATHSEND
+           PATHSEND USING "CLMPROC"
+           PATHSEND USING "RSVRCALC"
            PERFORM 1000-INITIALIZE
            PERFORM 1500-GET-CLAIM-NUMBER
            IF NOT WS-EXIT-NOW

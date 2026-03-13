@@ -14,6 +14,10 @@
 
        DATA DIVISION.
        WORKING-STORAGE SECTION.
+      *
+      *    Copybook references
+           COPY WCCLMCPY
+           COPY CLMCOPY
 
        01  WS-SCREEN-FIELDS.
            05  WS-POLICY-NUM-IN        PIC X(16).
@@ -134,6 +138,10 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-CONTROL.
+      *
+      *    Server communication via PATHSEND
+           PATHSEND USING "CLMPROC"
+           PATHSEND USING "ELGCHECK"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-SCREEN-LOOP
                UNTIL FK-F3-EXIT OR FK-F16-EXIT

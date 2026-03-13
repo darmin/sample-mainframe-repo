@@ -216,6 +216,10 @@
        01  VOC-REPORT-LINE                PIC X(132).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCEMPCPY
        01  WS-FILE-STATUS                 PIC X(2).
        01  WS-CURRENT-DATE                PIC 9(8).
        01  WS-EOF-FLAG                    PIC X(1) VALUE "N".
@@ -261,6 +265,9 @@
 
        PROCEDURE DIVISION.
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "WCBENCALC"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-REQUEST
            PERFORM 9000-TERMINATE

@@ -80,6 +80,10 @@ LITERAL MED^NONE                 = 4;   ! No mandated guidelines
 ! -------------------------------------------------------------------
 STRUCT JURIS^LOOKUP^KEY;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCSTATE;
     STRING   STATE^CODE[0:1];          ! 2-char: "CA", "TX", "NY", "FE" (federal)
     INT      DOI^YEAR;                 ! Year of injury for rate lookup
   END;

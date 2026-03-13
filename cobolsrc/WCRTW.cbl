@@ -205,6 +205,10 @@
            05  RM-SYSTEM-GENERATED       PIC X(01).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCEMPCPY
 
        01  WS-FILE-STATUSES.
            05  WS-RS-STATUS              PIC X(02).
@@ -268,6 +272,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-PROCESS.
+      *
+      *    Inter-program communication calls
+           CALL "WCBENCALC"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-REQUESTS
                UNTIL WS-PS-ERROR NOT = ZERO

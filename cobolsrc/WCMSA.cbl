@@ -129,6 +129,10 @@
        01  MSA-REPORT-RECORD           PIC X(132).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCPMTCPY
        01  WS-FILE-STATUSES.
            05  WS-CLM-FILE-STATUS     PIC XX.
            05  WS-MSA-FILE-STATUS     PIC XX.
@@ -207,6 +211,9 @@
 
        PROCEDURE DIVISION.
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           PATHSEND USING "WCLEGAL"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-CLAIMS
            PERFORM 5000-MONITOR-ACTIVE-MSAS

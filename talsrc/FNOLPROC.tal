@@ -61,6 +61,12 @@ LITERAL
 !-- FNOL request message structure
 STRUCT FNOL^REQUEST;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL FNOLVAL;
+!XREF: CALL CLMSETUP;
+!XREF: CALL CLMDIARY;
     INT(32)  MSG^TYPE;
     INT(32)  MSG^LENGTH;
     STRING   EMPLOYER^FEIN[0:8];

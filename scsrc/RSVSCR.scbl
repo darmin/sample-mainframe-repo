@@ -16,6 +16,9 @@
 *
 ?section DATA
 *
+*    Copybook references
+           COPY WCRSVCPY
+*
 SCREEN RSVSCR.
 *
     01 RSV-SCREEN-RECORD.
@@ -352,6 +355,10 @@ SCREEN RSVSCR.
        05 RSV-PENDING-APPROVAL    PIC X(1)   HIDDEN.
 *
 ?section LOGIC
+*
+*    Server communication via PATHSEND
+           PATHSEND USING "RSVRCALC"
+           PATHSEND USING "RSVRHIST"
 *
 *================================================================
 *  MAIN PROCESSING LOGIC

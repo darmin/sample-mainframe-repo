@@ -51,6 +51,11 @@ LITERAL STAT^PENDED     = 6;
 ! Fee schedule entry structure
 STRUCT FEE^ENTRY (*);
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCMEDFEE;
+!XREF: CALL WCPHARM;
     STRING CPT^CODE[0:4];
     STRING STATE^CODE[0:1];
     INT    EFFECTIVE^DATE[0:2];   ! YYYYMMDD as 3 words

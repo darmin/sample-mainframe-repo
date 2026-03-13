@@ -75,6 +75,10 @@
            05  CTL-LAST-ST-NUM        PIC 9(9).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCPMTCPY
+           COPY WCCLMCPY
        01  WS-FILE-STATUSES.
            05  WS-PAY-FILE-STATUS     PIC XX.
            05  WS-EDI-FILE-STATUS     PIC XX.
@@ -181,6 +185,9 @@
 
        PROCEDURE DIVISION.
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "PMTPROC"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-BUILD-INTERCHANGE-HEADER
            PERFORM 3000-PROCESS-PAYMENTS

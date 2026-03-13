@@ -64,6 +64,10 @@ DEFINE DOLLARS = FIXED(2);
 !---------------------------------------------------------------------
 STRUCT RSV^TRANSACTION^REC;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL RSVRCALC;
     STRING  CLAIM^NUMBER[0:11];
     INT(32) TRANSACTION^DATE;            ! Julian date
     INT(32) TRANSACTION^TIME;            ! Timestamp microseconds

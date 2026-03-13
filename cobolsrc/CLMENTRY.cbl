@@ -15,6 +15,10 @@
 
        DATA DIVISION.
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY CLMCOPY
 
        01  WS-CLAIM-RECORD.
            05  WS-CLAIM-ID             PIC X(12).
@@ -71,6 +75,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "CLMPROC"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-CLAIMS
                UNTIL WS-PATHSEND-STATUS = -1

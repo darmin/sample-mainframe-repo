@@ -77,6 +77,12 @@ LITERAL MAX^NCCI^CODE  = 4;
 ! -------------------------------------------------------------------
 STRUCT COMP^REQUEST;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCBENCALC;
+!XREF: CALL WCEXMOD;
+!XREF: CALL WCJURIS;
     INT(32)  CLAIM^NUMBER;
     INT(32)  CLAIMANT^SSN;
     STRING   JURISDICTION[0:1];         ! 2-char state code

@@ -74,6 +74,10 @@ LITERAL
 !-- Diary master record (key: claim_number + seq_number)
 STRUCT DIARY^MASTER^REC;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL CLMPROC;
     STRING   CLAIM^NUMBER[0:14];       ! Part of primary key
     INT(32)  SEQ^NUMBER;               ! Part of primary key
     STRING   CREATED^DATE[0:7];        ! YYYYMMDD

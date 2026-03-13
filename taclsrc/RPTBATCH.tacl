@@ -1,4 +1,10 @@
 ?SECTION RPTBATCH ROUTINE
+
+== Cross-program execution references
+== XREF: RUN WCLOSSRUN
+== XREF: RUN WCACTEXT
+== XREF: RUN WCVOCR
+== XREF: RUN WCSTATE
 !==================================================================!
 ! SCRIPT:     RPTBATCH                                             !
 ! AUTHOR:     MAINFRAMEMOD TPA SYSTEMS                             !

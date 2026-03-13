@@ -136,6 +136,10 @@
                88  DY-ACTIONED        VALUE 2.
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCRSVCPY
+           COPY WCCLMCPY
 
        01  WS-CR-STATUS               PIC X(2).
        01  WS-AU-STATUS               PIC X(2).
@@ -214,6 +218,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN.
+      *
+      *    Inter-program communication calls
+           ENTER TAL "RSVRCALC"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-REQUEST
            PERFORM 9000-TERMINATE

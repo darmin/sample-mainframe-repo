@@ -159,6 +159,10 @@
            05  RC-DAYS-OUTSTANDING    PIC 9(3).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCPMTCPY
+           COPY WCCLMCPY
 
        01  WS-FILE-STATUSES.
            05  WS-CQ-STATUS           PIC X(2).
@@ -283,6 +287,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN.
+      *
+      *    Inter-program communication calls
+           CALL "PMTAPPR"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-CHECK-QUEUE
            PERFORM 3000-GENERATE-POSITIVE-PAY

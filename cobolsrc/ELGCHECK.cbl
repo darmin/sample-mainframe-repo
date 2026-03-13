@@ -64,6 +64,10 @@
            05  DF-STATUS               PIC 9(1).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCEMPCPY
 
        01  WS-FILE-STATUS              PIC XX.
        01  WS-CURRENT-DATE             PIC 9(8).
@@ -103,6 +107,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "POLMAINT"
            OPEN INPUT POLICY-FILE
            OPEN INPUT DEPENDENT-FILE
            ACCEPT WS-CURRENT-DATE FROM DATE YYYYMMDD

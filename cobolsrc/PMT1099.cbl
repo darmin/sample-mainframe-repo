@@ -145,6 +145,10 @@
        01  ERROR-REPORT-REC           PIC X(132).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCPMTCPY
+           COPY WCEMPCPY
 
        01  WS-FILE-STATUSES.
            05  WS-PH-STATUS           PIC X(2).
@@ -218,6 +222,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN.
+      *
+      *    Inter-program communication calls
+           PATHSEND USING "PMTPROC"
            PERFORM 1000-INITIALIZE
            EVALUATE TRUE
                WHEN WS-MODE-ACCUMULATE

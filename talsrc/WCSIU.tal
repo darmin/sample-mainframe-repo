@@ -64,6 +64,11 @@ LITERAL STAT^CLOSED           = 6;
 !------------------------------------------------------------------!
 STRUCT CLAIM^REC;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL CLMPROC;
+!XREF: CALL WCLEGAL;
     STRING  CLAIM^NUM[0:19];
     STRING  CLAIMANT^SSN[0:8];
     STRING  CLAIMANT^NAME[0:59];

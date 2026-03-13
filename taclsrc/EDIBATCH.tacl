@@ -1,4 +1,9 @@
 ?SECTION EDIBATCH ROUTINE
+
+== Cross-program execution references
+== XREF: RUN WCEDI837
+== XREF: RUN WCEDI835
+== XREF: RUN WCMEDFEE
 !==================================================================!
 ! SCRIPT:     EDIBATCH                                             !
 ! AUTHOR:     MAINFRAMEMOD TPA SYSTEMS                             !

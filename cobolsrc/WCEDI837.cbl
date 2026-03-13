@@ -52,6 +52,10 @@
        01  ERROR-LOG-RECORD            PIC X(256).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCPRVCPY
        01  WS-FILE-STATUSES.
            05  WS-EDI-FILE-STATUS      PIC XX.
            05  WS-CLM-FILE-STATUS      PIC XX.
@@ -260,6 +264,9 @@
 
        PROCEDURE DIVISION.
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "WCMEDFEE"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-EDI-FILE
            PERFORM 9000-FINALIZE

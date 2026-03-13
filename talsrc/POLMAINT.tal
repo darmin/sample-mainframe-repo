@@ -30,6 +30,10 @@ LITERAL policy^expired    = 4;
 ! Policy master record -- Enscribe key-sequenced file
 STRUCT policy^master (*);
 BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCEXMOD;
     STRING  policy^number[0:15];       ! Primary key
     STRING  insured^name[0:39];
     STRING  insured^ssn[0:8];

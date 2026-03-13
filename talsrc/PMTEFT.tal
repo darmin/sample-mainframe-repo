@@ -59,6 +59,10 @@ DEFINE DOLLARS = FIXED(2);
 !---------------------------------------------------------------------
 STRUCT EFT^QUEUE^REC;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL PMTCHECK;
     STRING  PAYMENT^ID[0:9];             ! Key
     STRING  CLAIM^NUMBER[0:11];
     STRING  PAYEE^NAME[0:21];            ! NACHA: 22 chars max

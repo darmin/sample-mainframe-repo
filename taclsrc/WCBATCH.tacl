@@ -1,4 +1,11 @@
 ?SECTION WCBATCH ROUTINE
+
+== Cross-program execution references
+== XREF: RUN WCBENCALC
+== XREF: RUN WCCOMP
+== XREF: RUN WCEXMOD
+== XREF: RUN WCPPDRATE
+== XREF: RUN WCWAGE
 !==================================================================!
 ! SCRIPT:     WCBATCH                                              !
 ! AUTHOR:     MAINFRAMEMOD TPA SYSTEMS                             !

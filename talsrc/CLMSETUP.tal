@@ -64,6 +64,12 @@ LITERAL
 !-- Claim master record
 STRUCT CLAIM^MASTER^REC;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL FNOLVAL;
+!XREF: CALL CLMDIARY;
+!XREF: CALL RSVRCALC;
     STRING   CLAIM^NUMBER[0:14];       ! Primary key: SS-YYYYNNNNNNN
     STRING   EMPLOYEE^SSN[0:8];
     STRING   EMPLOYEE^LAST[0:29];

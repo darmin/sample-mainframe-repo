@@ -16,6 +16,9 @@
 *
 ?section DATA
 *
+*    Copybook references
+           COPY WCPMTCPY
+*
 SCREEN PMTSCR.
 *
     01 PMT-SCREEN-RECORD.
@@ -302,6 +305,10 @@ SCREEN PMTSCR.
        05 PMT-RESERVE-ADEQUATE    PIC X(1)   HIDDEN.
 *
 ?section LOGIC
+*
+*    Server communication via PATHSEND
+           PATHSEND USING "PMTPROC"
+           PATHSEND USING "PMTAPPR"
 *
 *================================================================
 *  MAIN PROCESSING LOGIC

@@ -16,6 +16,10 @@
 
        DATA DIVISION.
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCEMPCPY
 
        01  WS-CURRENT-DATE.
            05  WS-CURR-YEAR        PIC 9(4).
@@ -148,6 +152,10 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-PROCESS.
+      *
+      *    Inter-program communication calls
+           CALL "CLMSETUP"
+           PATHSEND USING "FNOLPROC"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-VALIDATE-EMPLOYER
            PERFORM 3000-VALIDATE-EMPLOYEE

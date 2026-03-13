@@ -115,6 +115,11 @@
        01  REPORT-LINE                   PIC X(132).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCRSVCPY
+           COPY WCPMTCPY
        01  WS-FILE-STATUS                PIC X(2).
        01  WS-CURRENT-DATE               PIC 9(8).
        01  WS-EOF-FLAG                   PIC X(1) VALUE "N".

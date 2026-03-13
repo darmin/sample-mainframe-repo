@@ -153,6 +153,9 @@
        01  NCM-REPORT-LINE               PIC X(132).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
        01  WS-FILE-STATUS                PIC X(2).
        01  WS-CURRENT-DATE               PIC 9(8).
        01  WS-CURRENT-TIME               PIC 9(6).
@@ -224,6 +227,10 @@
 
        PROCEDURE DIVISION.
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "MEDBILL"
+           CALL "WCRTW"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-REQUEST
            PERFORM 9000-TERMINATE

@@ -50,6 +50,11 @@ DEFINE DOLLARS = FIXED(2);
 !---------------------------------------------------------------------
 STRUCT RESERVE^TABLE^REC;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCBENCALC;
+!XREF: CALL WCJURIS;
     STRING  JURISDICTION^CODE[0:1];      ! 2-char state code
     INT     INJURY^TYPE;
     INT     BODY^PART^CODE;

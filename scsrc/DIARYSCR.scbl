@@ -21,6 +21,9 @@
 *
 ?section DATA
 *
+*    Copybook references
+           COPY WCCLMCPY
+*
 SCREEN DIARYSCR.
 *
     01 DRY-SCREEN-RECORD.
@@ -201,6 +204,9 @@ SCREEN DIARYSCR.
        05 DRY-TIMESTAMP          PIC X(26)  HIDDEN.
 *
 ?section LOGIC
+*
+*    Server communication via PATHSEND
+           PATHSEND USING "CLMDIARY"
 *
 *================================================================
 *  MAIN PROCESSING LOGIC

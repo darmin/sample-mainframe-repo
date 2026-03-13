@@ -68,6 +68,11 @@ LITERAL ISS^ATTORNEY^FEE = 10;  ! Attorney fee dispute
 ! Legal case record
 STRUCT LEGAL^CASE (*);
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCSUBRO;
+!XREF: CALL WCMSA;
     STRING CLAIM^NUM[0:11];
     STRING CASE^ID[0:11];        ! Litigation case ID
     INT    LIT^STATUS;

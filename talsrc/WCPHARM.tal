@@ -56,6 +56,10 @@ LITERAL DEA^NOT^CONTROLLED = 0;
 ! NDC record structure (11-digit NDC: 5-4-2)
 STRUCT NDC^ENTRY (*);
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCMEDFEE;
     STRING NDC^CODE[0:10];        ! 11-digit NDC
     STRING DRUG^NAME[0:39];       ! Drug name
     STRING GCN^CODE[0:7];         ! Generic code number

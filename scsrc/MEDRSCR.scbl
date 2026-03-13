@@ -23,6 +23,9 @@
 *
 ?section DATA
 *
+*    Copybook references
+           COPY WCCLMCPY
+*
 SCREEN MEDRSCR.
 *
     01 MED-SCREEN-RECORD.
@@ -276,6 +279,10 @@ SCREEN MEDRSCR.
        05 MED-BUNDLE-EDIT-FLAG    PIC X(1)   HIDDEN.
 *
 ?section LOGIC
+*
+*    Server communication via PATHSEND
+           PATHSEND USING "MEDBILL"
+           PATHSEND USING "WCPHARM"
 *
 *================================================================
 *  MAIN PROCESSING LOGIC

@@ -38,6 +38,12 @@ LITERAL pmt^status^stale     = 5;
 ! Payment record
 STRUCT payment^record (*);
 BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL PMTAPPR;
+!XREF: CALL PMTCHECK;
+!XREF: CALL RSVRCALC;
     STRING  payment^id[0:11];
     STRING  claim^id[0:11];
     STRING  payee^name[0:39];

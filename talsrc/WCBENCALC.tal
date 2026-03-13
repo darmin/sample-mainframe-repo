@@ -67,6 +67,11 @@ FIXED(2) .EXT G^TOTAL^BENEFITS;         ! Running total of benefits paid
 ! -------------------------------------------------------------------
 STRUCT BENEFIT^REQUEST;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCWAGE;
+!XREF: CALL WCJURIS;
     INT(32)  CLAIM^NUMBER;
     INT      BENEFIT^TYPE;              ! BEN^TTD, BEN^TPD, etc.
     STRING   JURISDICTION[0:1];         ! 2-char state code

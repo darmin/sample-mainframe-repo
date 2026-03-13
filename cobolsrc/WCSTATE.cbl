@@ -111,6 +111,10 @@
            05  FILLER                 PIC X(16).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCEMPCPY
        01  WS-FILE-STATUSES.
            05  WS-CLM-FILE-STATUS     PIC XX.
            05  WS-FIL-FILE-STATUS     PIC XX.
@@ -219,6 +223,9 @@
 
        PROCEDURE DIVISION.
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "WCJURIS"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-CLAIMS
            PERFORM 5000-PROCESS-ACKNOWLEDGMENTS

@@ -29,6 +29,13 @@ LITERAL claim^status^paid    = 4;
 ! Claim record structure
 STRUCT claim^record (*);
 BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL CLMASGN;
+!XREF: CALL CLMSTAT;
+!XREF: CALL ELGCHECK;
+!XREF: CALL CLMDIARY;
     STRING  claim^id[0:11];
     STRING  policy^number[0:15];
     STRING  claimant^name[0:39];

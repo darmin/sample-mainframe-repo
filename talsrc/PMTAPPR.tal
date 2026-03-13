@@ -59,6 +59,11 @@ DEFINE DOLLARS = FIXED(2);
 !---------------------------------------------------------------------
 STRUCT PMT^APPROVAL^REQ;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL PMTEFT;
+!XREF: CALL RSVRCALC;
     INT     MSG^TYPE;
     STRING  CLAIM^NUMBER[0:11];
     STRING  PAYEE^TIN[0:8];              ! SSN or EIN (9 digits)

@@ -61,6 +61,11 @@ LITERAL WAGE^SICK       = 8;
 ! -------------------------------------------------------------------
 STRUCT WAGE^RECORD;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCJURIS;
+!XREF: CALL POLMAINT;
     INT(32)  CLAIM^NUMBER;
     INT(32)  EMPLOYEE^SSN;
     INT      WEEK^NUMBER;                ! 1-52, week before DOI

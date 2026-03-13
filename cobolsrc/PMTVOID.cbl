@@ -195,6 +195,9 @@
            05  RQ-ORIGINAL-CHECK       PIC 9(8).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCPMTCPY
 
        01  WS-FILE-STATUSES.
            05  WS-CK-STATUS           PIC X(2).
@@ -275,6 +278,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN.
+      *
+      *    Inter-program communication calls
+           CALL "PMTPROC"
            PERFORM 1000-INITIALIZE
            EVALUATE TRUE
                WHEN WS-REQ-VOID

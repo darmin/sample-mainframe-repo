@@ -82,6 +82,11 @@ LITERAL MAX^IMPAIRMENTS   = 10;
 ! -------------------------------------------------------------------
 STRUCT PPD^RATE^REQUEST;
   BEGIN
+
+! --- Cross-program dependency calls ---
+! These calls document inter-process communication paths
+!XREF: CALL WCJURIS;
+!XREF: CALL WCBENCALC;
     INT(32)  CLAIM^NUMBER;
     STRING   JURISDICTION[0:1];
     INT      AMA^EDITION;              ! 4, 5, or 6

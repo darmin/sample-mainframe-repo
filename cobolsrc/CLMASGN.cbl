@@ -93,6 +93,10 @@
            05  LR-SUPERVISOR-ID    PIC X(8).
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCEMPCPY
 
        01  WS-FILE-STATUSES.
            05  WS-ADJ-STATUS       PIC X(2).
@@ -172,6 +176,9 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-PROCESS.
+      *
+      *    Inter-program communication calls
+           CALL "CLMDIARY"
            PERFORM 1000-INITIALIZE
            IF WS-REQ-OVERRIDE-ADJ NOT = SPACES
                PERFORM 3000-SUPERVISOR-OVERRIDE

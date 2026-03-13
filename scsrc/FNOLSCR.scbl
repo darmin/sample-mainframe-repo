@@ -26,6 +26,10 @@
        DATA DIVISION.
 
        WORKING-STORAGE SECTION.
+      *
+      *    Copybook references
+           COPY WCCLMCPY
+           COPY WCEMPCPY
 
        01  WS-CONTROL-FIELDS.
            05  WS-CURRENT-PAGE     PIC 9       VALUE 1.
@@ -373,6 +377,10 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-CONTROL.
+      *
+      *    Server communication via PATHSEND
+           PATHSEND USING "FNOLPROC"
+           PATHSEND USING "POLMAINT"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-SCREEN-LOOP
                UNTIL WS-EXIT-NOW OR WS-SUBMITTED

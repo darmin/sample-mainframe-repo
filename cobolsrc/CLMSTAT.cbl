@@ -117,6 +117,10 @@
            05  PF-UNRECONCILED-AMT PIC S9(9)V99 COMP-3.
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCRSVCPY
 
        01  WS-FILE-STATUSES.
            05  WS-CLM-STATUS       PIC X(2).
@@ -223,6 +227,10 @@
        PROCEDURE DIVISION.
 
        0000-MAIN-PROCESS.
+      *
+      *    Inter-program communication calls
+           CALL "RSVRCALC"
+           PATHSEND USING "CLMPROC"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-READ-CLAIM
            IF WS-STATUS-OK

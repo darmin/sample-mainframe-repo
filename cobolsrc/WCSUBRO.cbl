@@ -118,6 +118,10 @@
                88  PM-CREDIT          VALUE 'CR'.
 
        WORKING-STORAGE SECTION.
+      *
+      *    Cross-program copybook references
+           COPY WCCLMCPY
+           COPY WCPMTCPY
        01  WS-FILE-STATUSES.
            05  WS-CLM-FILE-STATUS     PIC XX.
            05  WS-SUB-FILE-STATUS     PIC XX.
@@ -189,6 +193,9 @@
 
        PROCEDURE DIVISION.
        0000-MAIN-CONTROL.
+      *
+      *    Inter-program communication calls
+           CALL "WCLEGAL"
            PERFORM 1000-INITIALIZE
            PERFORM 2000-PROCESS-CLAIMS
            PERFORM 5000-PROCESS-PAYMENTS
